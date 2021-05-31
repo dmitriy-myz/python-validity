@@ -28,13 +28,14 @@ line_update_type1_devices = [
 
 
 # TODO use more sophisticated glow patters in different cases
+# led green on
 def glow_start_scan():
     cmd = unhexlify(
         '3920bf0200ffff0000019900200000000099990000000000000000000000000020000000000000000000000000ffff000000990020000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'
     )
     assert_status(tls.app(cmd))
 
-
+# led_green_blink
 def glow_end_scan():
     cmd = unhexlify(
         '39f4010000f401000001ff002000000000ffff0000000000000000000000000020000000000000000000000000f401000000ff0020000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'
@@ -717,6 +718,7 @@ class Sensor:
 
             res = get_prg_status2()
 
+            # 0000 (status) 00200000 (sz) 7000 (x) 7000 (y) 4d01 (?) 0800 (?) 00000000 (err_code) xxxx (img_from_sensor)
             assert_status(res)
             res = res[2:]
 
@@ -726,15 +728,27 @@ class Sensor:
             if l != len(res):
                 raise Exception('Response size does not match %d != %d', l, len(res))
 
-            x, y, w1, w2, error = unpack('<HHHHL', res)
+            res, img_data = res[:12], res[12:]
 
+            x, y, w1, w2, error = unpack('<HHHHL', res)
             if error != 0:
                 raise Exception('Scanning problem: %04x' % error)
+            # retrieve remaining bytes of img
+            while l == 8192:
+                res = get_prg_status2()
+                assert_status(res)
+                res = res[2:]
+                l, res = res[:4], res[4:]
+                l, = unpack('<L', l)
+                if l != len(res):
+                    raise Exception('Response size does not match %d != %d', l, len(res))
+                img_data += res
 
-            return x, y, w1, w2
+            return x, y, w1, w2, img_data
 
         finally:
-            tls.app(unhexlify('04'))  # capture stop if still running, cleanup
+            pass
+            #tls.app(unhexlify('04'))  # capture stop if still running, cleanup
 
     def enrollment_update_start(self, key: int) -> int:
         rsp = tls.app(pack('<BLL', 0x68, key, 0))
@@ -825,13 +839,24 @@ class Sensor:
 
         key = 0
         template = b''
-        self.create_enrollment()
+        #self.create_enrollment()
         while True:
             try:
+                tid=0
                 glow_start_scan()
-                self.capture(CaptureMode.ENROLL)
-                key = self.enrollment_update_start(key)
-                rsp = self.append_new_image(template)
+                x, y, w1, w2, img_data = self.capture(CaptureMode.ENROLL)
+                # debug save image
+                import numpy as np
+                from PIL import Image
+                img = np.frombuffer(img_data, dtype=np.uint8).reshape(x,y)
+                # for some reason sensor returns transposed image
+                img = np.transpose(img)
+                Image.fromarray(img).save("fingerprint.jpg")
+                # end debug save image
+
+                # key = self.enrollment_update_start(key)
+                rsp = self.append_new_image(img_data)
+                print(rsp)
                 header, template, tid = rsp
                 update_cb(header, None)
                 if tid:
@@ -847,9 +872,10 @@ class Sensor:
                 update_cb(None, e)
                 # sleep, so we don't end up in a busy loop spaming the sensor with requests in case of unrecoverable error
             finally:
-                self.enrollment_update_end()
+                pass
+                #self.enrollment_update_end()
 
-        self.enrollment_update_end()  # done twice for some reason
+        #self.enrollment_update_end()  # done twice for some reason
         return do_create_finger(template, tid)
 
     def parse_dict(self, x: bytes):
