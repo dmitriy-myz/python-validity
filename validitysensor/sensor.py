@@ -10,17 +10,18 @@ from time import sleep
 from usb import core as usb_core
 
 from . import timeslot as prg
-from .blobs import reset_blob
+from .blobs import reset_blob, moh_enroll
 from .db import db, SidIdentity
 from .flash import write_enable, call_cleanups, read_flash, erase_flash, write_flash_all, read_flash_all
 from .hw_tables import dev_info_lookup
+from .init_data_dir import PYTHON_VALIDITY_DATA_DIR
 from .table_types import SensorTypeInfo, SensorCaptureProg
 from .tls import tls
 from .usb import usb, CancelledException
 from .util import assert_status, unhex
 
 # TODO: this should be specific to an individual device (system may have more than one sensor)
-calib_data_path = '/usr/share/python-validity/calib-data.bin'
+calib_data_path = PYTHON_VALIDITY_DATA_DIR + 'calib-data.bin'
 
 line_update_type1_devices = [
     0xB5, 0x885, 0xB3, 0x143B, 0x1055, 0xE1, 0x8B1, 0xEA, 0xE4, 0xED, 0x1825, 0x1FF5, 0x199
@@ -692,7 +693,7 @@ class Sensor:
     def cancel(self):
         usb.cancel = True
 
-    def capture(self, mode: CaptureMode) -> typing.Tuple[int, int, int, int]:
+    def capture(self, mode: CaptureMode) -> typing.Tuple[int, int, int, int, bytes]:
         try:
             assert_status(tls.app(self.build_cmd_02(mode)))
 
@@ -728,27 +729,43 @@ class Sensor:
             if l != len(res):
                 raise Exception('Response size does not match %d != %d', l, len(res))
 
-            res, img_data = res[:12], res[12:]
-
-            x, y, w1, w2, error = unpack('<HHHHL', res)
+            x, y, w1, w2, error = unpack('<HHHHL', res[:12])
             if error != 0:
                 raise Exception('Scanning problem: %04x' % error)
-            # retrieve remaining bytes of img
-            while l == 8192:
-                res = get_prg_status2()
-                assert_status(res)
-                res = res[2:]
-                l, res = res[:4], res[4:]
-                l, = unpack('<L', l)
-                if l != len(res):
-                    raise Exception('Response size does not match %d != %d', l, len(res))
-                img_data += res
+
+            # Only image-streaming sensors append pixel data after the 12-byte
+            # header. Metadata-only sensor types (e.g. match-on-chip) return
+            # just the header (l == 12) and no image; assume an image is present
+            # only when l > 12.
+            img_data = b''
+            if l > 12:
+                img_data = res[12:]
+                # The feature frame is x*y bytes. Each get_prg_status2 returns up
+                # to 8192 bytes, so pull chunks until we have the whole frame.
+                # Cap the number of follow-up reads so a sensor that reports
+                # l > 12 but never streams x*y bytes errors out instead of
+                # looping forever (8 reads ≈ 64 KB, well over any frame here).
+                expected = x * y
+                max_reads = 8
+                while len(img_data) < expected:
+                    if max_reads <= 0:
+                        raise Exception('capture: image underrun, got %d of %d bytes'
+                                        % (len(img_data), expected))
+                    max_reads -= 1
+                    res = get_prg_status2()
+                    assert_status(res)
+                    res = res[2:]
+                    l, res = res[:4], res[4:]
+                    l, = unpack('<L', l)
+                    if l != len(res):
+                        raise Exception('Response size does not match %d != %d', l, len(res))
+                    img_data += res
 
             return x, y, w1, w2, img_data
 
         finally:
-            pass
-            #tls.app(unhexlify('04'))  # capture stop if still running, cleanup
+            if not moh_enroll():
+                tls.app(unhexlify('04'))  # capture stop if still running, cleanup
 
     def enrollment_update_start(self, key: int) -> int:
         rsp = tls.app(pack('<BLL', 0x68, key, 0))
@@ -818,17 +835,175 @@ class Sensor:
 
         return tinfo
 
+    def enroll_moh(self, parent_dbid: int, subtype: int,
+                       update_cb: typing.Callable[[typing.Any, typing.Optional[Exception]], None] = lambda *a, **k: None,
+                       max_attempts: int = 6,
+                       num_frames: int = 6):
+        """Enroll a finger using the byte-exact native pipeline (no DLL).
+
+        Captures `num_frames` placements, builds a 23136-byte template via the
+        native pipeline (our keypoints into the baked WS-body framing scaffold,
+        recompute TID), and stores it via the raw 0x47 store protocol:
+            typ=6 direct, storage=3, 1-byte trailer appended — NOT the
+        db.new_finger() / type=0xb-becomes-6 magic path which doesn't actually
+        work without an active 0x68/0x6b enrollment session.
+
+        Args:
+            parent_dbid: the existing user dbid the new finger attaches to.
+                Use `db.dump_raw()` to see what users exist. Storing under
+                a non-existent dbid succeeds at the storage layer BUT the
+                chip's matcher will silently fail to find the enrollment.
+            subtype: the WinBio subtype (= finger position) for the record.
+            update_cb: progress callback update_cb(progress_bytes, error)
+                matching enroll()'s OS contract (see scripts/prototype.py).
+                Called after each frame with a 1-byte percentage (0-100), or
+                (None, exception) on a failed attempt.
+            max_attempts: how many capture retries on transient errors.
+
+        Returns: the recid created in the chip's storage."""
+        import numpy as np
+        from . import blobs
+
+        from .moh_native import (extract_frame_native, _load_ws_scaffold,
+                                 NATIVE_WS_V30_REGIONS,
+                                 patch_pre_v30_near_identity,
+                                 serialize_v30_section, V30_DESC_LEN)
+        from .moh_extract import compute_tid, _build_envelope
+
+        last_err = None
+        for attempt in range(max_attempts):
+            try:
+                # 1. Capture N frames (default 8; multi-frame enrollment
+                # fills the WS body's 4 v30 sections with different per-
+                # frame data).
+                logging.info(f'enroll_moh: capturing {num_frames} frame(s)...')
+                per_frame_kps = []
+                for f in range(num_frames):
+                    # Per-frame retry: if the sensor errors mid-capture
+                    # (e.g. "Scanning problem: 8080000" — finger lifted too
+                    # early), retry JUST this frame instead of restarting
+                    # the whole enrollment.
+                    for frame_attempt in range(max_attempts):
+                        glow_start_scan()
+                        logging.info(f'  frame {f+1}/{num_frames}: place finger')
+                        try:
+                            x, y, w1, w2, img_data = self.capture(CaptureMode.ENROLL)
+                            break
+                        except usb_core.USBError:
+                            glow_end_scan()
+                            raise
+                        except CancelledException:
+                            glow_end_scan()
+                            raise
+                        except Exception as e:
+                            glow_end_scan()
+                            logging.warning(f'  frame {f+1} capture failed '
+                                              f'(attempt {frame_attempt+1}/'
+                                              f'{max_attempts}): {e}')
+                            if frame_attempt + 1 == max_attempts:
+                                raise
+                            from time import sleep as _sleep
+                            _sleep(0.1)
+                    glow_end_scan()
+                    img = np.frombuffer(img_data, dtype=np.uint8).reshape(x, y)
+                    img_q16 = img.astype(np.int32) << 16
+
+                    logging.info(f'  frame {f+1}: extracting features...')
+                    kps = extract_frame_native(img_q16, h=112, w=112)
+                    logging.info(f'  frame {f+1}: {len(kps)} kp(s)')
+                    per_frame_kps.append(kps)
+                    # Report percentage complete after each frame is processed,
+                    # via the OS update_cb(progress_bytes, error) contract (see
+                    # scripts/prototype.py) — the percent is a single byte.
+                    # Fires before the store, so a raising callback retries a
+                    # capture (harmless) rather than duplicating a stored record.
+                    update_cb(bytes([int((f + 1) * 100 / num_frames)]), None)
+
+                # 2. Build envelope. Distribute frames across the v30 sections
+                # (round-robin if num_frames != #sections). The baked scaffold's
+                # WS framing bytes stay (header, anchors, section counts).
+                logging.info('enroll_moh: building envelope...')
+                ws_body = bytearray(_load_ws_scaffold())
+                regions = list(NATIVE_WS_V30_REGIONS)
+                # sec0_pre must be NEAR-identity (load-bearing): the matcher skips
+                # pure-identity records as the 'unmatched' sentinel, so near-identity
+                # (tx=ty=1) makes each section a valid candidate alignment at verify.
+                ws_body = bytearray(
+                    patch_pre_v30_near_identity(bytes(ws_body), regions)[0])
+                for idx, base in enumerate(regions):
+                    src_frame = per_frame_kps[idx % len(per_frame_kps)]
+                    # v30 records are [16B desc][x][y]; the record area starts
+                    # V30_DESC_LEN before the (x,y) anchor. The per-section trailer
+                    # is enroll-only bookkeeping the matcher ignores — leave it.
+                    section = serialize_v30_section(
+                        [(gx, gy, desc) for (gx, gy, _o, desc) in src_frame[:250]])
+                    start = base - V30_DESC_LEN
+                    ws_body[start:start + len(section)] = section
+                ws_body_bytes = bytes(ws_body)
+                tid = compute_tid(ws_body_bytes)
+                envelope = _build_envelope(subtype, ws_body_bytes, tid)
+                logging.info(f'  envelope: {len(envelope)} bytes')
+
+                # 3. Store via the proven replay protocol.  No wait_int()
+                # — the typ=6-direct path doesn't emit an interrupt the
+                # way db.new_finger's typ=0xb-magic path does.  bisect_ws
+                # send_finger() doesn't wait either, and it works.
+                logging.info('enroll_moh: storing on chip...')
+                db.db_info()
+                assert_status(tls.cmd(blobs.db_write_enable()))
+                try:
+                    msg = (pack('<BHHHH', 0x47, parent_dbid, 6, 3, len(envelope))
+                           + envelope + b'\x00')
+                    rsp = tls.cmd(msg)
+                    status, = unpack('<H', rsp[:2])
+                    if status != 0:
+                        raise RuntimeError(
+                            f'chip rejected new_finger: status=0x{status:04x}')
+                    recid, = unpack('<H', rsp[2:4])
+                finally:
+                    call_cleanups()
+
+                logging.info(f'enroll_moh: stored recid={recid}')
+                return recid
+
+            except usb_core.USBError:
+                glow_end_scan()
+                raise
+            except CancelledException:
+                glow_end_scan()
+                raise
+            except Exception as e:
+                last_err = e
+                update_cb(None, e)
+                logging.exception('enroll_moh attempt %d failed', attempt)
+                from time import sleep as _sleep
+                _sleep(0.1)
+
+        glow_end_scan()
+        raise RuntimeError(f'enroll_moh: all {max_attempts} attempts failed; '
+                            f'last error: {last_err}')
+
+
     # TODO: Better typing information needed.
     def enroll(self, identity: SidIdentity, subtype: int,
                update_cb: typing.Callable[[typing.Any, typing.Optional[Exception]], None]):
+        # Resolve the identity to a user dbid up front, creating the user if
+        # needed. Shared by both enrollment paths below.
+        usr = db.lookup_user(identity)
+        if usr is None:
+            usr = db.new_user(identity)
+        else:
+            usr = usr.dbid
+
+        # MoH and other native-pipeline devices enroll via enroll_moh
+        # (byte-exact pipeline + raw 0x47 store) instead of the DLL-style
+        # 0x68/0x6b enrollment session. The DLL uses 8 placements.
+        if moh_enroll():
+            return self.enroll_moh(usr, subtype,
+                                      update_cb=update_cb)
+
         def do_create_finger(final_template: bytes, tid: bytes):
             tinfo = self.make_finger_data(subtype, final_template, tid)
-
-            usr = db.lookup_user(identity)
-            if usr is None:
-                usr = db.new_user(identity)
-            else:
-                usr = usr.dbid
 
             recid = db.new_finger(usr, tinfo)
             usb.wait_int()
@@ -839,24 +1014,13 @@ class Sensor:
 
         key = 0
         template = b''
-        #self.create_enrollment()
+        self.create_enrollment()
         while True:
             try:
-                tid=0
                 glow_start_scan()
-                x, y, w1, w2, img_data = self.capture(CaptureMode.ENROLL)
-                # debug save image
-                import numpy as np
-                from PIL import Image
-                img = np.frombuffer(img_data, dtype=np.uint8).reshape(x,y)
-                # for some reason sensor returns transposed image
-                img = np.transpose(img)
-                Image.fromarray(img).save("fingerprint.jpg")
-                # end debug save image
-
-                # key = self.enrollment_update_start(key)
-                rsp = self.append_new_image(img_data)
-                print(rsp)
+                self.capture(CaptureMode.ENROLL)
+                key = self.enrollment_update_start(key)
+                rsp = self.append_new_image(template)
                 header, template, tid = rsp
                 update_cb(header, None)
                 if tid:
@@ -872,10 +1036,9 @@ class Sensor:
                 update_cb(None, e)
                 # sleep, so we don't end up in a busy loop spaming the sensor with requests in case of unrecoverable error
             finally:
-                pass
-                #self.enrollment_update_end()
+                self.enrollment_update_end()
 
-        #self.enrollment_update_end()  # done twice for some reason
+        self.enrollment_update_end()  # done twice for some reason
         return do_create_finger(template, tid)
 
     def parse_dict(self, x: bytes):
