@@ -100,6 +100,8 @@ class Tls:
             product_name = 'VirtualBox'
             product_serial = '0'
 
+        product_name = 'VirtualBox'
+        product_serial = '0'
         self.set_hwkey(product_name=product_name, serial_number=product_serial)
 
     def reset(self):
