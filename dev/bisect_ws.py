@@ -3,9 +3,13 @@
 Approach: take Wine's known-accepted finger data, replace portions with
 zeros (or our OpenCV output), and see what makes the chip reject.
 
-Run this on the device after opening the sensor. Each test creates a new
-db record (cleanup not automated — manage records via db.dump_all() /
-db.del_record() between runs if you fill up the slot).
+Two ways to run:
+  1. Standalone: `python -m dev.bisect_ws` — opens the sensor itself.
+  2. Inside the prototype.py REPL: `exec(open('dev/bisect_ws.py').read())`
+     — reuses the already-open sensor.
+
+Each accepted variant creates a new db record. Inspect with db.dump_all()
+between runs and delete junk via db.del_record() if you hit a slot limit.
 """
 import logging
 from struct import pack, unpack
@@ -17,6 +21,14 @@ from validitysensor.util import assert_status
 import validitysensor.blobs_a2 as blobs
 
 logging.basicConfig(level=logging.INFO)
+
+
+def _ensure_sensor_open():
+    """Idempotent: opens the sensor if it isn't already."""
+    from validitysensor.usb import usb
+    if usb.dev is None:
+        from validitysensor.init import open as open9x
+        open9x()
 
 
 WINE_FINGER_DATA = open('/tmp/wine_finger_data.bin', 'rb').read()
@@ -113,6 +125,7 @@ def test_zero_first(zero_first: int):
 if __name__ == '__main__':
     # Run sequentially. Clean db between runs if you hit a slot limit.
     print("=== Bisection: find what in WS makes the chip accept ===")
+    _ensure_sensor_open()
     baseline_wine()                          # A
     test_wine_via_our_builder()              # B — must match A
     test_zero_tid()                          # C
