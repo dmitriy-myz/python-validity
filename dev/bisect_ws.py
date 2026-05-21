@@ -37,14 +37,20 @@ WINE_WS  = WINE_FINGER_DATA[16:16+23056]
 WINE_TID = WINE_FINGER_DATA[23072:23104]
 
 
-def send_finger(template_bytes: bytes, label: str) -> int:
-    """Send a 23136-byte template via the new_finger pipeline. Returns chip status."""
+def send_finger(template_bytes: bytes, label: str,
+                cleanup_on_success: bool = True) -> int:
+    """Send a 23136-byte template via the new_finger pipeline. Returns chip status.
+
+    On success, optionally del_record the newly-created entry so subsequent
+    tests aren't rejected as duplicates of this one.
+    """
     assert len(template_bytes) == 23136, f"{label}: bad size {len(template_bytes)}"
     parent, typ, storage = 5, 6, 3
     opcode_msg = (pack('<BHHHH', 0x47, parent, typ, storage, len(template_bytes))
                   + template_bytes + b'\x11')
     db.db_info()
     assert_status(tls.cmd(blobs.db_write_enable))
+    recid = None
     try:
         rsp = tls.cmd(opcode_msg)
         status = unpack('<H', rsp[:2])[0]
@@ -53,9 +59,15 @@ def send_finger(template_bytes: bytes, label: str) -> int:
             print(f"  [{label}] ACCEPTED — dbid={recid}")
         else:
             print(f"  [{label}] rejected: 0x{status:04x}")
-        return status
     finally:
         call_cleanups()
+    if recid is not None and cleanup_on_success:
+        try:
+            db.del_record(recid)
+            print(f"  [{label}] cleaned up dbid={recid}")
+        except Exception as e:
+            print(f"  [{label}] WARNING: del_record({recid}) failed: {e}")
+    return status
 
 
 def make_envelope(ws: bytes, tid: bytes,
