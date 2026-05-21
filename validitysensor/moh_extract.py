@@ -498,28 +498,45 @@ class EnrollmentSession:
         return _build_envelope(subtype_u16, ws, tid)
 
 
-def _build_envelope(subtype: int, working_state: bytes, template_id: bytes) -> bytes:
-    """sub_180036840 in pure Python. Layout is fixed; sub_18003D7C0 is identity."""
+def _build_envelope(subtype: int, working_state: bytes, template_id: bytes,
+                    version: int = 3) -> bytes:
+    """Wire-exact envelope for new_record type=6. Verified byte-for-byte against
+    a Wine 4705 capture that the chip accepted: a 23056-byte working_state plus
+    32-byte SHA-256 TemplateId produces exactly 23136 bytes.
+
+    Layout:
+        u16 subtype     ; e.g. 0x00f7 (WINBIO_FINGER_UNSPECIFIED_POS_03)
+        u16 version     ; 3
+        u16 payload_sz  ; 8 + ws_size + tid_size  (excludes outer header and trailing)
+        u16 trailing    ; 32
+        u16 tlv1_tag    ; 1
+        u16 tlv1_len    ; ws_size  (in Wine: 23056)
+        u32 reserved    ; 0
+        bytes working_state[ws_size]
+        bytes template_id[32]        ; raw — no TLV header
+        u8   trailing[32]            ; zeros
+    """
     assert len(template_id) == 32
     ws_size = len(working_state)
     tid_size = len(template_id)
-    inner = ws_size + tid_size + 8
-    total = inner + 40                        # adds 32 trailing zeros + 8 from header math
+    trailing = 32
+    payload_size = 8 + ws_size + tid_size       # inner TLV1 header + ws + tid
+    total = 16 + ws_size + tid_size + trailing
 
     buf = bytearray(total)
-    # Header
-    buf[0:2]   = pack('<H', subtype)
-    # buf[2:4] stays zero
-    buf[4:6]   = pack('<H', inner & 0xffff)
-    buf[6:8]   = pack('<H', 32)
-    # TLV 1: working state
-    buf[8:10]  = pack('<H', 1)
-    buf[10:12] = pack('<H', ws_size & 0xffff)
-    buf[12:12+ws_size] = working_state
-    # TLV 2: TemplateId
-    off = 12 + ws_size
-    buf[off:off+2]   = pack('<H', 2)
-    buf[off+2:off+4] = pack('<H', tid_size)
-    buf[off+4:off+4+tid_size] = template_id
-    # trailing 32 zeros: already zero from bytearray init
+    # Outer header (8 bytes)
+    buf[0:2]   = pack('<H', subtype)            # subtype (e.g. 0x00f7)
+    buf[2:4]   = pack('<H', version)            # = 3
+    buf[4:6]   = pack('<H', payload_size & 0xffff)
+    buf[6:8]   = pack('<H', trailing)
+    # Inner header (8 bytes — TLV1 tag + len + 4 reserved zeros)
+    buf[8:10]  = pack('<H', 1)                  # tlv1_tag
+    buf[10:12] = pack('<H', ws_size & 0xffff)   # tlv1_len
+    # buf[12:16] stays zero — reserved
+    # Working state
+    buf[16:16+ws_size] = working_state
+    # TemplateId immediately after working state (no TLV header)
+    off = 16 + ws_size
+    buf[off:off+tid_size] = template_id
+    # Trailing 32 zeros already zero from bytearray init
     return bytes(buf)

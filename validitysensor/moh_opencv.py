@@ -62,8 +62,28 @@ HARRIS_K        = 0.04    # standard Harris k; the DLL formula is plain det(M), 
 # When we apply this in the float domain the equivalent is 128.0.
 FILL_GRAY       = 128
 
-# Subtype byte echoed at envelope header[0..1]. The wire trace showed 0xf75a.
-DEFAULT_SUBTYPE = 0xf75a
+# WINBIO_FINGER_UNSPECIFIED_POS_03 — the subtype Windows enrolled with on
+# the captured trace. Stored as u16 LE so the wire byte order is `f7 00`.
+DEFAULT_SUBTYPE = 0x00f7
+
+# First 32 bytes of working_state, copied verbatim from a chip-accepted Wine
+# capture. The chip likely validates magic/version bytes here. After byte 32
+# the buffer contains feature data that's free-form to us — for now we fill
+# with our minutia table + zeros.
+WS_MAGIC_PREFIX = bytes.fromhex(
+    "40480000"   # u32 = 0x4840 = 18496 (likely a sub-buffer size)
+    "06020500"   # u16=0x0206, u16=5  — config word 1
+    "02000801"   # u16=2,      u16=0x0108 — config word 2
+    "03020100"   # u16=0x0203, u16=1  — config word 3
+    "00000000"   # u32 zero — reserved/padding
+    "59000000"   # u32 = 89
+    "60000000"   # u32 = 96
+    "58000000"   # u32 = 88
+)
+assert len(WS_MAGIC_PREFIX) == 32
+
+# Wire-trace working-state size on accepted Wine template
+WS_SIZE = 23056
 
 
 # ─── Step 1-4: image → Harris response map ─────────────────────────────
@@ -170,31 +190,26 @@ def pack_minutia(x: int, y: int, descriptor_64: int,
 
 def build_working_state(records: List[bytes],
                          padded_image: np.ndarray) -> bytes:
-    """Assemble the in-memory working-state buffer (TLV-1 content).
+    """Assemble the working-state buffer (TLV-1 content).
 
-    The exact layout that the chip's matcher expects isn't yet recovered.
-    Best guess: a structured header followed by the 250-slot minutia
-    table. If the chip rejects this, this is the most likely candidate
-    for refinement.
+    Layout (mostly inferred from a chip-accepted Wine capture):
+        offset 0..31:    WS_MAGIC_PREFIX — required magic+config bytes
+        offset 32..8031: 250×32-byte minutia slot table
+        offset 8032..end: feature/calibration data we don't yet reverse —
+                          zero-filled for now. The chip's storage path
+                          accepted this size; matcher accuracy may need
+                          this region to carry real content.
     """
     # 250-slot minutia table
     pad_to_count = MAX_MINUTIAE - len(records)
     table = b''.join(records) + (b'\0' * 32) * pad_to_count
     assert len(table) == MAX_MINUTIAE * 32, "table is 250×32 = 8000 bytes"
 
-    # The total working state is ~22.9 KB on the wire. The minutia table
-    # is 8000 bytes of it. The remainder is calibration / image / other
-    # state we haven't fully reverse-engineered. For the proof-of-concept,
-    # pad to a plausible size with zeros and see if the chip accepts.
-    #
-    # Empirically: wire 4705 payload = 23184 bytes. Subtract 8-byte
-    # opcode header and 80 bytes of envelope (header + TLV2 + trailing
-    # zeros) leaves ws_size ≈ 23096. May need to adjust if the chip
-    # rejects this size.
-    target_size = 23096
-    if len(table) < target_size:
-        table = table + b'\0' * (target_size - len(table))
-    return table[:target_size]
+    buf = bytearray(WS_SIZE)
+    buf[0:len(WS_MAGIC_PREFIX)] = WS_MAGIC_PREFIX
+    table_off = len(WS_MAGIC_PREFIX)
+    buf[table_off:table_off + len(table)] = table
+    return bytes(buf)
 
 
 # ─── End-to-end: image → 23 KB envelope ────────────────────────────────
@@ -272,16 +287,13 @@ def main():
         image = cv2.resize(image, (SENSOR_W, SENSOR_H))
 
     envelope = extract_template(image)
-    print(f"\nEnvelope: {len(envelope)} bytes")
+    print(f"\nEnvelope: {len(envelope)} bytes (expected 23136)")
     print(f"  header (first 16):  {envelope[:16].hex()}")
-    print(f"  TLV-1 hdr at 0x08:  {envelope[8:12].hex()}  (type, length)")
     ws_size = int.from_bytes(envelope[10:12], 'little')
-    print(f"  TLV-1 data length:  {ws_size}")
-    tlv2_off = 12 + ws_size
-    print(f"  TLV-2 hdr at 0x{tlv2_off:04x}: {envelope[tlv2_off:tlv2_off+4].hex()}")
-    tid_size = int.from_bytes(envelope[tlv2_off+2:tlv2_off+4], 'little')
-    print(f"  TLV-2 data length:  {tid_size}")
-    print(f"  TLV-2 (TemplateId): {envelope[tlv2_off+4:tlv2_off+4+tid_size].hex()}")
+    print(f"  TLV-1 data length:  {ws_size} (expected 23056)")
+    print(f"  WS magic prefix:    {envelope[16:48].hex()}")
+    tid_off = 16 + ws_size
+    print(f"  TemplateId @ 0x{tid_off:04x}: {envelope[tid_off:tid_off+32].hex()}")
     print(f"  trailing 32 bytes:  {envelope[-32:].hex()}")
 
 
