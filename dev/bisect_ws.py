@@ -167,11 +167,15 @@ def enroll_and_match_fresh(data_path: str = '/tmp/wine_finger_fresh.bin',
         return
 
     print("\n  Place the SAME finger you enrolled in the fresh Wine capture...")
+    # identify() = capture(IDENTIFY) + match_finger(); match_finger alone
+    # doesn't capture an image so we'd never have anything to match.
+    def _cb(e):
+        print(f"  capture retry due to: {e!r}")
     try:
-        result = sensor.match_finger()
-        print(f"  match result: {result}")
+        result = sensor.identify(_cb)
+        print(f"  identify result: {result}")
     except Exception as e:
-        print(f"  match raised: {e!r}")
+        print(f"  identify raised: {e!r}")
 
     if cleanup_on_match:
         # Find the record we just created. db.dump_all() walks the tree but
