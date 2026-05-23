@@ -38,16 +38,22 @@ WINE_TID = WINE_FINGER_DATA[23072:23104]
 
 
 def send_finger(template_bytes: bytes, label: str,
-                cleanup_on_success: bool = True) -> int:
+                cleanup_on_success: bool = True,
+                trailer: bytes = b'\x11') -> int:
     """Send a 23136-byte template via the new_finger pipeline. Returns chip status.
 
     On success, optionally del_record the newly-created entry so subsequent
     tests aren't rejected as duplicates of this one.
+
+    The wire trace shows a 1-byte trailer after the data that varies per
+    enrollment (0x11 in enroll.log, 0x86 in enroll-fresh.log) — let callers
+    override it when replaying captured templates.
     """
     assert len(template_bytes) == 23136, f"{label}: bad size {len(template_bytes)}"
+    assert len(trailer) == 1
     parent, typ, storage = 5, 6, 3
     opcode_msg = (pack('<BHHHH', 0x47, parent, typ, storage, len(template_bytes))
-                  + template_bytes + b'\x11')
+                  + template_bytes + trailer)
     db.db_info()
     assert_status(tls.cmd(blobs.db_write_enable))
     recid = None
@@ -134,14 +140,79 @@ def test_zero_first(zero_first: int):
     return send_finger(env, f"F: zero[:{zero_first}] + WS[{zero_first}:]")
 
 
+def enroll_and_match_fresh(data_path: str = '/tmp/wine_finger_fresh.bin',
+                            trailer_path: str = '/tmp/wine_finger_fresh.trailer',
+                            cleanup_on_match: bool = True) -> None:
+    """End-to-end: store the fresh-enroll capture, ask user to place finger,
+    call match_finger(). Useful to check whether the chip's matcher actually
+    recognises the live finger that was enrolled in this fresh Wine session.
+
+    Different from the bisection tests because we DON'T cleanup on success
+    before matching (the record must exist for the matcher to find it).
+    """
+    from validitysensor.sensor import sensor   # imported lazily so script remains importable
+
+    with open(data_path, 'rb') as f:
+        data = f.read()
+    with open(trailer_path, 'rb') as f:
+        trailer = f.read()
+    assert len(data) == 23136
+    assert len(trailer) == 1
+    print(f"fresh enroll: subtype=0x{data[0]:02x}{data[1]:02x} trailer=0x{trailer.hex()}")
+
+    # Send the template (no cleanup — we need the record present for matching)
+    status = send_finger(data, "fresh: enroll", cleanup_on_success=False, trailer=trailer)
+    if status != 0:
+        print("  enroll failed; cannot try matching")
+        return
+
+    print("\n  Place the SAME finger you enrolled in the fresh Wine capture...")
+    try:
+        result = sensor.match_finger()
+        print(f"  match result: {result}")
+    except Exception as e:
+        print(f"  match raised: {e!r}")
+
+    if cleanup_on_match:
+        # Find the record we just created. db.dump_all() walks the tree but
+        # we want the dbid we just got — easiest: refetch & take the newest.
+        try:
+            from validitysensor.db import db as _db
+            stg = _db.get_user_storage(name='StgWindsor')
+            usrs = [_db.get_user(u['dbid']) for u in stg.users]
+            # Find the latest finger we just added (highest dbid under user 5)
+            for u in usrs:
+                if u.dbid == 5 and u.fingers:
+                    recid = max(f['dbid'] for f in u.fingers)
+                    _db.del_record(recid)
+                    print(f"  cleaned up dbid={recid}")
+                    break
+        except Exception as e:
+            print(f"  cleanup failed: {e!r}")
+
+
 if __name__ == '__main__':
-    # Run sequentially. Clean db between runs if you hit a slot limit.
-    print("=== Bisection: find what in WS makes the chip accept ===")
+    import sys
+
     _ensure_sensor_open()
-    baseline_wine()                          # A
-    test_wine_via_our_builder()              # B — must match A
-    test_zero_tid()                          # C
-    test_zero_ws()                           # D
-    test_partial_ws(keep_first=148)          # E — keep just the first dense block
-    test_partial_ws(keep_first=32)           # E — keep only magic prefix
-    test_zero_first(32)                      # F — zero only magic prefix
+
+    mode = sys.argv[1] if len(sys.argv) > 1 else 'bisect'
+
+    if mode == 'bisect':
+        # The original bisection — verify chip-acceptance of WS variants.
+        print("=== Bisection: find what in WS makes the chip accept ===")
+        baseline_wine()                          # A
+        test_wine_via_our_builder()              # B — must match A
+        test_zero_tid()                          # C
+        test_zero_ws()                           # D
+        test_partial_ws(keep_first=148)          # E — keep just the first dense block
+        test_partial_ws(keep_first=32)           # E — keep only magic prefix
+        test_zero_first(32)                      # F — zero only magic prefix
+    elif mode == 'match-fresh':
+        # End-to-end match test against the fresh enrollment capture.
+        print("=== Enroll fresh-capture finger + try matching ===")
+        enroll_and_match_fresh()
+    else:
+        print(f"unknown mode: {mode!r}")
+        print(f"usage: python -m dev.bisect_ws [bisect|match-fresh]")
+        sys.exit(2)
