@@ -140,6 +140,59 @@ def test_zero_first(zero_first: int):
     return send_finger(env, f"F: zero[:{zero_first}] + WS[{zero_first}:]")
 
 
+def enroll_and_match_under(parent: int,
+                            data_path: str,
+                            trailer_path: str,
+                            cleanup_on_match: bool = True) -> None:
+    """Store the given template under the specified parent (user dbid),
+    then attempt identify(). Useful for testing whether a template from
+    one Wine session matches a live finger when re-parented to a
+    different user. Different content gets different recid.
+    """
+    from validitysensor.sensor import sensor
+    with open(data_path, 'rb') as f:
+        data = f.read()
+    with open(trailer_path, 'rb') as f:
+        trailer = f.read()
+    assert len(data) == 23136
+    assert len(trailer) == 1
+    print(f"template: subtype=0x{data[0]:02x}{data[1]:02x} trailer=0x{trailer.hex()} → parent={parent}")
+
+    # Use send_finger but force parent
+    typ, storage = 6, 3
+    opcode_msg = (pack('<BHHHH', 0x47, parent, typ, storage, len(data))
+                  + data + trailer)
+    db.db_info()
+    assert_status(tls.cmd(blobs.db_write_enable))
+    recid = None
+    try:
+        rsp = tls.cmd(opcode_msg)
+        status = unpack('<H', rsp[:2])[0]
+        if status == 0:
+            recid = unpack('<H', rsp[2:4])[0]
+            print(f"  ACCEPTED — dbid={recid}")
+        else:
+            print(f"  rejected: 0x{status:04x}")
+            return
+    finally:
+        call_cleanups()
+
+    print("\n  Place the finger you want to test (the one originally enrolled in this template)...")
+    def _cb(e): print(f"  capture retry: {e!r}")
+    try:
+        result = sensor.identify(_cb)
+        print(f"  identify result: {result}")
+    except Exception as e:
+        print(f"  identify raised: {e!r}")
+
+    if cleanup_on_match and recid is not None:
+        try:
+            db.del_record(recid)
+            print(f"  cleaned up dbid={recid}")
+        except Exception as e:
+            print(f"  cleanup failed: {e!r}")
+
+
 def enroll_and_match_fresh(data_path: str = '/tmp/wine_finger_fresh.bin',
                             trailer_path: str = '/tmp/wine_finger_fresh.trailer',
                             cleanup_on_match: bool = True) -> None:
