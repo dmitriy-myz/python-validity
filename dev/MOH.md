@@ -249,8 +249,23 @@ print(sensor.identify(lambda e: print(f"retry: {e}")))
 
 ### Wine enrollment-session opcode catalog
 
-Observed in `enroll-fresh3.log` (a complete enrollment that added one
-new finger). 142 wire commands total. Opcodes seen, in encounter order:
+Observed across three Wine enrollment captures of the same finger
+(position `0xf6`):
+
+| Log                  | Host→chip cmds | `0x47` records emitted |
+|----------------------|----------------|------------------------|
+| `enroll-fresh.log`   | 94             | finger(type=6) + identity(type=8) |
+| `enroll-fresh2.log`  | 94             | finger(type=6) + identity(type=8) |
+| `enroll-fresh3.log`  | 142            | **StgWindsor(type=4)** + finger(type=6) + identity(type=8) |
+
+The structural difference between the 94-cmd and 142-cmd runs is the
+**`StgWindsor` storage-creation record**, not the identity record —
+all three runs emit an identity record, just under varying parent
+dbids. fresh3.log is bigger because it's an *empty-database* enrollment:
+the chip has no `StgWindsor` storage yet, so the Windows DLL creates one
+first (plus extra surrounding `0x4c` / `0x4b` setup chatter).
+
+Opcodes seen in fresh3.log, in encounter order:
 
 | Opcode + variant | Bytes/wire | Description |
 |------------------|------------|-------------|
@@ -260,18 +275,21 @@ new finger). 142 wire commands total. Opcodes seen, in encounter order:
 | `0x0278 ...`     | 13776       | Image transfer (one captured frame from chip → host) — 8 of these per enrollment |
 | `0x49f0 ...`     | 48          | get_record_value (variant) |
 | `0x0602 ...`     | 2736        | `db_write_enable` family (sender pads with 43 trailing TLS bytes we strip) |
-| `0x4701 ...`     | 64          | new_record, parent=1 type=4 — creates `StgWindsor` storage record |
-| `0x4706 ...`     | 23184       | new_record, parent=user type=6 — the finger template itself |
-| `0x4707 ...`     | 64          | new_record, parent=7 type=8 — data record (e.g. identity name "Unicorn") |
+| `0x47` parent=1 type=4 | 64    | new_record — creates `StgWindsor` storage record (only when chip DB is empty; payload is the literal string `"StgWindsor\0"`) |
+| `0x47` parent=user type=6 | 23184 | new_record — the finger template itself; followed on the wire by a 1-byte trailer (`0x86`/`0x70`/`0xa9` observed in these three captures, `0x11` in older `enroll.log`) |
+| `0x47` parent=user' type=8 | 64 | new_record — identity data record (payload `02 01 08 00 "Unicorn\0"`). Parent dbid varies per session (5/6/7 across the three captures); appears in *every* enrollment regardless of fresh-DB status |
 | `0x4a00`, `0x4a05`, `0x4a06` | 128 | get_user variants |
 | `0x4b00`, `0x4b03`, `0x4b04` | 64  | get_user_storage variants |
 | `0x4c1b`, `0x4cc8`, `0x4c5c` | 80–256 | opcode 0x4c family (semantics unknown) |
 | `0x4004`, `0x4006`, `0x5100`, `0x1aa9`, `0x3920`, `0x75d3`, `0x3f04`, `0x085c`, `0x0780`, `0x1400`, `0x4302` | 48–160 | other state-setup/teardown opcodes encountered, semantics not fully decoded |
 
-For a fresh enroll-to-an-existing-user (`enroll-fresh.log`, 95 commands)
-there's no `0x4701` (no storage creation) or `0x4707` (no identity
-data record); just the image transfers + db_write_enable batch + `0x47`
-finger record.
+Comparing two captures of the same finger (`subtype=0xf6`) confirms the
+encryption finding from the TL;DR: the finger-template payloads disagree
+on ~96% of their bytes (fresh vs fresh2 = 96.4%, fresh vs fresh3 = 96.7%,
+fresh2 vs fresh3 = 96.1%). The envelope header, the trailing 32 zero
+bytes, and the `02 01 08 00 "Unicorn\0"` identity payload are byte-identical
+across all three runs; only the 23056-byte working_state, the 32-byte TID,
+and the 1-byte trailer change per capture.
 
 ### Chip-state recovery
 
