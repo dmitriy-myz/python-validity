@@ -143,20 +143,29 @@ def test_zero_first(zero_first: int):
 def enroll_and_match_under(parent: int,
                             data_path: str,
                             trailer_path: str,
-                            cleanup_on_match: bool = True) -> None:
+                            cleanup_on_match: bool = True,
+                            override_subtype: int = None) -> None:
     """Store the given template under the specified parent (user dbid),
     then attempt identify(). Useful for testing whether a template from
     one Wine session matches a live finger when re-parented to a
-    different user. Different content gets different recid.
+    different user.
+
+    override_subtype: if set, patch bytes [0..2] of the template with this
+    little-endian u16. Use a different value than the live record's
+    subtype to avoid 0x04c3 (per-(user, subtype) duplicate detection).
     """
     from validitysensor.sensor import sensor
     with open(data_path, 'rb') as f:
-        data = f.read()
+        data = bytearray(f.read())
     with open(trailer_path, 'rb') as f:
         trailer = f.read()
     assert len(data) == 23136
     assert len(trailer) == 1
+    if override_subtype is not None:
+        data[0:2] = pack('<H', override_subtype)
+        print(f"  (subtype patched to 0x{override_subtype:04x})")
     print(f"template: subtype=0x{data[0]:02x}{data[1]:02x} trailer=0x{trailer.hex()} → parent={parent}")
+    data = bytes(data)
 
     # Use send_finger but force parent
     typ, storage = 6, 3
