@@ -74,8 +74,9 @@ record.
                        (calls sub_18004B710 multiple times)
                                  │
                                  ▼
-       sub_180036840 ─ serialize envelope: 16-byte header,
-                       23056-byte WS, 32-byte TID, 32 trailing zeros
+       sub_180036840 ─ serialize envelope: 8-byte outer hdr + 4-byte TLV1 hdr
+                       + 23056-byte ws_body + 4-byte TLV2 hdr + 32-byte TID
+                       + 32 trailing zeros  (= 23136 bytes total)
                                  │
                                  ▼
                        23136-byte template
@@ -221,22 +222,43 @@ implementation: `dev/MOH.md` "TID derivation" and
 
 | VA               | Role                                                 | Status |
 |------------------|------------------------------------------------------|--------|
-| `sub_180036840`  | **Envelope serializer.** Byte-exact in Python. Layout: 16 byte outer/inner header, ws_size bytes, 32-byte TID, 32 trailing zeros. | DECODED (after iteration) — `moh_extract.py:_build_envelope` |
+| `sub_180036840`  | **Envelope serializer.** 8-byte outer header + 4-byte TLV1 header + ws_body + 4-byte TLV2 header + TID + 32 trailing zeros. | DECODED — `moh_extract.py:_build_envelope` |
 | `sub_18003D7C0`  | Caller pass-through; effectively identity            | DECODED — no-op |
-| `sub_180036590`  | TLV-tag-1 writer used inside the envelope            | body decompiled |
-| `sub_180031CD0`  | Caller of `sub_180036840`                            | body decompiled |
+| `sub_180036590`  | Validation wrapper that forwards to `sub_180036840` with a constant 5th arg (110, used as a default error code on alloc failure). | body decompiled |
+| `sub_180031CD0`  | Caching wrapper around `sub_180036590`. Memoizes the envelope output keyed on `(a2_buf, a3_buf)` so identical inputs don't re-serialize. | body decompiled |
 
-The byte-exact envelope structure (verified against a chip-accepted Wine
-capture) is documented in `dev/MOH.md`. Briefly:
+The byte-exact envelope structure (verified against five distinct
+chip-accepted Wine captures, see `dev/extract_finger_templates.py`) is:
 
 ```
-[0..16]   outer + inner header (subtype, version=3, payload_size,
-          trailing=32, tlv1_tag=1, tlv1_len=ws_size, 4 reserved zeros)
-[16..16+ws_size]  working_state — encrypted feature bytes
-[..+32]           TemplateId
-[..+32]           trailing zeros
-total = 16 + ws_size + 32 + 32       (= 23136 when ws_size = 23056)
+offset      size    field
+─────────────────────────────────────────────────────────────────
+[0..2]      2       u16 subtype
+[2..4]      2       u16 version  (= 3)
+[4..6]      2       u16 payload_size  (= 4 + ws_size + 4 + tid_size)
+[6..8]      2       u16 trailing  (= 32)
+[8..10]     2       u16 tlv1_tag  (= 1)
+[10..12]    2       u16 tlv1_len  (= ws_size)
+[12..12+n]  n       ws_body  (chip-view; first 4 bytes always 0x00*4)
+[12+n..14+n] 2      u16 tlv2_tag  (= 2)
+[14+n..16+n] 2      u16 tlv2_len  (= tid_size = 32)
+[16+n..48+n] 32     TemplateId (HMAC-SHA256 chain over ws_body)
+[48+n..80+n] 32     trailing zeros
+
+total = 8 + 4 + ws_size + 4 + 32 + 32  =  ws_size + 80
+      = 23136 when ws_size = 23056
 ```
+
+**Critical correction:** earlier versions of this doc described an
+8-byte inner header (TLV1 tag + len + "4 reserved zeros") followed by a
+23056-byte WS body at envelope offset 16, and the TID written raw at
+envelope offset 23072. That model produces correct output bytes by
+coincidence — the "reserved zeros" we wrote happen to overlap with the
+first 4 bytes of the real WS body (which the chip also reads as zeros),
+and the "WS body tail" we thought we were writing actually contained the
+TLV2 header. The serializer's real layout has the WS body starting at
+offset 12 and the TID introduced by a TLV2 header at offset 23068. See
+`dev/MOH.md` "Wire format" for the full table.
 
 ---
 
@@ -314,7 +336,7 @@ Detailed in `dev/MOH.md`. Summary:
   1570→1583:
 
   ```
-  K   = SHA-256(reserved_u32 ‖ WS[:23052])
+  K   = SHA-256(ws_body)              # ws_body = template[12:12+23056]
   T1  = HMAC-SHA256(K, "Template ID" ‖ 32×0x00)
   TID = HMAC-SHA256(K, T1 ‖ "Template ID" ‖ 32×0x00)
   ```

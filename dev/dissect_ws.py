@@ -32,26 +32,29 @@ from typing import List, Optional, Tuple
 
 # Anchor signatures validated across 5 distinct Wine captures (2 fingers,
 # 2 modes — see dev/extract_finger_templates.py). Offsets are RELATIVE TO
-# WS BODY (envelope offset − 16).
+# THE CHIP-VIEW WS BODY (envelope offset − 12; the WS body is the 23056-byte
+# TLV1 payload at envelope[12..23068]).
 #
 # Each anchor is byte-stable across every captured template. Section
 # trailer markers carry a u32 BE index in their leading 4 bytes; observed
 # indices form the sequence 4, 5, 6, 7, (8 in mode B) — sections are
 # numbered 4..N, not 0..N.
 ANCHORS = [
-    ( 219, 70),     # env 235:  section-4 trailer, 57 zeros + `04 00 b8 11…fa`
-    (4813, 15),     # env 4829: short marker `00000068 00040000 00000003 0004 00`
-    (4829, 43),     # env 4845: section-5 trailer (43 bytes stable across both modes;
+    (  223, 70),    # env 235:  section-4 trailer, 57 zeros + `04 00 b8 11…fa`
+    ( 4817, 15),    # env 4829: short marker `00000068 00040000 00000003 0004 00`
+    ( 4833, 43),    # env 4845: section-5 trailer (43 bytes stable across both modes;
                     #            mode B has an additional 21 bytes through env 4909)
-    (9417, 16),     # env 9433: section-6 trailer `00000006…fa` (last 2 bytes session tail)
-    (13957, 16),    # env 13973: section-7 trailer `00000007…fa`
-    (18504, 8),     # env 18520: section-3/4 boundary, 8 zeros (stable in BOTH modes;
-                    #            in mode B section 8 follows, ending at the pre-TID footer)
-    (23043, 13),    # env 23059: pre-TID footer `00000000 00000000 00 02 00 20 00`
+    ( 9421, 16),    # env 9433: section-6 trailer `00000006…fa` (last 2 bytes session tail)
+    (13961, 16),    # env 13973: section-7 trailer `00000007…fa`
+    (18508,  8),    # env 18520: section-7/8 boundary, 8 zeros (stable in BOTH modes;
+                    #            in mode B section 8 follows, ending at the pre-TLV2 region)
+    (23047,  9),    # env 23059: trailing 9 zeros of WS body, just before the TLV2 header
+                    #            (the TLV2 header `02 00 20 00` at env 23068..23072 lives
+                    #             OUTSIDE the WS body — written by the envelope serializer)
     # Anchors RULED OUT by multi-capture analysis (were coincidental
     # 2-capture matches, not real structure):
-    #   - (5079, 4): bytes `60c4d090` at env 5095
-    #   - (17397, 4): bytes `c34e8799` at env 17413
+    #   - (5083, 4): bytes `60c4d090` at env 5095
+    #   - (17401, 4): bytes `c34e8799` at env 17413
 ]
 
 
@@ -64,27 +67,38 @@ def _entropy(b: bytes) -> float:
 
 
 def parse_header(ws: bytes) -> dict:
-    """Decode the first 36 bytes of the WS body."""
-    end_ptr, = struct.unpack_from('<I', ws, 0)
-    hdr_words = struct.unpack_from('<3I', ws, 4)   # 3 × u32 at WS[4..16]
-    reserved, = struct.unpack_from('<I', ws, 16)
-    counts = struct.unpack_from('<4I', ws, 20)
+    """Decode the first 40 bytes of the chip-view WS body.
+
+    Header layout (offsets relative to envelope offset 12):
+      WS[ 0.. 4]  4 leading zero bytes (natural padding)
+      WS[ 4.. 8]  u32 end_of_features_ptr
+      WS[ 8..20]  3 × u32 header words (last one is the mode discriminator)
+      WS[20..24]  u32 reserved = 0
+      WS[24..40]  4 × u32 section counts
+    """
+    leading,     = struct.unpack_from('<I', ws, 0)
+    end_ptr,     = struct.unpack_from('<I', ws, 4)
+    hdr_words    = struct.unpack_from('<3I', ws, 8)
+    reserved,    = struct.unpack_from('<I', ws, 20)
+    counts       = struct.unpack_from('<4I', ws, 24)
     return {
+        'leading':     leading,           # always 0 in observed captures
         'end_ptr':     end_ptr,
         'hdr_words':   hdr_words,
         'reserved':    reserved,
         'counts':      counts,
-        'feature_data_start': 36,
+        'feature_data_start': 40,
         'feature_data_end':   end_ptr,
     }
 
 
 def print_header(hdr: dict, label: str):
     print(f'{label}:')
-    print(f'  WS[0..4]  end_of_features_ptr = {hdr["end_ptr"]:>6d}  (0x{hdr["end_ptr"]:04x})')
-    print(f'  WS[4..16] header words = {[f"0x{w:08x}" for w in hdr["hdr_words"]]}')
-    print(f'  WS[16..20] reserved    = 0x{hdr["reserved"]:08x}')
-    print(f'  WS[20..36] section counts = {hdr["counts"]}  (sum={sum(hdr["counts"])})')
+    print(f'  WS[ 0.. 4] leading zeros     = 0x{hdr["leading"]:08x}')
+    print(f'  WS[ 4.. 8] end_features_ptr  = {hdr["end_ptr"]:>6d}  (0x{hdr["end_ptr"]:04x})')
+    print(f'  WS[ 8..20] header words      = {[f"0x{w:08x}" for w in hdr["hdr_words"]]}')
+    print(f'  WS[20..24] reserved          = 0x{hdr["reserved"]:08x}')
+    print(f'  WS[24..40] section counts    = {hdr["counts"]}  (sum={sum(hdr["counts"])})')
 
 
 def carve_sections(ws: bytes, hdr: dict) -> List[Tuple[int, int, str]]:
@@ -309,8 +323,9 @@ def main(path1='/tmp/wine_finger_fresh.bin',
          path2='/tmp/wine_finger_fresh2.bin'):
     data1 = open(path1, 'rb').read()
     data2 = open(path2, 'rb').read() if path2 else None
-    ws1 = data1[16:16 + 23056]
-    ws2 = data2[16:16 + 23056] if data2 else None
+    # WS body is the chip-view TLV1 payload at envelope[12..12+23056]
+    ws1 = data1[12:12 + 23056]
+    ws2 = data2[12:12 + 23056] if data2 else None
     assert len(ws1) == 23056
 
     print(f'=== {path1} ===')
@@ -426,10 +441,10 @@ def multi_capture_report(template_dir: str = '/tmp/finger_templates') -> None:
         print(f'  {name}')
     print()
 
-    # Group by mode (header_words[2] is the mode discriminator)
+    # Group by mode (header word 3 = WS[16..20] = envelope[28..32] is the
+    # mode discriminator).
     def mode_of(t):
-        ws = t[16:16 + 23056]
-        return struct.unpack_from('<I', ws, 12)[0]
+        return struct.unpack_from('<I', t, 28)[0]
 
     modes = {}
     for name, data in templates:
@@ -438,19 +453,21 @@ def multi_capture_report(template_dir: str = '/tmp/finger_templates') -> None:
 
     print(f'=== {len(modes)} distinct modes detected ===')
     for m, ts in sorted(modes.items()):
+        # end_ptr lives at WS[4..8] = envelope[16..20]
         end_ptr = struct.unpack_from('<I', ts[0][1], 16)[0]
         print(f'  mode 0x{m:08x}  end_ptr={end_ptr:>6d}  {len(ts)} captures: '
               f'{", ".join(t[0] for t in ts)}')
     print()
 
-    # Anchor envelope-offsets (ANCHORS uses WS-offsets; +16 for envelope)
+    # Section ranges expressed as envelope offsets. Anchors live at the
+    # boundaries (see ANCHORS above, +12 for envelope).
     section_ranges = [
-        ('section 4 features', 36, 235),
-        ('section 5 features', 305, 4829),
-        ('section 6 features', 4888, 9433),
-        ('section 7 features', 9449, 13973),
-        ('section 8 features (mode A: zero-pad)', 13989, 18520),
-        ('section 9 features (mode B only)', 18528, 23059),
+        ('section 4 features', 40, 235),       # WS[28..223]
+        ('section 5 features', 305, 4829),     # WS[293..4817]
+        ('section 6 features', 4888, 9433),    # WS[4876..9421]
+        ('section 7 features', 9449, 13973),   # WS[9437..13961]
+        ('section 8 features (mode A: zero-pad)', 13989, 18520),  # WS[13977..18508]
+        ('section 9 features (mode B only)', 18528, 23059),       # WS[18516..23047]
     ]
 
     print('=== intra-section stability per mode ===')

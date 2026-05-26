@@ -431,15 +431,16 @@ def extract_features(image: bytes, w: int, h: int, ctx: FrameContext,
 
     orchestrate(image, w, h, ctx)
 
-    ws = _serialize_for_hash(ctx)
-    if len(ws) != 23056:
-        # Placeholder until orchestrate() emits the full WS body. Returning
-        # a SHA-256 here keeps callers running but the chip's matcher will
-        # not accept the resulting template.
+    ws_body = _serialize_for_hash(ctx)
+    if len(ws_body) != 23056:
+        # Placeholder until orchestrate() emits the full chip-view WS body
+        # (23056 bytes starting with 4 zeros). Returning a SHA-256 here
+        # keeps callers running but the chip's matcher will not accept
+        # the resulting template.
         log.warning("WS body is %d bytes, expected 23056 — TID will not be chip-valid",
-                    len(ws))
-        return hashlib.sha256(ws).digest()
-    return compute_tid(ws)
+                    len(ws_body))
+        return hashlib.sha256(ws_body).digest()
+    return compute_tid(ws_body)
 
 
 def _serialize_for_hash(ctx: FrameContext) -> bytes:
@@ -506,46 +507,64 @@ class EnrollmentSession:
         return _build_envelope(subtype_u16, ws, tid)
 
 
-def _build_envelope(subtype: int, working_state: bytes, template_id: bytes,
+def _build_envelope(subtype: int, ws_body: bytes, template_id: bytes,
                     version: int = 3) -> bytes:
-    """Wire-exact envelope for new_record type=6. Verified byte-for-byte against
-    a Wine 4705 capture that the chip accepted: a 23056-byte working_state plus
-    32-byte SHA-256 TemplateId produces exactly 23136 bytes.
+    """Wire-exact envelope for new_record type=6, byte-identical to
+    sub_180036840 in synaWudfBioUsb.dll.
 
     Layout:
-        u16 subtype     ; e.g. 0x00f7 (WINBIO_FINGER_UNSPECIFIED_POS_03)
-        u16 version     ; 3
-        u16 payload_sz  ; 8 + ws_size + tid_size  (excludes outer header and trailing)
-        u16 trailing    ; 32
-        u16 tlv1_tag    ; 1
-        u16 tlv1_len    ; ws_size  (in Wine: 23056)
-        u32 reserved    ; 0
-        bytes working_state[ws_size]
-        bytes template_id[32]        ; raw — no TLV header
-        u8   trailing[32]            ; zeros
+        offset  size   field
+        ────────────────────────────────────────────────────────────
+        0       2      u16 subtype           (e.g. 0x00f7)
+        2       2      u16 version           (= 3)
+        4       2      u16 payload_size      (= 4 + ws_size + 4 + tid_size)
+        6       2      u16 trailing          (= 32)
+        8       2      u16 tlv1_tag          (= 1)
+        10      2      u16 tlv1_len          (= ws_size)
+        12      n      bytes ws_body[n]      ← chip-view WS body starts here
+        12+n    2      u16 tlv2_tag          (= 2)
+        14+n    2      u16 tlv2_len          (= tid_size)
+        16+n    32     bytes template_id
+        48+n    32     bytes trailing zeros
+
+    For ws_size = 23056 and tid_size = 32, total envelope is 23136 bytes
+    with the TID at envelope offset 23072..23104 and the TLV2 header
+    immediately preceding it at 23068..23072.
+
+    Caller contract: pass the chip-view WS body, NOT the
+    "envelope[16..23072]" slice. The chip-view WS body is 23056 bytes
+    that go from envelope offset 12 to 12+23056. In any captured
+    template it always begins with 4 natural-zero bytes
+    (template[12..16]) and ends with 4 bytes of feature-data tail
+    (template[23064..23068]); the TLV2 header that sits at template
+    offset 23068..23072 is NOT part of ws_body — this function writes
+    it explicitly.
     """
     assert len(template_id) == 32
-    ws_size = len(working_state)
+    ws_size = len(ws_body)
     tid_size = len(template_id)
     trailing = 32
-    payload_size = 8 + ws_size + tid_size       # inner TLV1 header + ws + tid
-    total = 16 + ws_size + tid_size + trailing
+    payload_size = 4 + ws_size + 4 + tid_size   # TLV1 hdr + ws + TLV2 hdr + TID
+    total = 8 + payload_size + trailing
 
     buf = bytearray(total)
     # Outer header (8 bytes)
-    buf[0:2]   = pack('<H', subtype)            # subtype (e.g. 0x00f7)
-    buf[2:4]   = pack('<H', version)            # = 3
+    buf[0:2]   = pack('<H', subtype)
+    buf[2:4]   = pack('<H', version)
     buf[4:6]   = pack('<H', payload_size & 0xffff)
     buf[6:8]   = pack('<H', trailing)
-    # Inner header (8 bytes — TLV1 tag + len + 4 reserved zeros)
-    buf[8:10]  = pack('<H', 1)                  # tlv1_tag
-    buf[10:12] = pack('<H', ws_size & 0xffff)   # tlv1_len
-    # buf[12:16] stays zero — reserved
-    # Working state
-    buf[16:16+ws_size] = working_state
-    # TemplateId immediately after working state (no TLV header)
-    off = 16 + ws_size
-    buf[off:off+tid_size] = template_id
+    # Inner TLV1 header (4 bytes, no reserved field — that's the first 4
+    # bytes of ws_body itself, naturally zero)
+    buf[8:10]  = pack('<H', 1)
+    buf[10:12] = pack('<H', ws_size & 0xffff)
+    # WS body (starts at envelope offset 12)
+    buf[12:12 + ws_size] = ws_body
+    # Inner TLV2 header (4 bytes after WS body)
+    off = 12 + ws_size
+    buf[off:off + 2]     = pack('<H', 2)
+    buf[off + 2:off + 4] = pack('<H', tid_size & 0xffff)
+    # TID
+    buf[off + 4:off + 4 + tid_size] = template_id
     # Trailing 32 zeros already zero from bytearray init
     return bytes(buf)
 
@@ -558,34 +577,36 @@ _TID_INFO = b'Template ID' + b'\x00' * 32
 assert len(_TID_INFO) == 43
 
 
-def compute_tid(working_state: bytes,
-                reserved_u32: bytes = b'\x00\x00\x00\x00') -> bytes:
+def compute_tid(ws_body: bytes) -> bytes:
     """Compute the 32-byte TemplateId for a Match-on-Host finger template.
 
     Recipe verified end-to-end against a Wine-captured enrollment
-    (enroll-fresh.log lines 1570→1583) and against the TID stored at
-    offset 23072 of the chip-accepted template:
+    (enroll-fresh.log lines 1570→1583) and against the stored TID at
+    envelope offset 23072..23104 of every captured template:
 
-        K   = SHA-256(reserved_u32 ‖ working_state[:23052])
+        K   = SHA-256(ws_body)
         T1  = HMAC-SHA256(K, "Template ID" ‖ 32×0x00)
         TID = HMAC-SHA256(K, T1 ‖ "Template ID" ‖ 32×0x00)
 
-    The key K is derived from the WS body itself, so there is no
-    device-bound secret involved. Anyone with the working state can
-    recompute the TID. See dev/MOH.md "TID derivation".
+    K is derived from the WS body itself, so there is no device-bound
+    secret involved. Anyone with the WS body can recompute the TID. See
+    dev/MOH.md "TID derivation".
 
-    The hash input runs from envelope offset 12 (the 4-byte u32 reserved
-    field that immediately precedes the working state) through offset
-    12+23056 — i.e. it includes the 4 reserved zeros and excludes the
-    last 4 bytes of the 23056-byte working state. Pass the full WS body
-    here; the slicing is handled internally.
+    Args:
+        ws_body: 23056-byte chip-view WS body. In a captured envelope
+            this is the slice template[12:12+23056] — the bytes the
+            chip parses as the TLV1 payload. Always begins with 4
+            natural-zero bytes and ends with feature data tail; does
+            NOT include the TLV2 header that lives between the WS body
+            and the TID at envelope offset 23068.
+
+    Returns:
+        The 32-byte TID, identical to template[23072:23104] for any
+        valid captured template.
     """
-    if len(working_state) != 23056:
-        raise ValueError(f"working_state must be 23056 bytes, got {len(working_state)}")
-    if len(reserved_u32) != 4:
-        raise ValueError(f"reserved_u32 must be 4 bytes, got {len(reserved_u32)}")
+    if len(ws_body) != 23056:
+        raise ValueError(f"ws_body must be 23056 bytes, got {len(ws_body)}")
 
-    K = hashlib.sha256(reserved_u32 + working_state[:23052]).digest()
+    K = hashlib.sha256(ws_body).digest()
     T1 = hmac.new(K, _TID_INFO, hashlib.sha256).digest()
-    TID = hmac.new(K, T1 + _TID_INFO, hashlib.sha256).digest()
-    return TID
+    return hmac.new(K, T1 + _TID_INFO, hashlib.sha256).digest()

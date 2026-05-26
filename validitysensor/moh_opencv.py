@@ -68,21 +68,34 @@ FILL_GRAY       = 128
 # the captured trace. Stored as u16 LE so the wire byte order is `f7 00`.
 DEFAULT_SUBTYPE = 0x00f7
 
-# First 32 bytes of working_state, copied verbatim from a chip-accepted Wine
-# capture. The chip likely validates magic/version bytes here. After byte 32
-# the buffer contains feature data that's free-form to us — for now we fill
-# with our minutia table + zeros.
-WS_MAGIC_PREFIX = bytes.fromhex(
-    "40480000"   # u32 = 0x4840 = 18496 (likely a sub-buffer size)
-    "06020500"   # u16=0x0206, u16=5  — config word 1
-    "02000801"   # u16=2,      u16=0x0108 — config word 2
-    "03020100"   # u16=0x0203, u16=1  — config word 3
-    "00000000"   # u32 zero — reserved/padding
-    "59000000"   # u32 = 89
-    "60000000"   # u32 = 96
-    "58000000"   # u32 = 88
+# The first 40 bytes of the chip-view WS body. Layout decoded across 5
+# captures (see dev/dissect_ws.py multi):
+#
+#   offset  size   field
+#   ───────────────────────────────────────────────────────────────
+#   0       4      ZEROS — natural leading padding (always 0x00*4)
+#   4       4      u32 end_ptr — feature data end offset; 18496 for
+#                  mode A (4 sections), 23036 for mode B (5 sections)
+#   8       4      u32 header word 1 = 0x00050206 (stable across captures)
+#   12      4      u32 header word 2 = 0x01080002 (stable across captures)
+#   16      4      u32 header word 3 — mode discriminator:
+#                  0x00010203 = mode A, 0x01020304 = mode B
+#   20      4      u32 reserved = 0
+#   24      16     four u32 section counts (one per main feature section)
+#
+# We target mode A (simpler, only 4 feature sections), and seed the counts
+# with values observed in fresh.bin — these need to be replaced with the
+# actual per-section feature counts once feature extraction is wired up.
+WS_HEADER_MODE_A = (
+    b'\x00\x00\x00\x00'                  # WS[0..4]   leading zeros
+    + (18496).to_bytes(4, 'little')      # WS[4..8]   end_ptr (mode A)
+    + (0x00050206).to_bytes(4, 'little') # WS[8..12]  header word 1
+    + (0x01080002).to_bytes(4, 'little') # WS[12..16] header word 2
+    + (0x00010203).to_bytes(4, 'little') # WS[16..20] header word 3 (mode A)
+    + b'\x00\x00\x00\x00'                # WS[20..24] reserved
+    # WS[24..40] = 4 u32 section counts, filled in by build_working_state
 )
-assert len(WS_MAGIC_PREFIX) == 32
+assert len(WS_HEADER_MODE_A) == 24
 
 # Wire-trace working-state size on accepted Wine template
 WS_SIZE = 23056
@@ -192,25 +205,55 @@ def pack_minutia(x: int, y: int, descriptor_64: int,
 
 def build_working_state(records: List[bytes],
                          padded_image: np.ndarray) -> bytes:
-    """Assemble the working-state buffer (TLV-1 content).
+    """Assemble the chip-view WS body (the TLV-1 payload).
 
-    Layout (mostly inferred from a chip-accepted Wine capture):
-        offset 0..31:    WS_MAGIC_PREFIX — required magic+config bytes
-        offset 32..8031: 250×32-byte minutia slot table
-        offset 8032..end: feature/calibration data we don't yet reverse —
-                          zero-filled for now. The chip's storage path
-                          accepted this size; matcher accuracy may need
-                          this region to carry real content.
+    The result is 23056 bytes that go directly at envelope offset
+    12..12+23056 (see moh_extract._build_envelope).
+
+    Layout (decoded from captured Wine templates; see dev/MOH.md and
+    dev/dissect_ws.py):
+
+        WS[0..24]      WS_HEADER_MODE_A (24 bytes — see above)
+        WS[24..40]     4 u32 section counts (one per main feature section)
+        WS[40..223]    pre-section-4 region — feature data, currently zero
+        WS[223..293]   70-byte section-4 trailer (anchor — verbatim)
+        WS[293..4817]  section 5 feature data (variable per session)
+        WS[4817..4876] section-5 trailer (anchor — verbatim)
+        WS[4876..9421] section 6 feature data
+        WS[9421..9437] section-6 trailer
+        WS[9437..13961] section 7 feature data
+        WS[13961..13977] section-7 trailer
+        WS[13977..18508] section 8 (mode A: zero-pad through end_ptr=18496)
+        WS[18508..23056] zero-pad through TID
+
+    For now we drop our raw minutia records into section 5 (the largest
+    bucket) and leave the others zero. The chip's matcher will reject
+    until both the per-section anchor trailers are emitted with the
+    right indices *and* the records inside each section match the
+    chip's expected encoding (still unknown — see dev/MOH.md
+    "Open questions"). This function is a scaffold.
     """
-    # 250-slot minutia table
+    # 250-slot minutia table (8000 bytes), padded to MAX_MINUTIAE entries
     pad_to_count = MAX_MINUTIAE - len(records)
     table = b''.join(records) + (b'\0' * 32) * pad_to_count
     assert len(table) == MAX_MINUTIAE * 32, "table is 250×32 = 8000 bytes"
 
     buf = bytearray(WS_SIZE)
-    buf[0:len(WS_MAGIC_PREFIX)] = WS_MAGIC_PREFIX
-    table_off = len(WS_MAGIC_PREFIX)
-    buf[table_off:table_off + len(table)] = table
+    # WS[0..24] — fixed header (zeros, end_ptr, header words, reserved)
+    buf[0:len(WS_HEADER_MODE_A)] = WS_HEADER_MODE_A
+    # WS[24..40] — section counts. Placeholder values that should be
+    # replaced with the actual number of records emitted into each
+    # section once we know how to serialize records. Counts in
+    # fresh.bin: (76, 90, 86, 89).
+    counts = (len(records), 0, 0, 0)
+    buf[24:40] = b''.join(c.to_bytes(4, 'little') for c in counts)
+    # Drop the raw 32-byte minutia table into the start of section 5
+    # (env offset 305 = WS offset 293). This is wrong format-wise (the
+    # chip's matcher expects variable-length packed records, not
+    # 32-byte fixed-stride entries) but is the best placeholder until
+    # the per-record encoding is decoded.
+    section5_start = 293
+    buf[section5_start:section5_start + len(table)] = table
     return bytes(buf)
 
 

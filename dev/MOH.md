@@ -57,21 +57,34 @@ data      23136 bytes        (the envelope below)
 trailer   1 byte             (varies per template — captured per-record)
 ```
 
-The 23136-byte data has this layout:
+The 23136-byte data has this layout (decoded from `sub_180036840` —
+the DLL's envelope serializer):
 
 ```
 offset    size    description
 0         2       u16  subtype          e.g. 0x00f7 (WINBIO_FINGER_UNSPECIFIED_POS_03)
 2         2       u16  version          = 3
-4         2       u16  payload_size     = 8 + ws_size + 32   (== 23096)
+4         2       u16  payload_size     = 4 + ws_size + 4 + 32 (== 23096)
 6         2       u16  trailing_size    = 32
 8         2       u16  tlv1_tag         = 1
-10        2       u16  tlv1_len         = ws_size            (== 23056)
-12        4       u32  reserved         = 0
-16        23056   working_state        encrypted feature data
-23072     32      TemplateId            chip-side identifier (varies per enrollment)
-23104     32      trailing zeros       padding
+10        2       u16  tlv1_len         = ws_size              (== 23056)
+12        23056   ws_body              chip-view "working state" buffer
+                                       — TLV1 payload, plaintext feature data
+23068     2       u16  tlv2_tag         = 2
+23070     2       u16  tlv2_len         = 32                   (TID size)
+23072     32      TemplateId            HMAC-SHA256 over ws_body (see below)
+23104     32      trailing zeros        padding
 ```
+
+Note: the **WS body starts at offset 12, not 16.** Older versions of
+this doc described an 8-byte inner header followed by 4 reserved zeros
+and a 23056-byte WS body at offset 16. That was wrong: the inner header
+is 4 bytes (tag + len, no reserved field) and the WS body's own first
+4 bytes are natural zeros — so the boundary is at offset 12. The
+"reserved field" we previously documented is just the leading zeros of
+the WS body itself. Similarly, the 4 bytes at envelope offset
+23068..23072 are a **TLV2 header** (tag=2, len=32) introducing the TID,
+not part of the WS body — older docs mistook them for "WS body tail".
 
 The **trailer byte** appended after the data isn't a fixed constant —
 captured values include `0x11`, `0x86`, `0x70`, `0xa9`. It's per-record
@@ -165,30 +178,28 @@ alone as a signature.
 The 32-byte TemplateId stored at envelope offset 23072..23104 is a
 **self-MAC**: HMAC-SHA256 with a key derived from the WS body itself.
 Recipe verified end-to-end against `enroll-fresh.log` lines 1570→1583
-and against the TID stored in fresh.bin:
+and against the TID stored in every one of the 5 unique captured
+templates we have:
 
 ```python
 import hashlib, hmac
 
-# Inputs: the 23056-byte WS body and the 4-byte u32 "reserved" field
-# that immediately precedes it at envelope offset 12.
-# (In a freshly built envelope the reserved field is 4 × 0x00.)
+# ws_body = template[12:12+23056]  — the chip-view WS body, identical to
+# the TLV1 payload the envelope serializer writes at envelope offsets
+# 12..12+23056. Always begins with 4 natural-zero bytes.
 
-K = hashlib.sha256(reserved_u32 + ws_body[:23052]).digest()
+K   = hashlib.sha256(ws_body).digest()
 info = b"Template ID" + b"\x00" * 32                  # 43 bytes, literal
 T1  = hmac.new(K, info,        hashlib.sha256).digest()
 TID = hmac.new(K, T1 + info,   hashlib.sha256).digest()
 ```
 
-Three things worth noting:
+Two things worth noting:
 
 - **K is derived from the WS body itself**, so there is no device-bound
-  or session-bound secret. Re-enrolling the same WS body would produce
-  the same TID. Different captures of the same finger get different
-  TIDs because the WS body itself varies (feature-extraction noise).
-- **The hash input is *not* the full 23056-byte WS body** — it's the
-  4-byte reserved field plus the first 23052 bytes of WS. The last
-  4 bytes of WS are excluded. Be careful when re-implementing.
+  or session-bound secret. Anyone with the WS body bytes can recompute
+  the TID. Different captures of the same finger get different TIDs
+  because the WS body itself varies (feature-extraction noise).
 - **The `"Template ID"` literal is the DLL's domain-separation label.**
   Other records in the database probably use different labels with the
   same HMAC construction; we haven't traced them.
