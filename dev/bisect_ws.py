@@ -257,6 +257,33 @@ def enroll_and_match_fresh(data_path: str = '/tmp/wine_finger_fresh.bin',
             print(f"  cleanup failed: {e!r}")
 
 
+def test_trailer_sweep(values=(b'\x00', b'\x11', b'\x86', b'\x70', b'\xa9', b'\xff')):
+    """G: does the 1-byte wire trailer matter?
+
+    Sends the same Wine-captured template with several trailer values.
+    Each success is del_record'd before the next attempt so duplicate
+    (parent, subtype) deduplication doesn't interfere.
+
+    Three possible outcomes:
+      - All values accepted (status 0x0000) → trailer value is irrelevant;
+        the byte must be present but any value works.
+      - Some accepted, some rejected → trailer is validated in some way;
+        rejected status code tells us what kind of check.
+      - All rejected → chip state is degraded; recover via Wine re-enroll.
+    """
+    print("=== G: trailer-value sweep against Wine verbatim ===")
+    results = []
+    for t in values:
+        status = send_finger(WINE_FINGER_DATA, f"G: trailer=0x{t.hex()}",
+                             cleanup_on_success=True, trailer=t)
+        results.append((t.hex(), status))
+    print("\nSummary:")
+    for hex_val, status in results:
+        verdict = 'ACCEPTED' if status == 0 else f'rejected 0x{status:04x}'
+        print(f"  trailer=0x{hex_val}  →  {verdict}")
+    return results
+
+
 if __name__ == '__main__':
     import sys
 
@@ -278,7 +305,10 @@ if __name__ == '__main__':
         # End-to-end match test against the fresh enrollment capture.
         print("=== Enroll fresh-capture finger + try matching ===")
         enroll_and_match_fresh()
+    elif mode == 'trailer-sweep':
+        # Does the trailer byte matter? Replay Wine-verbatim with varied trailers.
+        test_trailer_sweep()
     else:
         print(f"unknown mode: {mode!r}")
-        print(f"usage: python -m dev.bisect_ws [bisect|match-fresh]")
+        print(f"usage: python -m dev.bisect_ws [bisect|match-fresh|trailer-sweep]")
         sys.exit(2)
