@@ -326,6 +326,7 @@ print(sensor.identify(lambda e: print(f"retry: {e}")))
 | `0x0007` | Transient capture failure during `identify()`             | The `update_cb` retries automatically; no action |
 | `0x0401` | Opcode not supported on this device                        | You called a MoC-only opcode (e.g. `enrollment_update_start` opcode 0x68) on a MoH chip |
 | `0x0403` | Storage rejection — template framing/size wrong            | Re-check the 23136-byte envelope structure |
+| `0x04b3` | No such parent dbid                                        | The `parent` field of `0x47 new_record` references a user dbid that doesn't exist on the chip. Run `db.dump_all()` to see which user dbids are real, then resend with a valid parent. Don't diagnose record-content issues until parent existence is confirmed. |
 | `0x04b5` | Chip in bad state                                          | Re-enroll on Wine (see "Chip-state recovery" below) |
 | `0x04c3` | Duplicate `(parent_user, subtype)` enrollment              | `del_record` the existing finger or use a different subtype |
 | `0x04d7` | `db_write_enable` invalid                                  | Truncate the captured blob to 2693 bytes (strip trailing Wine TLS HMAC+pad) |

@@ -99,10 +99,12 @@ WS_SIZE = 23056
 # ─── Structural anchors borrowed verbatim from a chip-accepted Wine capture
 #     (fresh.bin, mode A). The chip's parser walks the WS body looking for
 #     these section trailers (the `<idx> 00b81100 …fa` markers) to find
-#     section boundaries. Without them we get 0x04b3 (chip-side content
-#     validation failure). With them the chip can at least PARSE our
-#     envelope; whether the matcher then accepts our minutiae is a separate
-#     question of per-record encoding (still unknown).
+#     section boundaries. We don't yet have empirical proof of what happens
+#     when they're missing — the previous 0x04b3 we attributed to missing
+#     anchors turned out to be "no such parent dbid" (see dev/MOH.md error
+#     code table). The anchors are still required on first principles
+#     since real fresh.bin contains them at exactly these offsets, but
+#     the chip's exact failure mode when they're absent is unknown.
 #
 #     These bytes are not finger-specific — they were the same across all
 #     three mode-A captures we have. The 70-byte SECT4_TRAILER and the
