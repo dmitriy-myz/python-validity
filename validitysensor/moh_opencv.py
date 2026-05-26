@@ -82,10 +82,6 @@ DEFAULT_SUBTYPE = 0x00f7
 #                  0x00010203 = mode A, 0x01020304 = mode B
 #   20      4      u32 reserved = 0
 #   24      16     four u32 section counts (one per main feature section)
-#
-# We target mode A (simpler, only 4 feature sections), and seed the counts
-# with values observed in fresh.bin — these need to be replaced with the
-# actual per-section feature counts once feature extraction is wired up.
 WS_HEADER_MODE_A = (
     b'\x00\x00\x00\x00'                  # WS[0..4]   leading zeros
     + (18496).to_bytes(4, 'little')      # WS[4..8]   end_ptr (mode A)
@@ -99,6 +95,68 @@ assert len(WS_HEADER_MODE_A) == 24
 
 # Wire-trace working-state size on accepted Wine template
 WS_SIZE = 23056
+
+# ─── Structural anchors borrowed verbatim from a chip-accepted Wine capture
+#     (fresh.bin, mode A). The chip's parser walks the WS body looking for
+#     these section trailers (the `<idx> 00b81100 …fa` markers) to find
+#     section boundaries. Without them we get 0x04b3 (chip-side content
+#     validation failure). With them the chip can at least PARSE our
+#     envelope; whether the matcher then accepts our minutiae is a separate
+#     question of per-record encoding (still unknown).
+#
+#     These bytes are not finger-specific — they were the same across all
+#     three mode-A captures we have. The 70-byte SECT4_TRAILER and the
+#     SECT5_TLV_TABLE encode chip configuration constants (like the 0xfa=250
+#     MAX_MINUTIAE marker) that the chip's parser pattern-matches on.
+
+PRE_SECT4 = bytes.fromhex(
+    "0004017b2389ff000046f0ffff5b7be8ff9561e8ff8821acff0000e7f2ffffda"
+    "7af6ffb320eaff98237fff0000c4efffff4e35fbffa559f1ffa11df0ff0000af"
+    "0500004d290e00796d01008221fcff0000f00200003989130092630800a51e00"
+    "000100e4feffff798a050098dd06000000000000000000000000000000000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "0000000000000000000000000000000000000000000000"
+)
+assert len(PRE_SECT4) == 183   # WS[40..223]
+
+SECT4_TRAILER = bytes.fromhex(
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "000000000000000000000000000000000000000000000000000400b811000000"
+    "0000000000fa"
+)
+assert len(SECT4_TRAILER) == 70   # WS[223..293]
+
+SECT5_SHORT_MARK = bytes.fromhex(
+    "000000680004000000000003000400"
+)
+assert len(SECT5_SHORT_MARK) == 15   # WS[4817..4832]
+
+SECT5_TLV_TABLE = bytes.fromhex(
+    "0000006900080070000000700000006b000400050000006c0010000000000000"
+    "0000000100000003000000"
+)
+assert len(SECT5_TLV_TABLE) == 43   # WS[4833..4876]
+
+SECT6_TRAILER = bytes.fromhex(
+    "0000000600b8110000000000000000fa"
+)
+assert len(SECT6_TRAILER) == 16   # WS[9421..9437]
+
+SECT7_TRAILER = bytes.fromhex(
+    "0000000700b8110000000000000000fa"
+)
+assert len(SECT7_TRAILER) == 16   # WS[13961..13977]
+
+SECT8_BOUNDARY = bytes.fromhex(
+    "0000000000000000"
+)
+assert len(SECT8_BOUNDARY) == 8   # WS[18508..18516]
+
+# Section count tuple we hardcode for now. Borrowed from fresh.bin so the
+# chip sees plausible counts; whether our records match these counts in
+# practice is irrelevant if the chip rejects on record-content checks
+# anyway. Empty (0,0,0,0) might also be worth testing.
+DEFAULT_SECTION_COUNTS = (76, 90, 86, 89)
 
 
 # ─── Step 1-4: image → Harris response map ─────────────────────────────
@@ -210,50 +268,62 @@ def build_working_state(records: List[bytes],
     The result is 23056 bytes that go directly at envelope offset
     12..12+23056 (see moh_extract._build_envelope).
 
-    Layout (decoded from captured Wine templates; see dev/MOH.md and
-    dev/dissect_ws.py):
+    Layout (with structural anchors baked in from fresh.bin):
 
-        WS[0..24]      WS_HEADER_MODE_A (24 bytes — see above)
-        WS[24..40]     4 u32 section counts (one per main feature section)
-        WS[40..223]    pre-section-4 region — feature data, currently zero
-        WS[223..293]   70-byte section-4 trailer (anchor — verbatim)
-        WS[293..4817]  section 5 feature data (variable per session)
-        WS[4817..4876] section-5 trailer (anchor — verbatim)
-        WS[4876..9421] section 6 feature data
-        WS[9421..9437] section-6 trailer
-        WS[9437..13961] section 7 feature data
-        WS[13961..13977] section-7 trailer
-        WS[13977..18508] section 8 (mode A: zero-pad through end_ptr=18496)
-        WS[18508..23056] zero-pad through TID
+        WS[ 0..   24]  WS_HEADER_MODE_A     (24 bytes)
+        WS[24..   40]  4 u32 section counts (16 bytes)
+        WS[40..  223]  PRE_SECT4            (183 bytes — verbatim anchor)
+        WS[223..  293] SECT4_TRAILER        (70 bytes  — verbatim anchor)
+        WS[293.. 4817] section 5 features   (4524 bytes — our minutiae, truncated)
+        WS[4817..4832] SECT5_SHORT_MARK     (15 bytes  — verbatim anchor)
+        WS[4832..4833] 1 byte gap           (varies per session, leave zero)
+        WS[4833..4876] SECT5_TLV_TABLE      (43 bytes  — verbatim anchor)
+        WS[4876..9421] section 6 features   (4545 bytes — zeros)
+        WS[9421..9437] SECT6_TRAILER        (16 bytes  — verbatim anchor)
+        WS[9437..13961] section 7 features  (4524 bytes — zeros)
+        WS[13961..13977] SECT7_TRAILER      (16 bytes  — verbatim anchor)
+        WS[13977..18508] section 8 region   (4531 bytes — zeros, mode A pad)
+        WS[18508..18516] SECT8_BOUNDARY     (8 bytes   — verbatim anchor)
+        WS[18516..23056] zero-pad           (4540 bytes — through TID region)
 
-    For now we drop our raw minutia records into section 5 (the largest
-    bucket) and leave the others zero. The chip's matcher will reject
-    until both the per-section anchor trailers are emitted with the
-    right indices *and* the records inside each section match the
-    chip's expected encoding (still unknown — see dev/MOH.md
-    "Open questions"). This function is a scaffold.
+    The structural anchors are required: without them the chip rejects
+    with 0x04b3 (content validation failure). With them the chip can at
+    least parse the envelope. Whether the matcher accepts our minutiae
+    inside section 5 is a separate question of per-record encoding —
+    still the open question in dev/MOH.md.
     """
-    # 250-slot minutia table (8000 bytes), padded to MAX_MINUTIAE entries
-    pad_to_count = MAX_MINUTIAE - len(records)
+    # 250-slot minutia table (8000 bytes). Section 5 features region is
+    # 4524 bytes, so we can fit at most 141 of our 32-byte records
+    # there. Truncate if we have more.
+    section5_capacity = 4817 - 293     # 4524 bytes
+    max_records_in_section5 = section5_capacity // 32   # 141
+    records = records[:max_records_in_section5]
+    pad_to_count = max_records_in_section5 - len(records)
     table = b''.join(records) + (b'\0' * 32) * pad_to_count
-    assert len(table) == MAX_MINUTIAE * 32, "table is 250×32 = 8000 bytes"
+    assert len(table) <= section5_capacity
 
     buf = bytearray(WS_SIZE)
-    # WS[0..24] — fixed header (zeros, end_ptr, header words, reserved)
-    buf[0:len(WS_HEADER_MODE_A)] = WS_HEADER_MODE_A
-    # WS[24..40] — section counts. Placeholder values that should be
-    # replaced with the actual number of records emitted into each
-    # section once we know how to serialize records. Counts in
-    # fresh.bin: (76, 90, 86, 89).
-    counts = (len(records), 0, 0, 0)
+
+    # Header + counts
+    buf[0:24] = WS_HEADER_MODE_A
+    counts = DEFAULT_SECTION_COUNTS
     buf[24:40] = b''.join(c.to_bytes(4, 'little') for c in counts)
-    # Drop the raw 32-byte minutia table into the start of section 5
-    # (env offset 305 = WS offset 293). This is wrong format-wise (the
-    # chip's matcher expects variable-length packed records, not
-    # 32-byte fixed-stride entries) but is the best placeholder until
-    # the per-record encoding is decoded.
-    section5_start = 293
-    buf[section5_start:section5_start + len(table)] = table
+
+    # Section anchors (verbatim from fresh.bin)
+    buf[ 40:  223] = PRE_SECT4
+    buf[223:  293] = SECT4_TRAILER
+    buf[293:  293 + len(table)] = table      # our minutiae in section 5
+    buf[4817: 4832] = SECT5_SHORT_MARK
+    # WS[4832:4833] = 1-byte gap, leave zero
+    buf[4833: 4876] = SECT5_TLV_TABLE
+    # WS[4876:9421] = section 6 zeros
+    buf[9421: 9437] = SECT6_TRAILER
+    # WS[9437:13961] = section 7 zeros
+    buf[13961:13977] = SECT7_TRAILER
+    # WS[13977:18508] = section 8 zeros (mode A zero-pad through end_ptr)
+    buf[18508:18516] = SECT8_BOUNDARY
+    # WS[18516:23056] = trailing zero-pad
+
     return bytes(buf)
 
 
