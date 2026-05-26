@@ -238,27 +238,58 @@ def compute_brief_descriptor(image: np.ndarray, cx: int, cy: int,
 
 
 # ─── Step 7: 32-byte minutia struct packing ────────────────────────────
-# Field offsets recovered from qsort comparators in sub_18000a7c0/_a7e0/
-# _a810/_a940. Tail bytes (+0x14..+0x1f) hold position; layout is a guess.
+# Layout recovered from the orchestrator sub_18000AAB0 + qsort comparators:
+#
+#   offset  size  field      source in the DLL
+#   ───────────────────────────────────────────────────────────────────
+#   0x00    8     head       copied from the v87 metadata stream (opaque;
+#                            8 bytes of per-slot anchor info). We don't
+#                            know its derivation — best guess is it holds
+#                            the BRIEF descriptor or raw detection coords.
+#   0x08    1     active     0/1 — qsort key (sub_18000A7E0)
+#   0x09    1     flag9      tile index 0..8 = (tile_x + 3*tile_y),
+#                            set by the orchestrator's 3x3 grid loop
+#   0x0a    2     pad        zero
+#   0x0c    4     score_c    int32, qsort key (sub_18000A940)
+#   0x10    4     score_10   int32, qsort key (sub_18000A7C0)
+#   0x14    4     x          int32, quantized coord (written by sub_18000A910)
+#   0x18    4     y          int32, quantized coord (written by sub_18000A910)
+#   0x1c    4     tail       unknown
+#
+# This is the IN-MEMORY layout. Whether the WS-body sections store records
+# in exactly this 32-byte form or a denser serialization is still
+# unconfirmed — this is the hypothesis we're testing.
 
 def pack_minutia(x: int, y: int, descriptor_64: int,
                  active: int = 1, flag9: int = 0,
-                 quality: int = 0) -> bytes:
-    """Pack one 32-byte minutia record."""
-    # Split 64-bit descriptor into two signed int32 halves.
-    # The qsort comparators sort by these as signed values, so we keep them signed.
-    low  = descriptor_64 & 0xffffffff
-    high = (descriptor_64 >> 32) & 0xffffffff
-    score_c  = low  if low  < 0x80000000 else low  - 0x100000000
-    score_10 = high if high < 0x80000000 else high - 0x100000000
+                 score_c: int = 0, score_10: int = 0) -> bytes:
+    """Pack one 32-byte minutia record in the decoded in-memory layout.
 
-    head    = pack('<HHHH', x & 0xffff, y & 0xffff, 0, 0)         # +0x00..+0x08
-    middle  = pack('<BBxx', active, flag9)                          # +0x08..+0x0c
-    scores  = pack('<ii', score_c, score_10)                        # +0x0c..+0x14
-    tail    = pack('<HHHHHHHH', quality, 0, 0, 0, 0, 0, 0, 0)       # +0x14..+0x24
-    record  = head + middle + scores + tail[:12]
+    head (+0x00..+0x08) gets the 64-bit BRIEF descriptor as our best
+    guess for the opaque per-slot metadata. x/y land at +0x14/+0x18
+    where the orchestrator's quantize stage writes them.
+    """
+    def s32(v):
+        v &= 0xffffffff
+        return v - 0x100000000 if v >= 0x80000000 else v
+
+    head   = pack('<Q', descriptor_64 & 0xffffffffffffffff)   # +0x00..+0x08
+    middle = pack('<BBxx', active & 0xff, flag9 & 0xff)        # +0x08..+0x0c
+    scores = pack('<ii', s32(score_c), s32(score_10))          # +0x0c..+0x14
+    coords = pack('<ii', x, y)                                 # +0x14..+0x1c
+    tail   = pack('<I', 0)                                      # +0x1c..+0x20
+    record = head + middle + scores + coords + tail
     assert len(record) == 32, f"minutia is 32 bytes, got {len(record)}"
     return record
+
+
+def tile_index(x: int, y: int, width: int, height: int) -> int:
+    """3x3 grid tile index (0..8) = tile_x + 3*tile_y, matching the
+    orchestrator's `v24 + 3*v75` loop. x/y are coords in the original
+    (unpadded) image."""
+    tx = min(2, max(0, x * 3 // max(1, width)))
+    ty = min(2, max(0, y * 3 // max(1, height)))
+    return tx + 3 * ty
 
 
 # ─── Step 8: build the working-state buffer ────────────────────────────
@@ -366,8 +397,14 @@ def extract_template(image: np.ndarray,
         descriptor = compute_brief_descriptor(padded, px, py, tests)
         x = px - PATCH_RADIUS
         y = py - PATCH_RADIUS
-        quality = int(min(max(score / 1000.0, 0), 0xffff))
-        records.append(pack_minutia(x, y, descriptor, quality=quality))
+        score_i = int(min(max(score, -2**31), 2**31 - 1))
+        records.append(pack_minutia(
+            x, y, descriptor,
+            active=1,
+            flag9=tile_index(x, y, SENSOR_W, SENSOR_H),
+            score_c=score_i,
+            score_10=score_i,
+        ))
 
     # 8. Build working state buffer + derive TID via the DLL's HMAC recipe
     ws = build_working_state(records, padded)
