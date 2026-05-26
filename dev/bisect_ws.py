@@ -37,9 +37,13 @@ WINE_WS  = WINE_FINGER_DATA[16:16+23056]
 WINE_TID = WINE_FINGER_DATA[23072:23104]
 
 
+DEFAULT_PARENT = 5    # which user dbid to attach the finger to; override per-call
+
+
 def send_finger(template_bytes: bytes, label: str,
                 cleanup_on_success: bool = True,
-                trailer: bytes = b'\x11') -> int:
+                trailer: bytes = b'\x11',
+                parent: int = DEFAULT_PARENT) -> int:
     """Send a 23136-byte template via the new_finger pipeline. Returns chip status.
 
     On success, optionally del_record the newly-created entry so subsequent
@@ -48,10 +52,15 @@ def send_finger(template_bytes: bytes, label: str,
     The wire trace shows a 1-byte trailer after the data that varies per
     enrollment (0x11 in enroll.log, 0x86 in enroll-fresh.log) — let callers
     override it when replaying captured templates.
+
+    `parent` is the user dbid the finger record gets attached to. Use
+    `db.dump_all()` to see what users exist before sending; storing under
+    a non-existent dbid succeeds at the storage layer but matching will
+    silently fail to find the enrollment.
     """
     assert len(template_bytes) == 23136, f"{label}: bad size {len(template_bytes)}"
     assert len(trailer) == 1
-    parent, typ, storage = 5, 6, 3
+    typ, storage = 6, 3
     opcode_msg = (pack('<BHHHH', 0x47, parent, typ, storage, len(template_bytes))
                   + template_bytes + trailer)
     db.db_info()
@@ -204,10 +213,15 @@ def enroll_and_match_under(parent: int,
 
 def enroll_and_match_fresh(data_path: str = '/tmp/wine_finger_fresh.bin',
                             trailer_path: str = '/tmp/wine_finger_fresh.trailer',
+                            parent: int = DEFAULT_PARENT,
                             cleanup_on_match: bool = True) -> None:
     """End-to-end: store the fresh-enroll capture, ask user to place finger,
     call match_finger(). Useful to check whether the chip's matcher actually
     recognises the live finger that was enrolled in this fresh Wine session.
+
+    `parent` is the user dbid the test record attaches to. Default is 5
+    but the chip's user-dbid assignment is not stable across re-pairings
+    — check `db.dump_all()` if the default parent doesn't exist.
 
     Different from the bisection tests because we DON'T cleanup on success
     before matching (the record must exist for the matcher to find it).
@@ -220,10 +234,11 @@ def enroll_and_match_fresh(data_path: str = '/tmp/wine_finger_fresh.bin',
         trailer = f.read()
     assert len(data) == 23136
     assert len(trailer) == 1
-    print(f"fresh enroll: subtype=0x{data[0]:02x}{data[1]:02x} trailer=0x{trailer.hex()}")
+    print(f"fresh enroll: subtype=0x{data[0]:02x}{data[1]:02x} trailer=0x{trailer.hex()} → parent={parent}")
 
     # Send the template (no cleanup — we need the record present for matching)
-    status = send_finger(data, "fresh: enroll", cleanup_on_success=False, trailer=trailer)
+    status = send_finger(data, "fresh: enroll", cleanup_on_success=False,
+                         trailer=trailer, parent=parent)
     if status != 0:
         print("  enroll failed; cannot try matching")
         return
@@ -241,14 +256,14 @@ def enroll_and_match_fresh(data_path: str = '/tmp/wine_finger_fresh.bin',
 
     if cleanup_on_match:
         # Find the record we just created. db.dump_all() walks the tree but
-        # we want the dbid we just got — easiest: refetch & take the newest.
+        # we want the dbid we just got — easiest: refetch & take the newest
+        # under the parent we used.
         try:
             from validitysensor.db import db as _db
             stg = _db.get_user_storage(name='StgWindsor')
             usrs = [_db.get_user(u['dbid']) for u in stg.users]
-            # Find the latest finger we just added (highest dbid under user 5)
             for u in usrs:
-                if u.dbid == 5 and u.fingers:
+                if u.dbid == parent and u.fingers:
                     recid = max(f['dbid'] for f in u.fingers)
                     _db.del_record(recid)
                     print(f"  cleaned up dbid={recid}")
@@ -257,7 +272,8 @@ def enroll_and_match_fresh(data_path: str = '/tmp/wine_finger_fresh.bin',
             print(f"  cleanup failed: {e!r}")
 
 
-def test_trailer_sweep(values=(b'\x00', b'\x11', b'\x86', b'\x70', b'\xa9', b'\xff')):
+def test_trailer_sweep(values=(b'\x00', b'\x11', b'\x86', b'\x70', b'\xa9', b'\xff'),
+                       parent: int = DEFAULT_PARENT):
     """G: does the 1-byte wire trailer matter?
 
     Sends the same Wine-captured template with several trailer values.
@@ -271,11 +287,11 @@ def test_trailer_sweep(values=(b'\x00', b'\x11', b'\x86', b'\x70', b'\xa9', b'\x
         rejected status code tells us what kind of check.
       - All rejected → chip state is degraded; recover via Wine re-enroll.
     """
-    print("=== G: trailer-value sweep against Wine verbatim ===")
+    print(f"=== G: trailer-value sweep against Wine verbatim (parent={parent}) ===")
     results = []
     for t in values:
         status = send_finger(WINE_FINGER_DATA, f"G: trailer=0x{t.hex()}",
-                             cleanup_on_success=True, trailer=t)
+                             cleanup_on_success=True, trailer=t, parent=parent)
         results.append((t.hex(), status))
     print("\nSummary:")
     for hex_val, status in results:
@@ -289,10 +305,26 @@ if __name__ == '__main__':
 
     _ensure_sensor_open()
 
-    mode = sys.argv[1] if len(sys.argv) > 1 else 'bisect'
+    args = sys.argv[1:]
+    mode = args[0] if args else 'bisect'
+
+    # Optional second arg: parent user dbid (override DEFAULT_PARENT)
+    parent = DEFAULT_PARENT
+    if len(args) >= 2:
+        try:
+            parent = int(args[1])
+        except ValueError:
+            print(f"bad parent arg {args[1]!r}; must be an integer dbid", file=sys.stderr)
+            sys.exit(2)
 
     if mode == 'bisect':
         # The original bisection — verify chip-acceptance of WS variants.
+        # (uses send_finger's default parent; pass an arg to override globally
+        # would require threading parent through every test_* function — for
+        # now bisect just uses DEFAULT_PARENT)
+        if parent != DEFAULT_PARENT:
+            print(f"note: bisect mode currently uses DEFAULT_PARENT={DEFAULT_PARENT};"
+                  f" edit module-level constant to use parent={parent}")
         print("=== Bisection: find what in WS makes the chip accept ===")
         baseline_wine()                          # A
         test_wine_via_our_builder()              # B — must match A
@@ -303,12 +335,12 @@ if __name__ == '__main__':
         test_zero_first(32)                      # F — zero only magic prefix
     elif mode == 'match-fresh':
         # End-to-end match test against the fresh enrollment capture.
-        print("=== Enroll fresh-capture finger + try matching ===")
-        enroll_and_match_fresh()
+        print(f"=== Enroll fresh-capture finger + try matching (parent={parent}) ===")
+        enroll_and_match_fresh(parent=parent)
     elif mode == 'trailer-sweep':
         # Does the trailer byte matter? Replay Wine-verbatim with varied trailers.
-        test_trailer_sweep()
+        test_trailer_sweep(parent=parent)
     else:
         print(f"unknown mode: {mode!r}")
-        print(f"usage: python -m dev.bisect_ws [bisect|match-fresh|trailer-sweep]")
+        print(f"usage: python -m dev.bisect_ws [bisect|match-fresh|trailer-sweep] [parent_dbid]")
         sys.exit(2)
