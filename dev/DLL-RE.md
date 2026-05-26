@@ -277,8 +277,24 @@ Detailed in `dev/MOH.md`. Summary:
    - `bcrypt.dll` calls from `sub_1800A4AD0` and friends
    - Any `CryptEncrypt` / `BCryptEncrypt` call sites
    - Key derivation: where does the per-device key live?
-2. **What is the 32-byte TID at offset 23072?** Not plain SHA-256 of WS,
-   but is derived by `sub_1800E0A60`. Worth tracing.
+2. **How is the 32-byte TID at offset 23072 derived?** Not plain SHA-256
+   of WS, but is built by `sub_1800E0A60` → `sub_18004B710`. Empirically
+   we know *what it's for*: `sensor.identify()` returns it as the
+   third tuple element (the "hash"), so it's the chip-surfaced
+   per-enrollment ID (see `dev/MOH.md` "Identify-hash semantics").
+   What's unknown is the input recipe — whether it's keyed by the
+   per-device key, whether it includes session randomness, whether
+   it's a digest of the post-orchestrator WS or of the post-encryption
+   WS. Two competing hypotheses worth resolving:
+   - **Host-derived**: the DLL computes the TID and writes it into the
+     envelope before sending. Consistent with the fact that the host
+     places exact bytes at offset 23072 of the wire payload.
+   - **Chip-generated**: the chip returns the TID on the enrollment
+     finalize frame and the host just embeds it. Suggested by the
+     observed MoH-vs-MoC difference at `sub_18002A0E8` — MoC passes a
+     write-back pointer that *receives* a TID from the chip; MoH
+     passes `NULL` for that slot (transcript ~L680). One of these
+     two readings is wrong; resolving which is a useful next step.
 3. **What is the trailer byte?** Hash byte? Subtype-related? Per-record
    counter encoded in single byte?
 4. **What do offsets 4845, 9433, 13973 in the WS actually represent?**

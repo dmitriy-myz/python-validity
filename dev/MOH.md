@@ -118,19 +118,38 @@ the existing one first, or use a different subtype.
 
 ## Identify-hash semantics
 
-`sensor.identify()` returns `(usrid, subtype, hash)` where `hash` is **a
-stable function of the matching stored template**:
+`sensor.identify()` returns `(usrid, subtype, hash)` where `hash` is
+**exactly the 32-byte TID stored at offset 23072..23104 of the matched
+template** — i.e. the chip surfaces the matched record's TID as the
+hash output.
 
-- Same `hash` is returned every time *that enrollment* wins the match.
+Two empirical pairs confirm this (transcript L8999, L9554):
+
+| Stored template     | TID at offset 23072..23104                  | `identify()` hash                            |
+|---------------------|---------------------------------------------|----------------------------------------------|
+| `fresh.bin`         | `f7a4f2af83682009e934a8668cc1ade8…c257ff`   | `f7a4f2af83682009e934a8668cc1ade8…c257ff`    |
+| `fresh3.bin`        | `b89e852413091c002c76a278085cd985…365ff9`   | `b89e852413091c002c76a278085cd985…365ff9`    |
+
+Properties that follow:
+
+- Same `hash` is returned every time *that enrollment* wins the match,
+  because the TID lives in the stored template and the chip just reads
+  it back.
 - Independent of who placed their finger (as long as the same stored
   enrollment is the best match).
-- Independent of the parent user, the subtype value, or which Wine
-  session originally captured the template.
-- NOT the same as the TID at offset 23072 (that's a separate field).
+- Independent of the parent user dbid and subtype byte under which the
+  template is stored — those can be patched (see the
+  `override_subtype` test) and the hash still equals the original
+  TID.
+- Different captures of the same finger produce *different* hashes,
+  because each Wine enrollment session generates its own TID.
 
 This makes the hash a useful **per-enrollment stable identifier**.
 Downstream code can use it as a user-bound auth primitive: link it to
 account state, treat its return as proof that the right enrollment fired.
+Note: the *derivation* of the TID inside the Windows DLL is still
+unknown — only its surfacing through `identify()` has been established
+(see `dev/DLL-RE.md` open question #2).
 
 ## Workflow
 
