@@ -11,15 +11,22 @@ enrollment + matching working on Linux.
 - The chip's **matcher works with templates captured by the Windows DLL.**
   We can replay a captured 4705 wire payload from a Wine session onto a
   Linux device and the chip will match a live finger against it.
-- **Encryption is device-bound, not session-bound.** A template captured
-  in one Wine session works for matching across reboots and Linux sessions
-  on the same physical chip.
-- **Pure host-side feature extraction does NOT work.** The 23 KB template
-  body has entropy ~7.7 bits/byte (essentially random) and differs by 96%
-  between two captures of the same finger. The chip's matcher expects
-  bytes that have been processed by the Windows DLL's encryption layer.
-- The workflow that *does* work today: **enroll once via Wine, persist
-  the .bin file, replay onto Linux.**
+- **The WS body is NOT encrypted.** It's plaintext signed-int32 feature
+  data plus structural padding. The high entropy (~7.7 bits/byte) and the
+  96% inter-capture byte diff both reflect natural variability of
+  fingerprint feature extraction across slightly different image captures,
+  not encryption. `db.dump_raw` returns the bytes verbatim.
+- **The 32-byte TemplateId at offset 23072 is a self-MAC**, derived
+  deterministically from the WS body via HMAC-SHA256 with K=SHA-256(WS).
+  No device-bound secret is involved; anyone with the WS body can
+  recompute the TID. See "TID derivation" below.
+- **`sensor.identify()`'s hash output equals this TID** — the chip
+  surfaces the matched record's TID as the 32-byte identifier in the
+  return tuple. See "Identify-hash semantics".
+- The workflow that works today: **enroll once via Wine, persist the
+  .bin file, replay onto Linux.** Native Linux enrollment is now blocked
+  only on producing a chip-acceptable WS body; the TID falls out of an
+  11-line recipe (`validitysensor/moh_extract.compute_tid`).
 
 ## Why python-validity didn't support enrollment for this device
 
@@ -27,7 +34,7 @@ This driver was originally written for Match-on-Chip (MoC) Synaptics
 sensors where the chip does its own feature extraction during enrollment.
 The MoH sensors split the work: the chip captures images and matches
 templates, but **the host (Windows DLL) does feature extraction and
-encryption**. python-validity's `sensor.enroll()` flow calls
+template serialization**. python-validity's `sensor.enroll()` flow calls
 `enrollment_update_start` (opcode 0x68), which MoH chips reject with
 `0x0401` (unsupported).
 
@@ -144,12 +151,61 @@ Properties that follow:
 - Different captures of the same finger produce *different* hashes,
   because each Wine enrollment session generates its own TID.
 
-This makes the hash a useful **per-enrollment stable identifier**.
-Downstream code can use it as a user-bound auth primitive: link it to
-account state, treat its return as proof that the right enrollment fired.
-Note: the *derivation* of the TID inside the Windows DLL is still
-unknown — only its surfacing through `identify()` has been established
-(see `dev/DLL-RE.md` open question #2).
+This makes the hash a useful **per-enrollment stable identifier**, but
+*not* a tamper-evident auth primitive on its own: the TID is a
+deterministic function of the stored WS body (see "TID derivation"
+below), so anyone with the WS bytes can recompute it. The hash proves
+"this enrollment matched", not "this enrollment came from a trusted
+source." For auth, treat the hash as an opaque per-enrollment ID and
+bind it to account state at enrollment time — don't trust the hash
+alone as a signature.
+
+## TID derivation
+
+The 32-byte TemplateId stored at envelope offset 23072..23104 is a
+**self-MAC**: HMAC-SHA256 with a key derived from the WS body itself.
+Recipe verified end-to-end against `enroll-fresh.log` lines 1570→1583
+and against the TID stored in fresh.bin:
+
+```python
+import hashlib, hmac
+
+# Inputs: the 23056-byte WS body and the 4-byte u32 "reserved" field
+# that immediately precedes it at envelope offset 12.
+# (In a freshly built envelope the reserved field is 4 × 0x00.)
+
+K = hashlib.sha256(reserved_u32 + ws_body[:23052]).digest()
+info = b"Template ID" + b"\x00" * 32                  # 43 bytes, literal
+T1  = hmac.new(K, info,        hashlib.sha256).digest()
+TID = hmac.new(K, T1 + info,   hashlib.sha256).digest()
+```
+
+Three things worth noting:
+
+- **K is derived from the WS body itself**, so there is no device-bound
+  or session-bound secret. Re-enrolling the same WS body would produce
+  the same TID. Different captures of the same finger get different
+  TIDs because the WS body itself varies (feature-extraction noise).
+- **The hash input is *not* the full 23056-byte WS body** — it's the
+  4-byte reserved field plus the first 23052 bytes of WS. The last
+  4 bytes of WS are excluded. Be careful when re-implementing.
+- **The `"Template ID"` literal is the DLL's domain-separation label.**
+  Other records in the database probably use different labels with the
+  same HMAC construction; we haven't traced them.
+
+A reference implementation lives in
+`validitysensor/moh_extract.compute_tid()`.
+
+## Why the OpenCV PoC didn't match
+
+The chip's storage path doesn't validate the TID (bisection confirms:
+zero TID is accepted on write). But the **matcher** very likely
+re-derives K and TID on the stored record as a structural integrity
+check before running comparison — that's the cheapest way to detect a
+truncated or corrupted WS body. An OpenCV-extracted template with the
+wrong TID stores fine but never matches. The fix is to compute the TID
+via `compute_tid(ws)` after building the WS body and write it into the
+envelope at offset 23072.
 
 ## Workflow
 
@@ -218,20 +274,37 @@ print(sensor.identify(lambda e: print(f"retry: {e}")))
 
 ## Open questions
 
-- **What is the WS encryption scheme?** Entropy ~7.7 bits/byte and 96%
-  inter-capture diff strongly suggest AES or similar with a device-bound
-  key. Reverse-engineering the DLL's encryption is the path to
-  Linux-native enrollment. Until then, Wine is required for enrollment.
+- **What is the exact WS body layout?** This is now the only blocker
+  for native Linux enrollment. The body is *plaintext* signed-int32
+  feature data + headers + padding (proven by the TID recipe working
+  on the bytes as-is, no decryption step needed), but we haven't fully
+  mapped the structure. The DLL-RE notes have a partial picture:
+  32-byte minutia records starting after a magic header, stable
+  section anchors at offsets 4845/9433/13973 carrying `0xfa = 250`,
+  and 250 slots. The remaining unknowns are the per-slot tail bytes
+  (+0x14..+0x1f), the header configuration words, and the trailing
+  feature/calibration region.
 
 - **What determines the trailer byte?** Captured values vary
   (0x11, 0x70, 0x86, 0xa9). Probably a record-type or subtype marker the
   chip wants for some kind of internal indexing.
 
-- **What's the structure of the stable anchors inside WS?** Diffing two
-  captures of the same finger reveals 16-byte structured blocks at
-  offsets 4845, 9433, 13973 carrying `0xfa = 250` (MAX_MINUTIAE) and a
-  sequential index. These look like section headers but their semantics
-  aren't fully understood.
+- **Why is the K-derivation input 23056 bytes from envelope offset 12
+  (not 23056 from offset 16)?** The reserved u32 at offset 12..16 is
+  always 0 in captures we've seen, so this doesn't currently affect
+  the recipe — but if the chip ever puts a non-zero value there, the
+  TID would change.
+
+### Resolved
+
+- ~~**What is the WS encryption scheme?**~~ Probably no encryption at
+  all. The WS body is plaintext signed-int feature data; the high
+  entropy reflects the dynamic range of int32 deltas. `db.dump_raw`
+  returns the bytes verbatim, and the TID self-MAC recipe works on the
+  cleartext bytes — both consistent with no symmetric encryption pass.
+
+- ~~**How is the TID derived?**~~ HMAC-SHA256 chain over the WS body
+  itself (see "TID derivation" above).
 
 ## Debugging reference
 

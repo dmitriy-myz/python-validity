@@ -9,8 +9,11 @@ x86-64 PE. Disassembly via IDA Pro / objdump.
 
 The work here is incomplete: about half the pipeline has been mapped
 byte-exactly; the actual feature transforms are partially understood;
-the **encryption step that produces the high-entropy output bytes has
-not been located** (see Open Questions).
+the **per-slot minutia tail bytes and the trailing feature/calibration
+region of the WS body** are still un-decoded (see Open Questions). The
+previously-listed "unknown encryption pass" turned out not to exist —
+the WS body is plaintext signed-int feature data, and the high entropy
+comes from the dynamic range of those values.
 
 ---
 
@@ -31,7 +34,11 @@ sends the result via `new_record`.
 
 The MoH pipeline appears to be Synaptics' internal **`vcsmRidgeMatcher`**
 algorithm: classical computer-vision keypoint detection plus binary
-descriptors plus an opaque encryption pass.
+descriptors, with the assembled template authenticated by a self-MAC
+TID (HMAC-SHA256 chained over the WS body — see TID-derivation notes
+below). No symmetric encryption is applied to the WS body itself; the
+only cipher in play is the TLS-layer AES-256-CBC wrapping the wire
+record.
 
 ---
 
@@ -63,10 +70,8 @@ descriptors plus an opaque encryption pass.
        sub_18000AAB0 ─ 9-stage orchestrator (reshape, qsort, dedup)
                                  │
                                  ▼
-       sub_18004B710 ─ SHA-256(working_state) → 32-byte TID
-                                 │
-                                 ▼
-       ── unknown encryption pass (high-entropy output) ──        ◀── gap
+       sub_1800E0A60 ─ TID = HMAC²-SHA256(K=SHA256(WS), "Template ID")
+                       (calls sub_18004B710 multiple times)
                                  │
                                  ▼
        sub_180036840 ─ serialize envelope: 16-byte header,
@@ -79,10 +84,13 @@ descriptors plus an opaque encryption pass.
                        sent via 0x47 new_record
 ```
 
-**The encryption pass between the post-orchestrator working state and
-the final wire bytes is what makes the entropy of the stored template
-~7.7 bits/byte.** That step is the one we haven't located. See `dev/MOH.md`
-for evidence (two captures of the same finger differ by 96%).
+**No encryption pass is applied to the WS body.** The ~7.7 bits/byte
+entropy of the stored template reflects the dynamic range of signed
+int32 feature values (sign-extended small numbers fill the byte
+distribution evenly), not encryption. The 96% inter-capture byte diff
+is feature-extraction noise — slightly different image captures of the
+same finger produce different minutiae, coordinates, scores, and
+descriptors. See `dev/MOH.md` "TL;DR" and "TID derivation".
 
 ---
 
@@ -201,9 +209,13 @@ The 250-slot minutia table is at session+152 in the session buffer
 | `sub_18004E640`  | Hash output format selector. Returns 32 (SHA-256), 20 (SHA-1), or 16 (MD5) depending on `select` arg | body decompiled |
 | `sub_1800A4AD0`  | Probably CryptDecrypt/CryptDuplicateKey path — touches `bcrypt.dll`, key handles | not fully decompiled |
 
-The 32-byte TID at template offset 23072 is **not** plain SHA-256 of
-the working state (we tested — they don't match). The TID derivation
-involves something else inside `sub_1800E0A60` / `sub_18004E640`.
+The 32-byte TID at template offset 23072 is a **two-iteration
+HMAC-SHA256 chain** with a key derived from the WS body itself,
+not plain SHA-256 of WS. `sub_1800E0A60` is the orchestrator;
+`sub_18004B710` (the CryptHashData wrapper) is invoked multiple times
+to compute K, then T1, then the final TID. Full recipe and reference
+implementation: `dev/MOH.md` "TID derivation" and
+`validitysensor/moh_extract.compute_tid()`.
 
 ### Envelope serialization (the final write step)
 
@@ -270,50 +282,61 @@ Detailed in `dev/MOH.md`. Summary:
 
 ## Open questions / dead ends
 
-1. **Where is the encryption step?** The transition from
-   post-orchestrator working state (structured feature data) to the
-   high-entropy 23056-byte WS body is the missing link. Candidates to
-   investigate:
-   - `bcrypt.dll` calls from `sub_1800A4AD0` and friends
-   - Any `CryptEncrypt` / `BCryptEncrypt` call sites
-   - Key derivation: where does the per-device key live?
-2. **How is the 32-byte TID at offset 23072 derived?** Not plain SHA-256
-   of WS, but is built by `sub_1800E0A60` → `sub_18004B710`. Empirically
-   we know *what it's for*: `sensor.identify()` returns it as the
-   third tuple element (the "hash"), so it's the chip-surfaced
-   per-enrollment ID (see `dev/MOH.md` "Identify-hash semantics").
-   What's unknown is the input recipe — whether it's keyed by the
-   per-device key, whether it includes session randomness, whether
-   it's a digest of the post-orchestrator WS or of the post-encryption
-   WS. Two competing hypotheses worth resolving:
-   - **Host-derived**: the DLL computes the TID and writes it into the
-     envelope before sending. Consistent with the fact that the host
-     places exact bytes at offset 23072 of the wire payload.
-   - **Chip-generated**: the chip returns the TID on the enrollment
-     finalize frame and the host just embeds it. Suggested by the
-     observed MoH-vs-MoC difference at `sub_18002A0E8` — MoC passes a
-     write-back pointer that *receives* a TID from the chip; MoH
-     passes `NULL` for that slot (transcript ~L680). One of these
-     two readings is wrong; resolving which is a useful next step.
-3. **What is the trailer byte?** Hash byte? Subtype-related? Per-record
-   counter encoded in single byte?
-4. **What do offsets 4845, 9433, 13973 in the WS actually represent?**
+1. **What is the trailer byte?** Hash byte? Subtype-related? Per-record
+   counter encoded in single byte? Captured values: `0x11`, `0x70`,
+   `0x86`, `0xa9`.
+2. **What do offsets 4845, 9433, 13973 in the WS actually represent?**
    Diffing two captures shows stable 16-byte structured anchors with a
-   counter (6, 7) and constant `0xfa = 250`. Possibly section headers
-   for sub-blocks of encrypted features.
-5. **The 4 high bytes of the minutia head** (offsets +0..+7) and the
+   counter (6, 7) and constant `0xfa = 250`. Likely section headers
+   for sub-blocks of feature data.
+3. **The 4 high bytes of the minutia head** (offsets +0..+7) and the
    12 tail bytes (+0x14..+0x1f): probably (x, y, theta, type, quality)
    but exact layout not cracked.
+4. **The trailing region of the WS body** (roughly offsets 8000..23052
+   that we haven't mapped to minutia records). Plaintext, but its
+   feature/calibration semantics aren't decoded. Without this region
+   the OpenCV PoC produces WS bodies the chip won't match.
+
+### Resolved (originally listed open questions, now answered)
+
+- ~~**Where is the encryption step?**~~ There isn't one. The WS body is
+  plaintext signed-int32 feature data, not encrypted. The Wine crypto
+  trace (see `dev/MOH.md` "TID derivation") shows that the only
+  symmetric encryption call covering the finger record is the TLS-layer
+  AES-256-CBC wrap of the whole wire payload — which the chip's TLS
+  endpoint decrypts, leaving the WS body in cleartext for storage.
+  `db.dump_raw` returns the same bytes that went in, confirming verbatim
+  storage. The high entropy reflects the dynamic range of signed-int
+  feature values, not encryption.
+
+- ~~**How is the 32-byte TID at offset 23072 derived?**~~ HMAC-SHA256
+  chain with a self-derived key, decoded from `enroll-fresh.log` lines
+  1570→1583:
+
+  ```
+  K   = SHA-256(reserved_u32 ‖ WS[:23052])
+  T1  = HMAC-SHA256(K, "Template ID" ‖ 32×0x00)
+  TID = HMAC-SHA256(K, T1 ‖ "Template ID" ‖ 32×0x00)
+  ```
+
+  No device-bound or session-bound secret. Reference implementation:
+  `validitysensor/moh_extract.compute_tid()`. Verified end-to-end
+  against fresh.bin's stored TID. The "host-derived vs chip-generated"
+  hypothesis pair from the previous version of this question is
+  resolved in favour of **host-derived** — the host computes the TID
+  from the WS body and writes it into the envelope before sending.
 
 ---
 
 ## Files in this repo to look at
 
-- `validitysensor/moh_extract.py` — Python ports of decoded functions,
+- `validitysensor/moh_extract.py` — Python ports of decoded functions:
   constants, qsort keys, Minutia struct, BRIEF seed table, envelope
-  serializer.
+  serializer, and `compute_tid()` (the verified HMAC-SHA256 chain).
 - `validitysensor/moh_opencv.py` — OpenCV-based PoC (Sobel + Harris +
-  BRIEF + envelope). Doesn't produce chip-matchable output because the
-  encryption pass is missing — kept as a reference of the structural
-  pipeline.
-- `dev/MOH.md` — protocol-side findings and replay workflow.
+  BRIEF + envelope + compute_tid). Now produces structurally-valid
+  envelopes with correct TIDs; the open question is whether the
+  feature-extraction approximation is close enough to the DLL's that
+  the chip's matcher accepts our minutiae. Test by running, storing,
+  then identifying — see `dev/MOH.md` "Why the OpenCV PoC didn't match".
+- `dev/MOH.md` — protocol-side findings, replay workflow, TID recipe.

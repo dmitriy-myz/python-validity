@@ -35,6 +35,7 @@ qsort comparators (all 32-byte minutia records):
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 from dataclasses import dataclass, field
 from struct import pack, unpack
@@ -420,27 +421,34 @@ def extract_features(image: bytes, w: int, h: int, ctx: FrameContext,
                      dpi: int = SENSOR_DPI) -> bytes:
     """sub_180001A50. Runs the per-frame pipeline, returns the 32-byte TemplateId.
 
-    The TemplateId is SHA-256 over (some subset of) the working state.
-    Which exact bytes get hashed is determined by whichever path leads
-    into sub_18004B710 — we don't yet know the full input.
+    The TemplateId is HMAC-SHA256 chained over the assembled WS body —
+    see compute_tid() for the verified recipe. Note that this function
+    is still a scaffold: it can't return the chip-accepted TID until
+    orchestrate() actually fills ctx into a full 23056-byte WS body.
     """
     if w > 255:
         w = 255
 
     orchestrate(image, w, h, ctx)
 
-    h_obj = hashlib.sha256()
-    h_obj.update(_serialize_for_hash(ctx))
-    return h_obj.digest()
+    ws = _serialize_for_hash(ctx)
+    if len(ws) != 23056:
+        # Placeholder until orchestrate() emits the full WS body. Returning
+        # a SHA-256 here keeps callers running but the chip's matcher will
+        # not accept the resulting template.
+        log.warning("WS body is %d bytes, expected 23056 — TID will not be chip-valid",
+                    len(ws))
+        return hashlib.sha256(ws).digest()
+    return compute_tid(ws)
 
 
 def _serialize_for_hash(ctx: FrameContext) -> bytes:
-    """Produce the byte sequence fed to CryptHashData.
+    """Produce the WS body bytes (TLV-1 payload of the finger template).
 
-    Provisional: hash all 250 minutia slots (8000 bytes). The DLL's
-    sub_18004B710 actually wraps a CryptoAPI hash context, so the
-    bytes hashed could be a smaller subset. To be confirmed by
-    decompile of the chain leading into sub_18004B710.
+    Provisional: emit the 250×32-byte minutia slot table only (8000 bytes).
+    The chip-accepted WS body is 23056 bytes, so this is short by 15056
+    bytes of feature/calibration data we haven't reverse-engineered yet.
+    To be filled in as orchestrate()'s stage outputs are decoded.
     """
     return b''.join(bytes(m) for m in ctx.minutiae)
 
@@ -540,3 +548,44 @@ def _build_envelope(subtype: int, working_state: bytes, template_id: bytes,
     buf[off:off+tid_size] = template_id
     # Trailing 32 zeros already zero from bytearray init
     return bytes(buf)
+
+
+# ─── TID derivation (sub_1800E0A60 → sub_18004B710 chain) ───────────────
+
+# The literal context string the DLL feeds to its TID HMAC, padded with
+# zeros to 43 bytes. Captured verbatim from enroll-fresh.log line 1573.
+_TID_INFO = b'Template ID' + b'\x00' * 32
+assert len(_TID_INFO) == 43
+
+
+def compute_tid(working_state: bytes,
+                reserved_u32: bytes = b'\x00\x00\x00\x00') -> bytes:
+    """Compute the 32-byte TemplateId for a Match-on-Host finger template.
+
+    Recipe verified end-to-end against a Wine-captured enrollment
+    (enroll-fresh.log lines 1570→1583) and against the TID stored at
+    offset 23072 of the chip-accepted template:
+
+        K   = SHA-256(reserved_u32 ‖ working_state[:23052])
+        T1  = HMAC-SHA256(K, "Template ID" ‖ 32×0x00)
+        TID = HMAC-SHA256(K, T1 ‖ "Template ID" ‖ 32×0x00)
+
+    The key K is derived from the WS body itself, so there is no
+    device-bound secret involved. Anyone with the working state can
+    recompute the TID. See dev/MOH.md "TID derivation".
+
+    The hash input runs from envelope offset 12 (the 4-byte u32 reserved
+    field that immediately precedes the working state) through offset
+    12+23056 — i.e. it includes the 4 reserved zeros and excludes the
+    last 4 bytes of the 23056-byte working state. Pass the full WS body
+    here; the slicing is handled internally.
+    """
+    if len(working_state) != 23056:
+        raise ValueError(f"working_state must be 23056 bytes, got {len(working_state)}")
+    if len(reserved_u32) != 4:
+        raise ValueError(f"reserved_u32 must be 4 bytes, got {len(reserved_u32)}")
+
+    K = hashlib.sha256(reserved_u32 + working_state[:23052]).digest()
+    T1 = hmac.new(K, _TID_INFO, hashlib.sha256).digest()
+    TID = hmac.new(K, T1 + _TID_INFO, hashlib.sha256).digest()
+    return TID

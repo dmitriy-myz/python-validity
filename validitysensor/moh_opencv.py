@@ -18,7 +18,9 @@ Algorithm (Synaptics' actual structure, from RE):
   5. Non-max suppression → top-N minutia positions
   6. BRIEF descriptor per minutia: 64 binary tests (sub_18000E6B0 + apply)
   7. Sort/dedup/store in 250-slot table
-  8. SHA-256 over working state → TemplateId
+  8. Compute TID via the HMAC-SHA256 recipe in moh_extract.compute_tid
+     (sub_1800E0A60 → sub_18004B710 chain, decoded from enroll-fresh.log
+     lines 1570→1583)
   9. Build TLV envelope (sub_180036840 — already byte-exact)
  10. Send via db.new_finger (existing python-validity transport)
 
@@ -27,7 +29,6 @@ Dependencies: numpy, opencv-python
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from struct import pack
 from typing import List, Optional, Tuple
@@ -41,6 +42,7 @@ from .moh_extract import (
     SENSOR_DPI,
     SENSOR_W, SENSOR_H,
     _build_envelope,
+    compute_tid,
     sub_18000E6B0 as brief_select_tests,
 )
 
@@ -252,9 +254,9 @@ def extract_template(image: np.ndarray,
         quality = int(min(max(score / 1000.0, 0), 0xffff))
         records.append(pack_minutia(x, y, descriptor, quality=quality))
 
-    # 8. Build working state buffer + SHA-256 over it
+    # 8. Build working state buffer + derive TID via the DLL's HMAC recipe
     ws = build_working_state(records, padded)
-    template_id = hashlib.sha256(ws).digest()
+    template_id = compute_tid(ws)
 
     # 9. TLV envelope (already byte-exact)
     envelope = _build_envelope(subtype, ws, template_id)
