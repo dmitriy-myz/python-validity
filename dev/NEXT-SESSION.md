@@ -54,7 +54,30 @@ variant (real coords + OUR descriptor computed via the reproduced pipeline)
 must **match** on `identify()`. That is the definition of done for the
 descriptor. Intermediate gate: `dev/diff_v30.py compare_gradin` corr → ~1.0.
 
-## STATUS: RE COMPLETE — now an implementation task
+## IMPLEMENTATION ROADMAP (resume here — RE structure complete)
+
+Native module started: `validitysensor/moh_native.py`. Stage status + the
+exact leaves left to port bit-exact (validate each vs the dumps in
+`$FRIDA_DUMP_DIR` via `dev/diff_v30.py`):
+
+| stage | status | remaining leaves (decompile + port) |
+|-------|--------|--------------------------------------|
+| tiling | ✅ byte-exact (`tile_image`) | — |
+| gradient kernels | Gaussian, structure decoded | exp table `unk_180130F80` (use IDA, not manual offset); `sub_18000F460`/`sub_18000F840` (separable passes + the Q-truncation that makes `Ixy` exact) |
+| DoH `Ixx/Iyy` | linear 7×7, corr 0.998 (regression) | confirm vs the exact Gaussian-smoothed finite-diff kernel |
+| DoH `Ixy` | NOT linear-recoverable | needs `F460`/`F840` truncation |
+| keypoints (NMS) | — | the NMS/peak-pick inside `sub_18000A1B0`'s solver |
+| orientation | algo decoded (`sub_18000D920`) | atan2 leaves `sub_1800030A0`, `sub_180003150`; peak `sub_18000D850`; weights `dword_180120C00` (dumped) |
+| descriptor | algo decoded (`sub_18000E090`) | bit-pack `sub_18000DF20`; DoH context `sub_18000C920`; BRIEF pairs from `sub_18000E6B0` (`BRIEF_SEED_TABLE`) |
+| assemble v30 | format known (`build_v30_record`) | wire stages → 250 records → splice/TID (have) |
+
+Validation gates: `compare_harris` (DoH), `decode_records` (v30 layout),
+`splice_experiment.py` `our_desc` must `identify()`-match (final). Pull the
+`.rdata` tables with IDA (manual file-offset math proved unreliable). The
+work is bounded (~8 small leaves) but methodical; do it offline against the
+captured dumps, not as a live function-by-function chain.
+
+## (older) STATUS: RE COMPLETE — now an implementation task
 
 Every stage from raw frame → `v30` is decoded as classical CV with known
 tables (see `dev/DLL-RE.md` "Descriptor algorithm — FULLY DECODED"). No

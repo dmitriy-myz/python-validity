@@ -252,6 +252,30 @@ The BRIEF pairs come from `sub_18000E6B0` (`moh_extract.BRIEF_SEED_TABLE`).
 classical CV with known tables — see `dev/NEXT-SESSION.md` for the
 implementation plan (port + validate against captured `v30`).
 
+### Gradient kernel chain (decoded; the bit-exact leaves remain)
+
+`sub_18000F250` → `sub_1800101C0` → `sub_180010050` build the `Ixx/Iyy/Ixy`
+tensor buffers from the tile:
+
+- `sub_1800101C0`: scale `a5` → odd kernel sizes `v8,v9` (`size ∝ scale`,
+  `218453≈(10/3)·65536`), delegates to `sub_180010050`.
+- `sub_180010050`: allocs 1D kernel buffers; `sub_18000FFE0` fills them;
+  `sub_18000FDF0(img, …, kx, ky, …, 12)` applies them (separable).
+- `sub_18000FFE0` → `sub_18000FF00` (×2): builds a **normalized 1D Gaussian**
+  kernel — taps centered (step 1024 = 1px Q10), width coeff `−2²⁹/σ²`,
+  σ-proxy `(157184·size+367309)>>10`, tap value via `sub_18000FEC0` (an
+  **exp lookup** into `unk_180130F80`), normalized to constant sum.
+- So the kernels are **Gaussian smoothing**; the derivative + per-pass
+  Q-truncation live in `sub_18000FDF0`/`sub_18000F460`/`sub_18000F840`.
+
+Empirical (from `gradin>>6` → buffers): `Ixx`,`Iyy` recover as **7×7 linear**
+kernels at corr **0.998** (Gaussian-smoothed 2nd-difference). `Ixy` does NOT
+(corr 0.19) — the inter-pass integer truncation makes it nonlinear, so it
+needs the exact `F460`/`F840` arithmetic. Remaining leaves to port for
+bit-exact gradients: `F460`, `F840`, and the `unk_180130F80` exp table (pull
+via IDA — manual file-offset extraction was unreliable). See
+`dev/NEXT-SESSION.md` roadmap.
+
 ### BRIEF descriptor selection
 
 | VA              | Role                                                  | Status |
