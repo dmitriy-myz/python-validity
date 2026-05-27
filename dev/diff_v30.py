@@ -226,6 +226,50 @@ def compare_keypoints(v30s, images):
               f"recall@2px={recall(2):.2f} @5px={recall(5):.2f} @10px={recall(10):.2f}")
 
 
+def compare_harris(bucket, images):
+    """Diff the DLL's fixed-point response map (sub_18000CE80, GDB_DUMP_HARRIS)
+    against our float Harris on the same image. Tells us whether the @2px gap
+    is the OPERATOR (maps differ) or the NMS (maps match, peaks chosen
+    differently)."""
+    resp_files = sorted(glob.glob(os.path.join(DUMP_DIR, 'harris_resp_*_call*.bin')))
+    resp_files = [f for f in resp_files
+                  if int(re.search(r'_(\d+)_call', os.path.basename(f)).group(1)) // 100000 == bucket]
+    if not resp_files:
+        print("\n(no harris_resp_* — capture GDB_DUMP_HARRIS=1 to diff the response map)")
+        return
+    print("\n=== Harris response map: DLL (fixed-point) vs ours (float) ===")
+    sys.path.insert(0, REPO_ROOT)
+    import cv2
+    import numpy as np
+    from validitysensor import moh_opencv as mo
+    for f in resp_files:
+        m = re.search(r'call(\d+)_plane(\d+)_(\d+)x(\d+)', os.path.basename(f))
+        call, plane, w, h = (int(m.group(i)) for i in range(1, 5))
+        dll = np.frombuffer(open(f, 'rb').read(), dtype=np.int32)
+        if dll.size < w * h:
+            print(f"  call{call} plane{plane} {w}x{h}: short dump ({dll.size}/{w*h})")
+            continue
+        dll = dll[:w * h].reshape(h, w).astype(np.float64)
+        line = f"  call{call} plane{plane} {w}x{h}: DLL resp range[{dll.min():.0f},{dll.max():.0f}]"
+        if call in images:
+            data, iw, ih = images[call]
+            img = np.frombuffer(data[:iw * ih], dtype=np.uint8).reshape(ih, iw).astype(np.float32)
+            # pad our image to the plane size if it's the padded working buffer
+            pad = (w - iw) // 2
+            src = cv2.copyMakeBorder(img, pad, h - ih - pad, pad, w - iw - pad,
+                                     cv2.BORDER_CONSTANT, value=mo.FILL_GRAY) if pad >= 0 else img
+            if src.shape == (h, w):
+                ours = mo.compute_harris_response(src).astype(np.float64)
+                a, b = dll.ravel(), ours.ravel()
+                cc = np.corrcoef(a, b)[0, 1]
+                line += f" | corr(DLL,ours)={cc:+.3f}"
+            else:
+                line += f" | (our {src.shape} != plane {(h, w)}, no align)"
+        print(line)
+    print("  → high corr ⇒ gap is NMS/localization; low corr ⇒ operator differs "
+          "(likely the Q12 >>12 fixed-point quantization).")
+
+
 def report_opencv(images):
     print(f"\n=== our moh_opencv extraction ({len(images)} images) ===")
     try:
@@ -266,6 +310,7 @@ def main():
     images = load_images(bucket)
     if images:
         compare_keypoints(v30s, images)
+        compare_harris(bucket, images)
         report_opencv(images)
     else:
         print("\n(no extract_image_* — capture GDB_DUMP_EXTRACT=1 for the matching "

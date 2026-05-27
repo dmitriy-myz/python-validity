@@ -49,6 +49,7 @@ RVA_2240 = 0x2240     # WS-body PACKER (opt-in) — see PackerEntryBP below
 RVA_46E0 = 0x46E0     # per-minutia DESCRIPTOR builder (opt-in) — see DescEntryBP
 RVA_43D0 = 0x43D0     # descriptor-BLOB filler (opt-in) — see BlobEntryBP
 RVA_1A50 = 0x1A50     # feature EXTRACTOR (opt-in) — see ExtractEntryBP
+RVA_CE80 = 0xCE80     # Harris RESPONSE (opt-in) — see HarrisEntryBP
 
 MASK = (1 << 64) - 1
 
@@ -106,6 +107,15 @@ BLOB_IMG = int(os.environ.get('GDB_BLOB_IMG', '16384'))      # input image (best
 EXTRACT_ON = os.environ.get('GDB_DUMP_EXTRACT') == '1'
 EXTRACT_MAX = int(os.environ.get('GDB_EXTRACT_MAX', '8'))
 EXTRACT_V30 = int(os.environ.get('GDB_EXTRACT_V30', '8192'))   # feature buffer (best-effort)
+
+# Harris-response hook is opt-in. sub_18000CE80(ctx=RCX, _, flag=R8d) computes,
+# per plane, out[i] = (Ixx[i]>>12)*(Iyy[i]>>12) - (Ixy[i]>>12)^2  (int32, Q12).
+# Plane list at *(ctx+0x50), count *(ctx+0x58), stride 0x70; per plane:
+#   +0=width(i32) +4=height(i32) +0x30=Ixx +0x38=Ixy +0x40=Iyy +0x50=response.
+# Dump each plane's response (+ the 3 gradient buffers, plane 0) at return, to
+# diff the DLL's fixed-point response map against our float Harris.
+HARRIS_ON = os.environ.get('GDB_DUMP_HARRIS') == '1'
+HARRIS_MAX = int(os.environ.get('GDB_HARRIS_MAX', '4'))
 
 # Stage-5 hook is opt-in (it fires ~9 tiles × N frames). Enable with:
 #   GDB_DUMP_STAGE5=1   and optionally  GDB_STAGE5_MAX=<n>  GDB_STAGE5_BUF=<bytes>
@@ -456,6 +466,63 @@ class ExtractEntryBP(gdb.Breakpoint):
         return False
 
 
+# ─── Harris response (sub_18000CE80) — fixed-point response maps ────────
+_harris_calls = 0
+
+
+class HarrisFinishBP(gdb.FinishBreakpoint):
+    def __init__(self, ctx, idx):
+        super().__init__(internal=True)
+        self.ctx, self.idx = ctx, idx
+
+    def stop(self):
+        try:
+            base = _u64(self.ctx + 0x50)
+            count = _u32(self.ctx + 0x58)
+            if not (0 < count <= 32):
+                print(f'[!] harris: implausible plane count {count}')
+                return False
+            for p in range(count):
+                pl = base + p * 0x70
+                w, h = _u32(pl), _u32(pl + 4)
+                if not (0 < w <= 512 and 0 < h <= 512):
+                    continue
+                n = w * h * 4
+                resp = _u64(pl + 0x50)
+                _save('harris_resp', f'call{self.idx}_plane{p}_{w}x{h}', _read_safe(resp, n))
+                if p == 0:   # also the gradient inputs for the main plane
+                    for off, tag in ((0x30, 'Ixx'), (0x38, 'Ixy'), (0x40, 'Iyy')):
+                        _save(f'harris_{tag}', f'call{self.idx}_plane{p}_{w}x{h}',
+                              _read_safe(_u64(pl + off), n))
+                print(f'    harris plane{p}: {w}x{h} resp@0x{resp:x}')
+        except Exception as e:
+            print(f'[!] harris finish failed: {e}')
+        return False
+
+    def out_of_scope(self):
+        pass
+
+
+class HarrisEntryBP(gdb.Breakpoint):
+    """sub_18000CE80 entry: RCX=ctx, R8d=flag (0 = the response-writing path).
+    Dump each plane's response map (+ gradients) at return."""
+    def stop(self):
+        global _harris_calls
+        if _harris_calls >= HARRIS_MAX:
+            return False
+        try:
+            if _reg('r8') & 0xffffffff:   # nonzero flag = different path, skip
+                return False
+            ctx = _reg('rcx')
+            print(f'[*] harris #{_harris_calls}: ctx=0x{ctx:x} '
+                  f'planes={_u32(ctx + 0x58)}')
+            HarrisFinishBP(ctx, _harris_calls)
+            _harris_calls += 1
+        except Exception as e:
+            print(f'[!] harris entry failed: {e}')
+        return False
+
+
 class VtableResolveBP(gdb.Breakpoint):
     """One-shot: at sub_18009FD20 entry, resolve the indirect frame-processor
     target at *(RCX+104) and print its address + RVA. That target (a runtime
@@ -514,6 +581,9 @@ def main():
         ExtractEntryBP('*' + hex(base + RVA_1A50))
         print(f'[*] feature-extractor hook ON (max {EXTRACT_MAX} calls, '
               f'v30<={EXTRACT_V30}B)')
+    if HARRIS_ON:
+        HarrisEntryBP('*' + hex(base + RVA_CE80))
+        print(f'[*] Harris-response hook ON (max {HARRIS_MAX} calls)')
     print(f'[*] breakpoints armed. dumps -> {OUTDIR}/')
     print('[*] run a full enrollment now, then Ctrl-C + detach.')
     gdb.execute('continue')
