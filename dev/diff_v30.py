@@ -177,6 +177,55 @@ def run_opencv(image_bytes, w, h):
     }
 
 
+def dll_keypoints(v30_buf):
+    """Extract the DLL's keypoint (x,y) coords from a v30 buffer. Records are
+    54 bytes; each carries coord pairs at byte offsets 17/18 and 35/36
+    (x at the even offset, y at +1) — confirmed: (x,y) order scores 2x random
+    on our Harris, swapped scores ~random. Returns a deduped, in-frame list."""
+    body = decode_v30(v30_buf)[2]
+    pts = set()
+    for i in range(len(body) // 54):
+        r = body[i * 54:(i + 1) * 54]
+        for a in (17, 35):
+            pts.add((r[a], r[a + 1]))
+    return [p for p in pts if 0 < p[0] < 112 and 0 < p[1] < 112]
+
+
+def compare_keypoints(v30s, images):
+    """Grind metric: detection recall of our orchestrator vs the DLL's actual
+    keypoints (recovered from v30). recall@N = fraction of DLL keypoints with
+    one of ours within N px (L1). Drives the detector toward bit-exactness."""
+    print("\n=== detection recall (our moh_opencv vs DLL v30 keypoints) ===")
+    sys.path.insert(0, REPO_ROOT)
+    try:
+        import cv2
+        import numpy as np
+        from validitysensor import moh_opencv as mo
+    except ImportError as e:
+        print(f"  (skipped — needs .venv-poc: {e})")
+        return
+    for n in sorted(set(v30s) & set(images)):
+        data, w, h = images[n]
+        dll = dll_keypoints(v30s[n])
+        img = np.frombuffer(data[:w * h], dtype=np.uint8).reshape(h, w)
+        padded = cv2.copyMakeBorder(img, mo.PATCH_RADIUS, mo.PATCH_RADIUS,
+                                    mo.PATCH_RADIUS, mo.PATCH_RADIUS,
+                                    cv2.BORDER_CONSTANT, value=mo.FILL_GRAY)
+        resp = mo.compute_harris_response(padded)
+        mins = mo.extract_minutiae(resp, mo.MAX_MINUTIAE,
+                                   border=mo.PATCH_RADIUS, min_distance=mo.MIN_DIST_NMS)
+        ours = np.array([(x - mo.PATCH_RADIUS, y - mo.PATCH_RADIUS) for y, x, _ in mins])
+
+        def recall(tol):
+            if not len(ours) or not dll:
+                return 0.0
+            hit = sum(1 for x, y in dll
+                      if np.min(np.abs(ours[:, 0] - x) + np.abs(ours[:, 1] - y)) <= tol)
+            return hit / len(dll)
+        print(f"  frame{n}: DLL kp={len(dll)} ours={len(ours)} | "
+              f"recall@2px={recall(2):.2f} @5px={recall(5):.2f} @10px={recall(10):.2f}")
+
+
 def report_opencv(images):
     print(f"\n=== our moh_opencv extraction ({len(images)} images) ===")
     try:
@@ -216,6 +265,7 @@ def main():
 
     images = load_images(bucket)
     if images:
+        compare_keypoints(v30s, images)
         report_opencv(images)
     else:
         print("\n(no extract_image_* — capture GDB_DUMP_EXTRACT=1 for the matching "
