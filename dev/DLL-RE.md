@@ -270,11 +270,26 @@ tensor buffers from the tile:
 
 Empirical (from `gradin>>6` → buffers): `Ixx`,`Iyy` recover as **7×7 linear**
 kernels at corr **0.998** (Gaussian-smoothed 2nd-difference). `Ixy` does NOT
-(corr 0.19) — the inter-pass integer truncation makes it nonlinear, so it
-needs the exact `F460`/`F840` arithmetic. Remaining leaves to port for
-bit-exact gradients: `F460`, `F840`, and the `unk_180130F80` exp table (pull
-via IDA — manual file-offset extraction was unreliable). See
-`dev/NEXT-SESSION.md` roadmap.
+(corr 0.19) — explained by the passes:
+
+**`sub_18000F460` (horizontal) / `sub_18000F840` (vertical)** = the separable
+1D convolution. The load-bearing detail: each accumulates
+`acc += (pixel · tap) >> a8` with **`a8 = 12`** — every tap product is
+**truncated `>>12` before summing** (per-term, not at the end). That
+truncation is nonlinear and compounds across the two perpendicular passes,
+which is why `Ixy` (x-pass then y-pass) won't recover as a single linear
+kernel while `Ixx`/`Iyy` (truncation-dominated by one axis) nearly do. Both
+passes handle left/middle/right edges explicitly with a rotating buffer.
+
+**OPEN (next session, with IDA):** the kernels from `sub_18000FFE0` look like
+pure Gaussians (smoothing), yet `Ixx`/`Iyy`/`Ixy` are derivatives — so the
+derivative either enters via a derivative-of-Gaussian tap variant in
+`sub_18000FEC0` or a finite-difference stencil in `sub_18000FDF0`, and how the
+three plane buffers (`+0x30/+0x38/+0x40`) get populated from one pass chain is
+not yet pinned. Resolve by reading `sub_18000FDF0` + `sub_18000FEC0`'s exact
+output against the `unk_180130F80` table in IDA. Then a Python port of
+`(pixel·tap)>>12` separable conv reproduces the buffers bit-exact. See
+`dev/NEXT-SESSION.md`.
 
 ### BRIEF descriptor selection
 
