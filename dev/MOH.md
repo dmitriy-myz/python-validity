@@ -285,14 +285,52 @@ print(sensor.identify(lambda e: print(f"retry: {e}")))
 
 ## Open questions
 
-- **What is the per-field bit layout inside the WS body sections?**
-  This is the only blocker for native Linux enrollment, and black-box
-  analysis has been *exhausted* — see "WS body feature encoding
-  (black-box findings)" below. We know the packing granularity
-  (36-byte / two 144-bit units) but not the per-field bit assignment.
-  This now requires **known inputs** via `dev/frida_dump.py` (dump the
-  in-memory minutia table beside the WS body and search for known
-  values inside the 36-byte records).
+- **How are the per-minutia descriptors computed and encoded?** This is
+  the real blocker for native enrollment (revised — see "gdb-dump
+  findings" below). The template is *descriptor-dominated*: the
+  in-memory 32-byte minutia record holds only position/score metadata,
+  none of which appears in the WS body. The bulk of the template is
+  binary feature descriptors computed from image patches by stage 5
+  (`sub_18000A5B0`). Reproducing the template therefore requires
+  reproducing that descriptor algorithm, not just placing coordinates.
+
+## gdb-dump findings (known-input correlation)
+
+Frida can't attach to Wine (bootstrapper SIGSTOP), so `dev/gdb_dump.py`
+captures the in-memory state instead. From one enrollment we dumped 8
+per-frame minutia tables + the final WS body. Results:
+
+- **In-memory 32-byte minutia record fully confirmed:** `active` (0/1),
+  `flag9` = tile index (exactly 0..8), `x`/`y` = **raw image pixel
+  coordinates** (range ~5..108, NOT scaled to 1126×671), `score_c` =
+  ascending sort rank, `score_10` = quality score, `head[0:8]` = a u32
+  in 0x4e530..0x4f4c0 (a buffer offset/pointer, not a coordinate).
+
+- **None of those fields appear in the WS body.** 8-byte head substring:
+  0/248. (x,y) / single-x bit search: random frequency only. So the
+  template does NOT store the in-memory record — it stores something
+  derived.
+
+- **The template is descriptor-dominated.** The 32-byte record contains
+  no descriptor; the binary feature descriptor (the high-entropy bulk of
+  each template record) is computed from the image pixel patch around
+  the minutia by stage 5 and lives only transiently in stream buffers.
+  That's why the WS body is 7.86-bit entropy and why coordinates can't
+  be found — the descriptors dominate and the positions (if present at
+  all) are buried bits.
+
+- **An enrollment accumulator sits between the orchestrator and the
+  serializer.** Each frame's orchestrator produces ~132 active minutiae,
+  but the template sections are (87,95,96,94)=372 — neither a single
+  frame's count nor a clean multiple. So frames are merged/selected by a
+  step we haven't hooked; the per-frame minutia table is not the direct
+  serializer input.
+
+Next instrumentation: `dev/gdb_dump.py` with `GDB_DUMP_STAGE5=1` hooks
+stage 5 (`sub_18000A5B0`) and snapshots its working buffer before/after
+each call, so the delta = the descriptor bytes produced for a known slot
+range. That yields (minutia → descriptor) pairs directly, bypassing both
+the accumulator and the template bit-layout problem.
 
 ## WS body feature encoding (black-box findings)
 

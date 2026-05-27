@@ -43,8 +43,15 @@ DLL = 'synaWudfBioUsb.dll'
 
 RVA_A4900 = 0xA4900   # WS-body copy-out (session in RCX)
 RVA_AAB0 = 0xAAB0     # orchestrator (minutia ctx in RDX)
+RVA_A5B0 = 0xA5B0     # stage 5 — descriptor computation (opt-in)
 
 MASK = (1 << 64) - 1
+
+# Stage-5 hook is opt-in (it fires ~9 tiles × N frames). Enable with:
+#   GDB_DUMP_STAGE5=1   and optionally  GDB_STAGE5_MAX=<n>  GDB_STAGE5_BUF=<bytes>
+STAGE5_ON = os.environ.get('GDB_DUMP_STAGE5') == '1'
+STAGE5_MAX = int(os.environ.get('GDB_STAGE5_MAX', '6'))
+STAGE5_BUF = int(os.environ.get('GDB_STAGE5_BUF', '8192'))
 
 
 def _reg(name):
@@ -129,6 +136,64 @@ class MinutiaEntryBP(gdb.Breakpoint):
         return False
 
 
+# ─── Stage 5 (sub_18000A5B0) — descriptor computation (opt-in) ──────────
+#
+# Called per tile per frame:
+#   sub_18000A5B0(v85, a2, v60, v59, | v90, v88, v79, v78, v49, &v97, a7)
+# Win64 args: RCX=v85, RDX=a2(minutia ctx), R8=v60, R9=v59; stack:
+#   [RSP+0x28]=v90 [+0x30]=v88 [+0x38]=v79 [+0x40]=v78(start slot)
+#   [+0x48]=v49(end slot) ...
+# v85 is the working buffer stage 5 writes descriptors into. We snapshot
+# it before (entry) and after (return) so the DELTA reveals exactly what
+# bytes stage 5 produced for minutia slots [v78..v49]. Pair that with the
+# minutia table dump and we have (minutia -> descriptor bytes).
+
+_stage5_calls = 0
+
+
+class Stage5FinishBP(gdb.FinishBreakpoint):
+    def __init__(self, before, base, n, lo, hi, idx):
+        super().__init__(internal=True)
+        self.before, self.base, self.n = before, base, n
+        self.lo, self.hi, self.idx = lo, hi, idx
+
+    def stop(self):
+        try:
+            after = _read(self.base, self.n)
+            # save before+after concatenated; tag with slot range
+            tag = f'slots{self.lo}-{self.hi}_call{self.idx}'
+            _save('stage5_v85before', tag, self.before)
+            _save('stage5_v85after', tag, after)
+            ndiff = sum(1 for a, b in zip(self.before, after) if a != b)
+            print(f'    stage5 call{self.idx} slots[{self.lo}..{self.hi}]: '
+                  f'{ndiff}/{self.n} bytes changed in v85')
+        except Exception as e:
+            print(f'[!] stage5 finish failed: {e}')
+        return False
+
+    def out_of_scope(self):
+        pass
+
+
+class Stage5EntryBP(gdb.Breakpoint):
+    def stop(self):
+        global _stage5_calls
+        if _stage5_calls >= STAGE5_MAX:
+            return False
+        try:
+            rcx = _reg('rcx')          # v85 — descriptor target buffer
+            rsp = _reg('rsp')
+            lo = _u32(rsp + 0x40)      # v78 start slot
+            hi = _u32(rsp + 0x48)      # v49 end slot
+            print(f'[*] stage5 #{_stage5_calls}: v85=0x{rcx:x} slots[{lo}..{hi}]')
+            before = _read(rcx, STAGE5_BUF)
+            Stage5FinishBP(before, rcx, STAGE5_BUF, lo, hi, _stage5_calls)
+            _stage5_calls += 1
+        except Exception as e:
+            print(f'[!] stage5 entry failed: {e}')
+        return False
+
+
 def main():
     base = find_dll_base()
     if base is None:
@@ -137,6 +202,10 @@ def main():
     print(f'[*] {DLL} base = {hex(base)}')
     WSBodyBP('*' + hex(base + RVA_A4900))
     MinutiaEntryBP('*' + hex(base + RVA_AAB0))
+    if STAGE5_ON:
+        Stage5EntryBP('*' + hex(base + RVA_A5B0))
+        print(f'[*] stage-5 descriptor hook ON (max {STAGE5_MAX} calls, '
+              f'{STAGE5_BUF}B buffer)')
     print(f'[*] breakpoints armed. dumps -> {OUTDIR}/')
     print('[*] run a full enrollment now, then Ctrl-C + detach.')
     gdb.execute('continue')
