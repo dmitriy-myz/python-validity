@@ -51,6 +51,7 @@ RVA_43D0 = 0x43D0     # descriptor-BLOB filler (opt-in) — see BlobEntryBP
 RVA_1A50 = 0x1A50     # feature EXTRACTOR (opt-in) — see ExtractEntryBP
 RVA_CE80 = 0xCE80     # Harris RESPONSE (opt-in) — see HarrisEntryBP
 RVA_FDF0 = 0xFDF0     # gradient I_x — its input is the ENHANCED image (opt-in)
+RVA_10380 = 0x10380   # one separable filter pass (CC20 calls it 5×) (opt-in)
 
 MASK = (1 << 64) - 1
 
@@ -533,6 +534,58 @@ class HarrisEntryBP(gdb.Breakpoint):
         return False
 
 
+# ─── Separable filter pass (sub_180010380) — CC20's per-pass intermediates ─
+# sub_180010380(dst=RCX, src=RDX, type_x=R8d, type_y=R9d, scale, w, h, image).
+# CC20 calls it 5× per block to build Ixx/Iyy/Ixy. Dumping dst before+after each
+# call gives (input → output) per pass to find the first divergence from the
+# Python port (dev/port_gradient.py cc20()). The actual filtered buffer is
+# `src` if src!=0 (FDF0 copies dst→src then filters src), else `dst` in-place.
+G380_ON = os.environ.get('GDB_DUMP_G380') == '1'
+G380_MAX = int(os.environ.get('GDB_G380_MAX', '12'))
+_g380_calls = 0
+
+
+class G380FinishBP(gdb.FinishBreakpoint):
+    def __init__(self, out, n, idx, tx, ty):
+        super().__init__(internal=True)
+        self.out, self.n, self.idx, self.tx, self.ty = out, n, idx, tx, ty
+
+    def stop(self):
+        try:
+            _save('g380_after', f'call{self.idx}_t{self.tx}{self.ty}',
+                  _read_safe(self.out, self.n))
+        except Exception as e:
+            print(f'[!] g380 finish failed: {e}')
+        return False
+
+    def out_of_scope(self):
+        pass
+
+
+class G380EntryBP(gdb.Breakpoint):
+    def stop(self):
+        global _g380_calls
+        if _g380_calls >= G380_MAX:
+            return False
+        try:
+            dst = _reg('rcx'); src = _reg('rdx')
+            tx = _reg('r8') & 0xffffffff; ty = _reg('r9') & 0xffffffff
+            rsp = _reg('rsp')
+            w = _u32(rsp + 0x30); h = _u32(rsp + 0x38)   # args 6,7 (after retaddr)
+            out = src if src else dst                     # filtered buffer
+            if not (0 < w <= 512 and 0 < h <= 512):
+                return False
+            n = w * h * 4
+            i = _g380_calls
+            _save('g380_before', f'call{i}_t{tx}{ty}_{w}x{h}', _read_safe(out, n))
+            print(f'[*] g380 #{i}: dst=0x{dst:x} src=0x{src:x} type=({tx},{ty}) {w}x{h}')
+            G380FinishBP(out, n, i, tx, ty)
+            _g380_calls += 1
+        except Exception as e:
+            print(f'[!] g380 entry failed: {e}')
+        return False
+
+
 # ─── Gradient input (sub_18000FDF0) — the enhanced image ────────────────
 _gradin_calls = 0
 
@@ -624,6 +677,9 @@ def main():
     if GRADIN_ON:
         GradinEntryBP('*' + hex(base + RVA_FDF0))
         print(f'[*] gradient-input hook ON (max {GRADIN_MAX} calls)')
+    if G380_ON:
+        G380EntryBP('*' + hex(base + RVA_10380))
+        print(f'[*] sub_180010380 per-pass hook ON (max {G380_MAX} calls)')
     print(f'[*] breakpoints armed. dumps -> {OUTDIR}/')
     print('[*] run a full enrollment now, then Ctrl-C + detach.')
     gdb.execute('continue')
