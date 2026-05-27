@@ -381,8 +381,9 @@ WS body (23056 B = TLV1 payload at envelope offset 12):
   [24..44)  per-section count table   u32×N — minutiae per section, e.g. 89,91,97,92,96
   [44..~64) geometry/stats            7800 (0x1e78), 676 (0x2a4), signed deltas, 9279
   [~64.. ]  N sections, one per ACCEPTED frame, ~4540 B each:
-              [u32 ordinal][u32 flags][TLV tag=5,len=4536][payload]
-              payload: leading zeros, 0xfa(250) marker, dense descriptor bytes
+              [TLV tag=5,len=4536][payload]; payload (decoded below):
+                ~13 × 18-byte minutia POSE records (234 B)
+                + ~4298 B descriptor blob (entropy 7.79, the proprietary part)
   [23036..23056)  20-byte trailer (… 9a a2 a2 a3 a7 bf d2 d8 d9 da e0 00 00 00 01 00 04 00 …)
 ```
 
@@ -392,6 +393,26 @@ each ACCEPTED frame grows `size@+4` by exactly **4540** (4868→9408→13956
 →18496→23036); REJECTED frames (quality gate `stats[7]=1`) add only 8
 bytes (bump size + a reject counter + small marker). The per-section
 count table `[89,91,97,92,96]` *is* the old "(87,95,96,94)=372" anchors.
+
+### Inside a section: pose table + descriptor blob (record→section)
+
+From a combined `GDB_DUMP_DESC=1 GDB_DUMP_PACKER=1` capture (same
+enrollment), correlating each `sub_1800046E0` 180-byte record against its
+section bytes:
+
+- **`sub_1800046E0` is a per-keypoint pose/model FITTER**, not a descriptor
+  extractor. It collects ≤25 candidate keypoints (28-byte records, qsorted),
+  runs solver `sub_180007480`, and outputs a 4-dword pose (`a1`) + quality +
+  inlier count into the 180-byte record (`[1..4]`, `[23]`=quality,
+  `[24]`=inliers, `[25]`=min(count,25)). `sub_1800043D0` then fills `[26..]`.
+- **The pose serializes verbatim.** Each section opens with a table of
+  **18-byte pose records**: `[3-byte flags][int32 pose1 = record[1]][int32
+  pose2 = record[2]][int32 field][3-byte tail]`. record[1]/[2] appear as
+  int32 at slot `+3`/`+7`. The first frame's reference pose goes into the WS
+  **header** (offsets 49/53/57), not a section.
+- **The bulk is a descriptor blob.** After ~13 pose records (~234 B) the
+  section is ~4298 B of entropy-7.79 data — the proprietary per-keypoint
+  feature representation, written by `sub_1800043D0` → `sub_180008980`.
 
 ### What this resolves and what remains
 

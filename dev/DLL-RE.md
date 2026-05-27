@@ -237,6 +237,43 @@ Full byte layout + live validation in `dev/MOH.md` "WS body layout".
 | `sub_1800056C0` | Field writer → TLV `{tag = v+3, payload = buf}`. | DECODED |
 | `sub_180005B70` | Field writer → TLV `{tag=3, len=4, value}`. | DECODED |
 
+### 180-byte working record (the per-minutia descriptor builder output)
+
+`sub_1800046E0` fills one 180-byte record (45 dwords) per minutia from the
+image patch. Decoded from a 12-minutia live capture (`dev/gdb_dump.py
+GDB_DUMP_DESC=1`, dumping the record at `[rsp+0x30]` before/after the call).
+The input image is **128×128 8-bit grayscale** (confirmed by row
+correlation; `desc_image_*` dumps). Builder writes dwords `[1–4], [23–35],
+[38–40]`:
+
+| dword | observed range | role (inferred) |
+|-------|----------------|-----------------|
+| `[1],[2],[4]` | signed, ±3M, sign-extended | signed feature vector (orientation/gradient sums or sub-pixel offset). **NOT a binary descriptor** — popcount scatters 18..43, values are signed. |
+| `[3]` | ~65536 | normalization (1.0 in 16.16) |
+| `[23,24,26,27]` | 7..41 | small params; `[25]` = const 25 |
+| `[28]=[32], [33], [29,30,31]` | 71..8180 | response block (Harris / scale-extrema magnitudes; the high-entropy source) |
+| `[34]=[40]` | 62..172 | position-like (scaled/padded space, not raw 0..128 pixels) |
+| `[35]` | 46..95 | position-like (y, fits 0..128) |
+| `[38]` | 3..7 | scale / octave |
+| `[39]` | 334..498 | orientation-ish |
+
+After the call, `sub_180008F10` shuffles 5 of these into output slots
+(`v28[36]=v28[26]`, `[37]=[34]`, `[41]=[39]`, `[42]=[38]`, `[43]=[40]`).
+
+**`sub_1800046E0` is actually a per-keypoint pose/model FITTER** (the full
+decompile shows it collecting ≤25 candidate 28-byte keypoints, qsorting via
+`sub_180004600`, solving with `sub_180007480`), not a descriptor extractor.
+`record[1..4]` = the solver pose `a1`; `[23]`=quality, `[24]`=inlier count.
+`sub_1800043D0(record+104, …)` fills `[26..43]`.
+
+**record→section mapping (from a combined DESC+PACKER capture):** the pose
+`record[1],[2]` serializes **verbatim** as int32 into 18-byte section pose
+records (`[3B flags][i32 pose1][i32 pose2][i32 field][3B tail]`, pose1@+3
+pose2@+7). The first frame's reference pose goes to the WS header
+(offset 49/53/57). After the ~13-record pose table, the rest of the section
+(~4298 B, entropy 7.79) is the descriptor blob from `sub_1800043D0` →
+`sub_180008980` — the proprietary feature data, still un-ported.
+
 ### Envelope serialization (the final write step)
 
 | VA               | Role                                                 | Status |
