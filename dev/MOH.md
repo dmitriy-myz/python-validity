@@ -410,6 +410,15 @@ section bytes:
   pose2 = record[2]][int32 field][3-byte tail]`. record[1]/[2] appear as
   int32 at slot `+3`/`+7`. The first frame's reference pose goes into the WS
   **header** (offsets 49/53/57), not a section.
+- **`v30` record layout (DECODED).** `v30` body = `[~17 B lead-in] + 250 ×
+  18-byte records + [~16 B trailer]`. Each **18-byte record = `[x:u8][y:u8]
+  [128-bit binary descriptor: 16 B]`** — confirmed: exactly 250 records/frame
+  (= `MAX_MINUTIAE`), `x,y ∈ [3,108]` (112px image coords), and the 16-byte
+  descriptor has mean popcount 63/128 (~50% bits set) = a BRIEF/ORB-family
+  binary descriptor. So a minutia → 18-byte record; `moh_opencv` emits a
+  64-bit BRIEF (right family, wrong 64-vs-128 length, wrong input/operator).
+  The earlier "54-byte triplet" read was the 3×18 periodicity, not the record.
+
 - **The bulk is the feature buffer `v30` copied VERBATIM.** After the
   ~276-byte header/pose region, the rest of each section is the packer's
   input feature buffer `v30` copied in at section offset ~280 with **98.9%

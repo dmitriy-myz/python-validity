@@ -125,8 +125,28 @@ def report_record_format(v30s):
         print(f"  stride {s}B: {info['n']} records (leftover {info['leftover']}B), "
               f"mean col-entropy {info['mean_ent']:.2f}, "
               f"coord-like cols (max<=115): {info['coord_cols']}")
-    print("  → records carry (x,y) coordinate fields + binary-descriptor bulk;"
-          " matching needs bit-exact keypoints AND descriptors.")
+    # DECODED layout: 18-byte records [x:u8][y:u8][128-bit descriptor], 250/frame.
+    recs = decode_records(body)
+    if recs:
+        import statistics
+        pops = [sum(bin(b).count('1') for b in d) for _, _, d in recs]
+        print(f"  DECODED: {len(recs)} × 18B records = [x][y][16B/128-bit descriptor]; "
+              f"x,y∈[{min(x for x,_,_ in recs)},{max(x for x,_,_ in recs)}], "
+              f"descriptor mean popcount {statistics.mean(pops):.0f}/128 (binary descriptor)")
+
+
+def decode_records(body, start=17, stride=18):
+    """Decode v30 body into minutia records [x:u8][y:u8][16B descriptor].
+    Returns list of (x, y, descriptor_bytes). start=17 is the empirically
+    found record alignment (100% of (x,y) pairs land in [0,112])."""
+    out = []
+    p = start
+    while p + stride <= len(body):
+        x, y = body[p], body[p + 1]
+        if x <= 112 and y <= 112:
+            out.append((x, y, bytes(body[p + 2:p + 18])))
+        p += stride
+    return out
 
 
 def report_v30(v30s):
