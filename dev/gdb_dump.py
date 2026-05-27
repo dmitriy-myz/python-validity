@@ -48,6 +48,7 @@ RVA_9FD20 = 0x9FD20   # frame-processor vtable dispatcher (resolves *(RCX+104))
 RVA_2240 = 0x2240     # WS-body PACKER (opt-in) — see PackerEntryBP below
 RVA_46E0 = 0x46E0     # per-minutia DESCRIPTOR builder (opt-in) — see DescEntryBP
 RVA_43D0 = 0x43D0     # descriptor-BLOB filler (opt-in) — see BlobEntryBP
+RVA_1A50 = 0x1A50     # feature EXTRACTOR (opt-in) — see ExtractEntryBP
 
 MASK = (1 << 64) - 1
 
@@ -92,6 +93,19 @@ BLOB_MAX = int(os.environ.get('GDB_BLOB_MAX', '40'))
 BLOB_REC = 76                                                 # record[26..44] (RCX = record+104)
 BLOB_WORK = int(os.environ.get('GDB_BLOB_WORK', '4096'))     # the 4004-byte work area
 BLOB_IMG = int(os.environ.get('GDB_BLOB_IMG', '16384'))      # input image (best-effort)
+
+# Feature-extractor hook is opt-in. sub_180001A50 turns the working image
+# into the feature buffer v30 that the packer copies verbatim into the WS
+# section. Call (from sub_1800D89C0):
+#   sub_180001A50(algo, v30_OUT, image_IN, w, h, dpi=363, …)
+#   RCX=algo  RDX=v30 (output buffer, filled during the call)  R8=image
+#   R9=w  [RSP+0x28]=h  [RSP+0x30]=dpi
+# Dump the input image (R8, w*h) at entry and the feature buffer (RDX) at
+# return — the canonical (image -> v30) pair to diff moh_opencv.py against
+# (see dev/diff_v30.py).
+EXTRACT_ON = os.environ.get('GDB_DUMP_EXTRACT') == '1'
+EXTRACT_MAX = int(os.environ.get('GDB_EXTRACT_MAX', '8'))
+EXTRACT_V30 = int(os.environ.get('GDB_EXTRACT_V30', '8192'))   # feature buffer (best-effort)
 
 # Stage-5 hook is opt-in (it fires ~9 tiles × N frames). Enable with:
 #   GDB_DUMP_STAGE5=1   and optionally  GDB_STAGE5_MAX=<n>  GDB_STAGE5_BUF=<bytes>
@@ -399,6 +413,49 @@ class BlobEntryBP(gdb.Breakpoint):
         return False
 
 
+# ─── Feature extractor (sub_180001A50) — canonical (image -> v30) pair ──
+_extract_calls = 0
+
+
+class ExtractFinishBP(gdb.FinishBreakpoint):
+    def __init__(self, v30, idx):
+        super().__init__(internal=True)
+        self.v30, self.idx = v30, idx
+
+    def stop(self):
+        try:
+            _save('extract_v30', f'call{self.idx}', _read_safe(self.v30, EXTRACT_V30))
+        except Exception as e:
+            print(f'[!] extract finish failed: {e}')
+        return False
+
+    def out_of_scope(self):
+        pass
+
+
+class ExtractEntryBP(gdb.Breakpoint):
+    """sub_180001A50 entry: RDX=v30 out buffer, R8=image, R9=w, [rsp+0x28]=h.
+    Dump the input image (w*h) now and the v30 buffer (RDX) on return."""
+    def stop(self):
+        global _extract_calls
+        if _extract_calls >= EXTRACT_MAX:
+            return False
+        try:
+            v30 = _reg('rdx')          # output feature buffer (filled during call)
+            img = _reg('r8')           # input working image
+            w = _reg('r9') & 0xffffffff
+            h = _u32(_reg('rsp') + 0x28)
+            i = _extract_calls
+            n = w * h if 0 < w * h <= 0x40000 else EXTRACT_V30
+            print(f'[*] extract #{i}: image=0x{img:x} {w}x{h} v30=0x{v30:x}')
+            _save('extract_image', f'call{i}_{w}x{h}', _read_safe(img, n))
+            ExtractFinishBP(v30, i)
+            _extract_calls += 1
+        except Exception as e:
+            print(f'[!] extract entry failed: {e}')
+        return False
+
+
 class VtableResolveBP(gdb.Breakpoint):
     """One-shot: at sub_18009FD20 entry, resolve the indirect frame-processor
     target at *(RCX+104) and print its address + RVA. That target (a runtime
@@ -453,6 +510,10 @@ def main():
         BlobEntryBP('*' + hex(base + RVA_43D0))
         print(f'[*] descriptor-blob hook ON (max {BLOB_MAX} calls, '
               f'rec={BLOB_REC}B work<={BLOB_WORK}B img<={BLOB_IMG}B)')
+    if EXTRACT_ON:
+        ExtractEntryBP('*' + hex(base + RVA_1A50))
+        print(f'[*] feature-extractor hook ON (max {EXTRACT_MAX} calls, '
+              f'v30<={EXTRACT_V30}B)')
     print(f'[*] breakpoints armed. dumps -> {OUTDIR}/')
     print('[*] run a full enrollment now, then Ctrl-C + detach.')
     gdb.execute('continue')
