@@ -410,9 +410,32 @@ section bytes:
   pose2 = record[2]][int32 field][3-byte tail]`. record[1]/[2] appear as
   int32 at slot `+3`/`+7`. The first frame's reference pose goes into the WS
   **header** (offsets 49/53/57), not a section.
-- **The bulk is a descriptor blob.** After ~13 pose records (~234 B) the
-  section is ~4298 B of entropy-7.79 data — the proprietary per-keypoint
-  feature representation, written by `sub_1800043D0` → `sub_180008980`.
+- **The bulk is the feature buffer `v30` copied VERBATIM.** After the
+  ~276-byte header/pose region, the rest of each section is the packer's
+  input feature buffer `v30` copied in at section offset ~280 with **98.9%
+  byte-identity** (`section[i] == features[i-280]`; verified frame0, shift
+  found automatically). The last ~50 bytes differ (a trailer/boundary). So
+  the "descriptor blob" is NOT a separate transform — it is the output of
+  the feature extractor `sub_180001A50` (→ `sub_180004C10` → orchestrator
+  `sub_18000AAB0`, Harris + BRIEF) dropped in unchanged.
+  - `v30` itself starts with a 12-byte header (`04 00 | b5 11=4533 len | 8
+    zeros`) then ~4533 B of entropy-7.82 binary descriptor data with weak
+    18-byte periodicity (the period the black-box pass mis-read as packing).
+  - `sub_1800043D0` does NOT write this blob — it only fills the 180-byte
+    record's `[26..40]` metadata and samples smooth image patches into
+    scratch buffers; none of that reaches the section. (Earlier drafts
+    wrongly credited `sub_1800043D0`/`sub_180008980` with the blob.)
+
+### Implication for native enrollment
+
+The descriptor encoding is no longer an unknown transform: a section is
+`[header + pose records] + [feature-extractor output v30 verbatim]`. To
+build a matchable template we must reproduce `v30` — i.e. make our
+orchestrator (`moh_extract.py` / `moh_opencv.py`, Harris + the 64-of-162
+BRIEF test selection + 128-seed table) emit **byte-identical** output to
+the DLL's `sub_18000AAB0`. We now hold real `v30` captures
+(`packer_features_*`) to diff against. That is the concrete remaining task;
+it is hard (bit-exact CV) but bounded, not open-ended.
 
 ### What this resolves and what remains
 

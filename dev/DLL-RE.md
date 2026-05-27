@@ -270,9 +270,13 @@ decompile shows it collecting ≤25 candidate 28-byte keypoints, qsorting via
 `record[1],[2]` serializes **verbatim** as int32 into 18-byte section pose
 records (`[3B flags][i32 pose1][i32 pose2][i32 field][3B tail]`, pose1@+3
 pose2@+7). The first frame's reference pose goes to the WS header
-(offset 49/53/57). After the ~13-record pose table, the rest of the section
-(~4298 B, entropy 7.79) is the descriptor blob from `sub_1800043D0` →
-`sub_180008980` — the proprietary feature data, still un-ported.
+(offset 49/53/57). After the ~276-byte header/pose region, **the rest of
+each section is the packer's input feature buffer `v30` copied verbatim**
+(98.9% byte-identity at shift 280) — i.e. the output of `sub_180001A50` →
+orchestrator `sub_18000AAB0`. `sub_1800043D0` only fills `record[26..40]`
+metadata + samples image patches into scratch; it does NOT produce the
+section blob. So native enrollment reduces to reproducing `v30` bit-for-bit
+(see `dev/MOH.md` "Implication for native enrollment").
 
 ### Envelope serialization (the final write step)
 
