@@ -45,8 +45,23 @@ RVA_A4900 = 0xA4900   # WS-body copy-out (session in RCX)
 RVA_AAB0 = 0xAAB0     # orchestrator (minutia ctx in RDX)
 RVA_A5B0 = 0xA5B0     # stage 5 — descriptor computation (opt-in)
 RVA_9FD20 = 0x9FD20   # frame-processor vtable dispatcher (resolves *(RCX+104))
+RVA_2240 = 0x2240     # WS-body PACKER (opt-in) — see PackerEntryBP below
 
 MASK = (1 << 64) - 1
+
+# WS-body packer hook is opt-in. sub_180002240 serializes the extracted
+# feature buffer into the WS body. Win64 args:
+#   sub_180002240(v26 algo, v34 ws_dest, v38 stats, v30 features, w, h)
+#   RCX=v26  RDX=v34(ws+152)  R8=v38(stats,64B)  R9=v30(features in)
+#   [RSP+0x28]=w  [RSP+0x30]=h
+# We dump (features v30) + (ws BEFORE) on entry and (ws AFTER) on return,
+# per good frame. ws_after - ws_before = exactly the bytes this frame's
+# features produced — i.e. known-input -> packed-output pairs that crack
+# the WS bit layout (the last blocker for native enrollment).
+PACKER_ON = os.environ.get('GDB_DUMP_PACKER') == '1'
+PACKER_MAX = int(os.environ.get('GDB_PACKER_MAX', '12'))
+PACKER_WS = int(os.environ.get('GDB_PACKER_WS', '23056'))    # WS body size
+PACKER_FEAT = int(os.environ.get('GDB_PACKER_FEAT', '32768'))  # v30 (size unknown; best-effort)
 
 # Stage-5 hook is opt-in (it fires ~9 tiles × N frames). Enable with:
 #   GDB_DUMP_STAGE5=1   and optionally  GDB_STAGE5_MAX=<n>  GDB_STAGE5_BUF=<bytes>
@@ -61,6 +76,17 @@ def _reg(name):
 
 def _read(addr, n):
     return bytes(gdb.selected_inferior().read_memory(addr, n))
+
+
+def _read_safe(addr, n):
+    """Read up to n bytes, shrinking toward a page boundary if the tail is
+    unmapped (the feature buffer's real size is unknown, so we over-ask)."""
+    while n > 0:
+        try:
+            return bytes(gdb.selected_inferior().read_memory(addr, n))
+        except gdb.MemoryError:
+            n -= 0x1000
+    return b''
 
 
 def _u32(addr):
@@ -195,6 +221,48 @@ class Stage5EntryBP(gdb.Breakpoint):
         return False
 
 
+# ─── WS-body packer (sub_180002240) — known-input → packed-output ───────
+_packer_calls = 0
+
+
+class PackerFinishBP(gdb.FinishBreakpoint):
+    def __init__(self, ws, idx):
+        super().__init__(internal=True)
+        self.ws, self.idx = ws, idx
+
+    def stop(self):
+        try:
+            _save('packer_ws_after', f'call{self.idx}', _read_safe(self.ws, PACKER_WS))
+        except Exception as e:
+            print(f'[!] packer finish failed: {e}')
+        return False
+
+    def out_of_scope(self):
+        pass
+
+
+class PackerEntryBP(gdb.Breakpoint):
+    """sub_180002240(a1 algo, a2=ws_dest[RDX], a3 stats[R8], a4=features[R9], w, h).
+    Dump features (a4) + ws BEFORE on entry, ws AFTER on return. The delta is
+    exactly the bytes this frame's feature buffer produced in the WS body."""
+    def stop(self):
+        global _packer_calls
+        if _packer_calls >= PACKER_MAX:
+            return False
+        try:
+            ws = _reg('rdx')       # a2 — WS body dest (ws+152)
+            feat = _reg('r9')      # a4 — extracted feature buffer (input)
+            i = _packer_calls
+            print(f'[*] packer #{i}: ws=0x{ws:x} features=0x{feat:x}')
+            _save('packer_features', f'call{i}', _read_safe(feat, PACKER_FEAT))
+            _save('packer_ws_before', f'call{i}', _read_safe(ws, PACKER_WS))
+            PackerFinishBP(ws, i)
+            _packer_calls += 1
+        except Exception as e:
+            print(f'[!] packer entry failed: {e}')
+        return False
+
+
 class VtableResolveBP(gdb.Breakpoint):
     """One-shot: at sub_18009FD20 entry, resolve the indirect frame-processor
     target at *(RCX+104) and print its address + RVA. That target (a runtime
@@ -237,6 +305,10 @@ def main():
         Stage5EntryBP('*' + hex(base + RVA_A5B0))
         print(f'[*] stage-5 descriptor hook ON (max {STAGE5_MAX} calls, '
               f'{STAGE5_BUF}B buffer)')
+    if PACKER_ON:
+        PackerEntryBP('*' + hex(base + RVA_2240))
+        print(f'[*] WS-body packer hook ON (max {PACKER_MAX} calls, '
+              f'ws={PACKER_WS}B feat<={PACKER_FEAT}B)')
     print(f'[*] breakpoints armed. dumps -> {OUTDIR}/')
     print('[*] run a full enrollment now, then Ctrl-C + detach.')
     gdb.execute('continue')
