@@ -281,14 +281,63 @@ which is why `Ixy` (x-pass then y-pass) won't recover as a single linear
 kernel while `Ixx`/`Iyy` (truncation-dominated by one axis) nearly do. Both
 passes handle left/middle/right edges explicitly with a rotating buffer.
 
-**OPEN (next session, with IDA):** the kernels from `sub_18000FFE0` look like
-pure Gaussians (smoothing), yet `Ixx`/`Iyy`/`Ixy` are derivatives — so the
-derivative either enters via a derivative-of-Gaussian tap variant in
-`sub_18000FEC0` or a finite-difference stencil in `sub_18000FDF0`, and how the
-three plane buffers (`+0x30/+0x38/+0x40`) get populated from one pass chain is
-not yet pinned. Resolve by reading `sub_18000FDF0` + `sub_18000FEC0`'s exact
-output against the `unk_180130F80` table in IDA. Then a Python port of
-`(pixel·tap)>>12` separable conv reproduces the buffers bit-exact. See
+**RESOLVED (disassembly, this session — objdump on `/tmp/syna.dll`).** The
+whole DoH detector chain is now decoded; the derivative enters as a
+**finite-difference stencil in a separate 3-tap kernel builder**, not in the
+Gaussian taps. Full chain:
+
+```
+gradin (57×57 Q10)
+ └ sub_18000F250:  per-pixel img >>= 6                       (Q10 → Q4)
+     ├ sub_1800101C0 → sub_180010050:  Gaussian PRE-SMOOTH    (shift 12)
+     │     two Gaussian kernels (FFE0/FF00/FEC0), σ ∝ scale, sum→4096 (Q12)
+     ├ per-pixel img <<= 6                                    (Q4 → Q10)
+     └ sub_18000CE80:
+         ├ sub_18000CC20:  build 3 Hessian planes via sub_180010380×  (shift 10)
+         │     per call sub_180010280 builds the (kx,ky) pair by type flag:
+         │        type 0 (smoothing): [c, c·0xd55>>10, c]  ≈ [1, 3.33, 1]
+         │        type 1 (derivative): [1024, 0, -1024]     = central diff [1,0,-1] Q10
+         │     planes: Ixx(+0x30), Ixy(+0x38), Iyy(+0x40); ·scale / ·scale² normalize
+         │     (Ixy = [1,0,-1]_x ⊗ [1,0,-1]_y — the per-tap >>10 in BOTH passes
+         │      is exactly why Ixy never recovered as a single linear kernel)
+         └ resp(+0x50) = (Ixx>>12)·(Iyy>>12) − (Ixy>>12)²
+         └ sub_18000CF90:  8-neighbour NMS + thresh([+0x20],[+0x24]) + dist-dedup → kp
+```
+
+Key bit-exact facts (all from disasm, ready to port):
+- **`unk_180130F80`** = 52-entry exp table, `table[i]=round(65536·exp(-0.19531·i))`,
+  `table[51]=0`. (A separate cos-style table follows it in `.rdata`.)
+- **`sub_18000FEC0`** (Gaussian tap): `t=(coef·x²>>10)`; `idx=((t·0x51eb851f)>>35,
+  rounded)>>13`; returns `table[-idx]` (indexed backward). `coef=−2²⁹/σ²`,
+  `x`=tap pos Q10 (step 1024=1px).
+- **`sub_18000FF00`** (1D Gaussian): σ-proxy `(157184·n+367309)>>10`; tap=`FEC0>>4`;
+  normalize `tap·(2³⁰/sum>>3)>>15` → kernel sums ~4096 (Q12).
+- **`sub_18000F460`/`F840`** (separable apply): `out[x]=Σ (in[x+k]·kernel[k])>>shift`,
+  per-term truncation; explicit left/middle/right edge regions w/ a scratch row.
+- **shift is 12 for the Gaussian smooth (`sub_180010050`) and 10 for the
+  derivative planes (`sub_180010380`)** — note the two regimes.
+
+**Response formula VALIDATED bit-exact + capture note.** `harris_resp_*` and
+`harris_Ixy_*` are byte-identical (all px, call0-3) because the DLL computes the
+response **in-place over the Ixy buffer** (`+0x50` and `+0x38` are the same
+allocation; the dump only fires on the `flag=0` path, so the response DID run).
+Both files therefore hold the **real response map** — a valid oracle. Proof:
+`(Ixx>>12)·(Iyy>>12) − resp` is a non-negative PERFECT SQUARE at every pixel
+(3249/3249, call0-3) ⇒ `resp = (Ixx>>12)(Iyy>>12) − (Ixy>>12)²` exactly, and the
+plane labels (`+0x30`=Ixx, `+0x40`=Iyy) are confirmed. Consequences:
+- `harris_resp`/`harris_Ixy` = the real response (bit-exact oracle).
+- there is NO separate raw-Ixy capture (it was overwritten in-place), but
+  `|Ixy>>12|` is recoverable as `sqrt((Ixx>>12)(Iyy>>12) − resp)`.
+(The earlier "resp corr 0.949" undershot only because it compared a *computed*
+resp against this map without an exact gradient; the formula was always right.)
+
+REMAINING = pure implementation: port the two builders + the separable apply +
+the 3-plane dataflow in `sub_18000CC20`, then validate **bit-exact** against the
+captured `harris_Ixx/Iyy/Ixy/resp` planes (57×57) in `$FRIDA_DUMP_DIR` (already
+on disk; `dev/diff_v30.py compare_harris`). The exact per-plane source/dest
+buffer wiring in `sub_18000CC20` (struct offsets +0x20/+0x28/+0x30/+0x38/+0x40/
++0x48/+0x50) and the scale params from the ctx struct ([+0x18],[+0x5c],[+0x60])
+are the only thing to read off carefully during the port. See
 `dev/NEXT-SESSION.md`.
 
 ### BRIEF descriptor selection

@@ -63,10 +63,9 @@ exact leaves left to port bit-exact (validate each vs the dumps in
 | stage | status | remaining leaves (decompile + port) |
 |-------|--------|--------------------------------------|
 | tiling | ✅ byte-exact (`tile_image`) | — |
-| gradient kernels | Gaussian, structure decoded | exp table `unk_180130F80` (use IDA, not manual offset); `sub_18000F460`/`sub_18000F840` (separable passes + the Q-truncation that makes `Ixy` exact) |
-| DoH `Ixx/Iyy` | linear 7×7, corr 0.998 (regression) | confirm vs the exact Gaussian-smoothed finite-diff kernel |
-| DoH `Ixy` | NOT linear-recoverable | needs `F460`/`F840` truncation |
-| keypoints (NMS) | — | the NMS/peak-pick inside `sub_18000A1B0`'s solver |
+| gradient/DoH | ✅ FULLY decoded (disasm) — see DLL-RE.md "Gradient kernel chain" | PORT: Gaussian smooth (shift 12) + 3-tap [1,0,-1]/[1,3.33,1] planes (shift 10) + `sub_18000CC20` buffer/scale wiring; validate vs captured `harris_*` planes |
+| DoH `Ixy` | ✅ explained: `[1,0,-1]_x ⊗ [1,0,-1]_y`, per-tap >>10 in both passes | (port, same as above) |
+| keypoints (NMS) | ✅ decoded — `sub_18000CF90`: 8-nbr NMS + thresh([+0x20],[+0x24]) + dist-dedup | port + validate kp coords |
 | orientation | algo decoded (`sub_18000D920`) | atan2 leaves `sub_1800030A0`, `sub_180003150`; peak `sub_18000D850`; weights `dword_180120C00` (dumped) |
 | descriptor | algo decoded (`sub_18000E090`) | bit-pack `sub_18000DF20`; DoH context `sub_18000C920`; BRIEF pairs from `sub_18000E6B0` (`BRIEF_SEED_TABLE`) |
 | assemble v30 | format known (`build_v30_record`) | wire stages → 250 records → splice/TID (have) |
