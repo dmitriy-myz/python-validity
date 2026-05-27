@@ -435,6 +435,34 @@ section bytes:
     scratch buffers; none of that reaches the section. (Earlier drafts
     wrongly credited `sub_1800043D0`/`sub_180008980` with the blob.)
 
+### CORRECTION: there is NO ridge enhancement — it's image tiling
+
+Earlier sections concluded the detector runs on a "ridge-enhanced image" we
+couldn't reproduce (the "enhancement wall"). **That was wrong.** Decompiling
+the orchestrator `sub_18000AAB0` shows it splits the working image into a
+**3×3 grid of overlapping 57×57 tiles** and runs the DoH detector per tile:
+
+- tile step = `h/3` = 37 px; tile size = `2·GRID_X + h/3` = `20 + 37` = 57;
+  overlap 20 px; out-of-bounds filled mid-gray (128) by `sub_180009F50`.
+- tile (i,j) = `image[i*37-10 : +57, j*37-10 : +57]`.
+- `gradin = tile << 10` (uint8 ×1024, the `[0,255·1024]` range).
+
+Proven: each captured `gradin` matches a 57×57 tile of `extract_image` at
+**corr 1.000** (call0 → tile(0,0) @ (−10,−10); call6 → tile(0,1) @ (−10,27)).
+The earlier "corr ~0 vs the raw frame" was because we compared against a
+*resize / center-crop*, not the actual off-origin tile. `sub_18000A850` is
+the tile blit; `sub_18000A4B0`→`sub_18000A1B0` is the per-tile detector;
+keypoints are merged and coords quantized tile-local→global by
+`sub_18000A910`; per-keypoint descriptors come from stage 5 `sub_18000A5B0`.
+
+**Consequence:** the detector input is fully reproducible (plain tiling +
+mid-gray pad). Native enrollment is **not** blocked by an unrecoverable
+enhancement; the only remaining unknown is the **descriptor algorithm**
+(`sub_18000A5B0` + the exact DoH), which is ordinary decompilable RE. The
+isolation-experiment finding below still holds (descriptors are load-bearing,
+and our *raw-image BRIEF* descriptor was wrong) — but the reason is a wrong
+descriptor pipeline, not a wall.
+
 ### Isolation experiment — the descriptor is load-bearing (DEFINITIVE)
 
 `dev/splice_experiment.py` built variants from a known-good reference (one

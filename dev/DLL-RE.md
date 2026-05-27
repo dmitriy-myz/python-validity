@@ -145,13 +145,15 @@ Hooking `sub_18000CE80` and diffing its dumps against `moh_opencv`:
   values (`[-4.1M,+2.7M]`) — not a squared gradient `Ix²`, so this is a
   **2nd-order / Hessian-like** operator (det-of-Hessian shape), not the
   first-derivative structure tensor our PoC uses.
-- **Input is preprocessed.** The tensor buffers and the final response
-  correlate **~0** with *any* simple derivative (Harris or Hessian, resized
-  or full-res, all transposes/flips/shifts ≤3px) of the raw `extract_image`.
-  ⇒ detection runs on a **ridge-enhanced and/or geometrically-aligned**
-  half-res image, not the raw frame. `moh_opencv` gets ~90% keypoint recall
-  @5px (ridge structure survives enhancement) but the exact response is
-  decorrelated → that is the @2px / bit-exact wall.
+- **Input is a TILE, not an enhanced image (CORRECTED).** The 57×57 plane is
+  a **tile of the working image**, not a downsample/enhancement. Proven:
+  `gradin/1024` matches a 57×57 window of `extract_image` at **corr 1.000**
+  (call0 → offset (−10,−10); call6 → (−10,27)). The orchestrator
+  `sub_18000AAB0` tiles the image into a 3×3 grid (step `h/3`=37, size
+  `2·GRID_X+h/3`=57, 20px overlap, mid-gray pad) and runs DoH per tile. The
+  earlier "~0 corr / ridge-enhanced / wall" claim was an artifact of
+  comparing `gradin` to a *resize/center-crop* of the whole frame instead of
+  the actual off-origin tile. **There is no enhancement.**
 
 **Front-end call tree (located via Hex-Rays — supersedes earlier objdump
 guess that put the enhancement in sub_18000F250; that was a bad disasm
@@ -169,17 +171,26 @@ sub_18000A1B0 (orchestrator stage-4 glue) — input a2 = already ~57² image
         └─ sub_18000CE80(a9, a1, …)               DoH response — DECODED
 ```
 
-So `gradin = v41 >> 6`, and `v41 = pad(a2)` — i.e. `sub_18000F250` only does
-gradients + DoH, and `sub_180009F50` is just a border (our port is correct,
-just incomplete in role). **`a2` (stage-4 input) is already the enhanced,
-downsampled ~57² image** (gradin minus border, pre `>>6`). Therefore the
-enhancement + 112→57 downsample are **upstream, inside the orchestrator
-`sub_18000AAB0` before stage-4** (`sub_18000A1B0` is reached via the stage-4
-dispatcher `sub_18000A4B0`). Standard orientation+Gabor does NOT reproduce
-the enhanced image (corr ~0). **Next: trace `sub_18000AAB0` → its early
-stages to find where raw 112² becomes enhanced ~57², or bracket it with a
-hook on `sub_18000A1B0` input (a2) vs the orchestrator input.** Next: decompile `sub_18000F250` (the order + which callee emits
-the enhanced image) and `sub_18000D920`/`sub_18000E090` (the filter kernels).
+So `gradin = v41 >> 6`, `v41 = pad(a2)`, and **`a2` (stage-4 input) is a
+57×57 TILE** of the working image (NOT an enhanced image). The orchestrator
+`sub_18000AAB0` does the tiling:
+
+```
+sub_18000AAB0: 3×3 grid over the working image
+  for each tile (i,j):
+    sub_18000A850  blit image[i*37-10:+57, j*37-10:+57] → v85 (mid-gray pad)
+    sub_18000A4B0 → sub_18000A1B0   DoH detector on the tile
+  merge keypoints; sub_18000A910 quantize tile-local→global coords
+  (second 9-tile pass) sub_18000A5B0  per-keypoint DESCRIPTOR (stage 5)
+  sub_1800095C0 qsorts / dedup → 250 minutiae → v30
+```
+
+So there is **no enhancement** to reverse. The detector input is plain
+tiling + mid-gray pad (reproducible). The remaining unknown for native
+enrollment is the **descriptor**: decompile `sub_18000A5B0` (stage 5, the
+per-keypoint descriptor) and nail the exact DoH (now feasible — input is a
+known tile). `sub_18000A850` (blit) and `sub_18000A910` (coord quantize) are
+already DECODED in `moh_extract.py`.
 
 **Operator confirmed = Determinant of Hessian** (GDB_DUMP_GRADIN capture of
 the enhanced image, `sub_18000FDF0`'s RCX input, 57×57 int32 Q10 in
