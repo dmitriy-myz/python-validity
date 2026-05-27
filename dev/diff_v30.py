@@ -98,6 +98,37 @@ def autocorr_strides(body, lo=4, hi=200):
     return best[:6]
 
 
+def record_format(body, strides=(18, 54)):
+    """Per-column entropy + coordinate-field detection for candidate record
+    sizes. A coord field (image is 112px) shows as a column whose values
+    stay within ~[0,112]. Returns the stride whose record count is most
+    integer and its coord-like column offsets."""
+    out = {}
+    for s in strides:
+        n = len(body) // s
+        coord_cols, col_ent = [], []
+        for j in range(s):
+            col = [body[r * s + j] for r in range(n)]
+            e = entropy(col)
+            col_ent.append(e)
+            if max(col) <= 115:          # plausible coordinate in a 112px frame
+                coord_cols.append(j)
+        out[s] = dict(n=n, leftover=len(body) % s,
+                      coord_cols=coord_cols, mean_ent=sum(col_ent) / s)
+    return out
+
+
+def report_record_format(v30s):
+    print("\n=== v30 record format (per-column analysis, frame 0) ===")
+    body = decode_v30(v30s[sorted(v30s)[0]])[2]
+    for s, info in record_format(body).items():
+        print(f"  stride {s}B: {info['n']} records (leftover {info['leftover']}B), "
+              f"mean col-entropy {info['mean_ent']:.2f}, "
+              f"coord-like cols (max<=115): {info['coord_cols']}")
+    print("  → records carry (x,y) coordinate fields + binary-descriptor bulk;"
+          " matching needs bit-exact keypoints AND descriptors.")
+
+
 def report_v30(v30s):
     print(f"\n=== v30 structure ({len(v30s)} frames) ===")
     for n in sorted(v30s):
@@ -181,6 +212,7 @@ def main():
     print(f"v30 source: {src}")
     if v30s:
         report_v30(v30s)
+        report_record_format(v30s)
 
     images = load_images(bucket)
     if images:
