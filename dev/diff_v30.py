@@ -270,6 +270,54 @@ def compare_harris(bucket, images):
           "(likely the Q12 >>12 fixed-point quantization).")
 
 
+def compare_gradin(bucket):
+    """If the enhanced gradient-input image is captured (GDB_DUMP_GRADIN), run
+    our operators on THAT image (not the raw frame) and correlate against the
+    DLL's gradient/response buffers. High corr here = we've located the
+    enhanced image and only the operator remains; still low = the buffers
+    aren't simple derivatives of even the enhanced image."""
+    gin = [f for f in glob.glob(os.path.join(DUMP_DIR, 'gradin_image_*_call*.bin'))
+           if int(re.search(r'_(\d+)_call', os.path.basename(f)).group(1)) // 100000 == bucket]
+    if not gin:
+        print("\n(no gradin_image_* — capture GDB_DUMP_GRADIN=1 for the enhanced "
+              "image the detector actually runs on)")
+        return
+    print("\n=== enhanced gradient-input image vs DLL buffers ===")
+    sys.path.insert(0, REPO_ROOT)
+    import cv2
+    import numpy as np
+
+    def at(call, kind, w, h):
+        fs = [f for f in glob.glob(os.path.join(DUMP_DIR, f'harris_{kind}_*_call{call}_*.bin'))
+              if int(re.search(r'_(\d+)_call', os.path.basename(f)).group(1)) // 100000 == bucket]
+        if not fs:
+            return None
+        return np.frombuffer(open(fs[0], 'rb').read(), np.int32)[:w * h].reshape(h, w).astype(np.float64)
+
+    def cc(a, b):
+        return float(np.corrcoef(a.ravel(), b.ravel())[0, 1])
+
+    for f in sorted(gin):
+        m = re.search(r'call(\d+)_(\d+)x(\d+)', os.path.basename(f))
+        call, w, h = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        img = np.frombuffer(open(f, 'rb').read(), np.int32)[:w * h].reshape(h, w).astype(np.float64)
+        ixx, iyy, ixy = (at(call, k, w, h) for k in ('Ixx', 'Iyy', 'Ixy'))
+        resp = at(call, 'resp', w, h)
+        f32 = img.astype(np.float32)
+        # first-derivative (Harris) and second-derivative (Hessian) products
+        gx = cv2.Sobel(f32, cv2.CV_64F, 1, 0, ksize=3); gy = cv2.Sobel(f32, cv2.CV_64F, 0, 1, ksize=3)
+        lxx = cv2.Sobel(f32, cv2.CV_64F, 2, 0, ksize=3); lyy = cv2.Sobel(f32, cv2.CV_64F, 0, 2, ksize=3)
+        lxy = cv2.Sobel(f32, cv2.CV_64F, 1, 1, ksize=3)
+        line = f"  call{call} {w}x{h}: img range[{img.min():.0f},{img.max():.0f}]"
+        if ixx is not None:
+            line += (f" | Harris Ix²->Ixx={cc(gx * gx, ixx):+.2f}"
+                     f" | Hessian Lxx->Ixx={cc(lxx, ixx):+.2f} Lxy->Ixy={cc(lxy, ixy):+.2f}")
+        if resp is not None:
+            line += f" | DoH->resp={cc(lxx * lyy - lxy * lxy, resp):+.2f}"
+        print(line)
+    print("  → if Hessian corrs are high, port: enhance->this image, Sobel d2, DoH.")
+
+
 def report_opencv(images):
     print(f"\n=== our moh_opencv extraction ({len(images)} images) ===")
     try:
@@ -311,6 +359,7 @@ def main():
     if images:
         compare_keypoints(v30s, images)
         compare_harris(bucket, images)
+        compare_gradin(bucket)
         report_opencv(images)
     else:
         print("\n(no extract_image_* — capture GDB_DUMP_EXTRACT=1 for the matching "

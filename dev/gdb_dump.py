@@ -50,6 +50,7 @@ RVA_46E0 = 0x46E0     # per-minutia DESCRIPTOR builder (opt-in) — see DescEntr
 RVA_43D0 = 0x43D0     # descriptor-BLOB filler (opt-in) — see BlobEntryBP
 RVA_1A50 = 0x1A50     # feature EXTRACTOR (opt-in) — see ExtractEntryBP
 RVA_CE80 = 0xCE80     # Harris RESPONSE (opt-in) — see HarrisEntryBP
+RVA_FDF0 = 0xFDF0     # gradient I_x — its input is the ENHANCED image (opt-in)
 
 MASK = (1 << 64) - 1
 
@@ -116,6 +117,15 @@ EXTRACT_V30 = int(os.environ.get('GDB_EXTRACT_V30', '8192'))   # feature buffer 
 # diff the DLL's fixed-point response map against our float Harris.
 HARRIS_ON = os.environ.get('GDB_DUMP_HARRIS') == '1'
 HARRIS_MAX = int(os.environ.get('GDB_HARRIS_MAX', '4'))
+
+# Gradient-input hook is opt-in. sub_18000FDF0(a1=img, a2=dst, w=R8d, h=R9d)
+# copies a1 -> a2 (w*h*4 bytes, int32 pixels) then runs the separable
+# gradient passes. So RCX at entry is the ENHANCED image the detector
+# actually works on (57x57 int32) — the missing piece: our operator run on
+# THIS image should correlate with the DLL gradients/response, turning the
+# unknown enhancement into a decodable image->image transform.
+GRADIN_ON = os.environ.get('GDB_DUMP_GRADIN') == '1'
+GRADIN_MAX = int(os.environ.get('GDB_GRADIN_MAX', '8'))
 
 # Stage-5 hook is opt-in (it fires ~9 tiles × N frames). Enable with:
 #   GDB_DUMP_STAGE5=1   and optionally  GDB_STAGE5_MAX=<n>  GDB_STAGE5_BUF=<bytes>
@@ -523,6 +533,33 @@ class HarrisEntryBP(gdb.Breakpoint):
         return False
 
 
+# ─── Gradient input (sub_18000FDF0) — the enhanced image ────────────────
+_gradin_calls = 0
+
+
+class GradinEntryBP(gdb.Breakpoint):
+    """sub_18000FDF0 entry: RCX=input image, R8d=w, R9d=h (int32 pixels).
+    Dump the enhanced image the detector actually runs on."""
+    def stop(self):
+        global _gradin_calls
+        if _gradin_calls >= GRADIN_MAX:
+            return False
+        try:
+            img = _reg('rcx')
+            w = _reg('r8') & 0xffffffff
+            h = _reg('r9') & 0xffffffff
+            i = _gradin_calls
+            if not (0 < w <= 512 and 0 < h <= 512):
+                print(f'[!] gradin #{i}: implausible {w}x{h}, skipping')
+                return False
+            print(f'[*] gradin #{i}: img=0x{img:x} {w}x{h} (int32)')
+            _save('gradin_image', f'call{i}_{w}x{h}', _read_safe(img, w * h * 4))
+            _gradin_calls += 1
+        except Exception as e:
+            print(f'[!] gradin entry failed: {e}')
+        return False
+
+
 class VtableResolveBP(gdb.Breakpoint):
     """One-shot: at sub_18009FD20 entry, resolve the indirect frame-processor
     target at *(RCX+104) and print its address + RVA. That target (a runtime
@@ -584,6 +621,9 @@ def main():
     if HARRIS_ON:
         HarrisEntryBP('*' + hex(base + RVA_CE80))
         print(f'[*] Harris-response hook ON (max {HARRIS_MAX} calls)')
+    if GRADIN_ON:
+        GradinEntryBP('*' + hex(base + RVA_FDF0))
+        print(f'[*] gradient-input hook ON (max {GRADIN_MAX} calls)')
     print(f'[*] breakpoints armed. dumps -> {OUTDIR}/')
     print('[*] run a full enrollment now, then Ctrl-C + detach.')
     gdb.execute('continue')
