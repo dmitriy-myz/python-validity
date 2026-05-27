@@ -129,7 +129,35 @@ Python port it lives in `validitysensor/moh_extract.py`.
 |-----------------|-------------------------------------------------------|--------|
 | `sub_180010050` | Sobel-style gradient (vertical pass / I_y)            | body present, not ported |
 | `sub_18000FDF0` | Sobel-style gradient (horizontal pass / I_x)          | body present, not ported |
-| `sub_18000CE80` | Harris-style response: computes `Ixx·Iyy − Ixy²` (no `−k·trace²` term seen) | body present, not ported |
+| `sub_18000CE80` | Response: `(buf30>>12)·(buf40>>12) − (buf38>>12)²` in **Q12 fixed-point**, int32. Operates per *plane* (list at ctx+0x50, count ctx+0x58, stride 0x70; per plane +0=w +4=h +0x30/0x38/0x40=tensor +0x50=response). | DECODED |
+
+#### Detector diagnosis (GDB_DUMP_HARRIS capture, `dev/diff_v30.py compare_harris`)
+
+Hooking `sub_18000CE80` and diffing its dumps against `moh_opencv`:
+
+- **Half resolution.** The response plane is **57×57** (≈112/2): the detector
+  downsamples the 112×112 frame before computing gradients.
+- **Response formula confirmed.** `(buf30>>12)·(buf40>>12) − (buf38>>12)²`
+  reproduces the dumped `resp` at **corr +0.949** (24% byte-exact; the rest
+  is rounding/overflow detail). So the `AB−C²` decode is correct.
+- **NOT Harris on the raw image.** `buf30` ("Ixx") holds large **negative**
+  values (`[-4.1M,+2.7M]`) — not a squared gradient `Ix²`, so this is a
+  **2nd-order / Hessian-like** operator (det-of-Hessian shape), not the
+  first-derivative structure tensor our PoC uses.
+- **Input is preprocessed.** The tensor buffers and the final response
+  correlate **~0** with *any* simple derivative (Harris or Hessian, resized
+  or full-res, all transposes/flips/shifts ≤3px) of the raw `extract_image`.
+  ⇒ detection runs on a **ridge-enhanced and/or geometrically-aligned**
+  half-res image, not the raw frame. `moh_opencv` gets ~90% keypoint recall
+  @5px (ridge structure survives enhancement) but the exact response is
+  decorrelated → that is the @2px / bit-exact wall.
+
+**Bottom line:** the bit-exact-`v30` blocker is the **image-enhancement
+front-end** inside `sub_180001A50` (pad `sub_180009F50` → downsample →
+enhance), upstream of the now-decoded response math. Next diagnostic to go
+further: hook the gradient functions `sub_180010050`/`sub_18000FDF0` to dump
+their *input* (the enhanced 57×57 image) — our operator on THAT should
+correlate.
 
 ### BRIEF descriptor selection
 
