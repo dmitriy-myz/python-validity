@@ -340,16 +340,23 @@ class DescEntryBP(gdb.Breakpoint):
 _blob_calls = 0
 
 
+# The work-area arg's exact stack slot was ambiguous (vararg trace), so we
+# scan every stack-arg slot and dump each one that holds a *readable*
+# pointer. The per-keypoint descriptor source is whichever slot's region
+# changes across the call — match its delta to the section blob.
+BLOB_SLOTS = (0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58)
+
+
 class BlobFinishBP(gdb.FinishBreakpoint):
-    def __init__(self, rec, work, idx):
+    def __init__(self, rec, cands, idx):
         super().__init__(internal=True)
-        self.rec, self.work, self.idx = rec, work, idx
+        self.rec, self.cands, self.idx = rec, cands, idx
 
     def stop(self):
         try:
             _save('blob_record_after', f'call{self.idx}', _read_safe(self.rec, BLOB_REC))
-            if self.work:
-                _save('blob_work_after', f'call{self.idx}', _read_safe(self.work, BLOB_WORK))
+            for off, ptr in self.cands:
+                _save(f'blob_arg{off:#x}_after', f'call{self.idx}', _read_safe(ptr, BLOB_WORK))
         except Exception as e:
             print(f'[!] blob finish failed: {e}')
         return False
@@ -359,9 +366,10 @@ class BlobFinishBP(gdb.FinishBreakpoint):
 
 
 class BlobEntryBP(gdb.Breakpoint):
-    """sub_1800043D0 entry: RCX=record+104, RDX=image, R9=pose,
-    work area at [rsp+0x40]. Dump record[26..] + work before/after (deltas =
-    the per-keypoint descriptor) + pose + image."""
+    """sub_1800043D0 entry: RCX=record+104, RDX=image, R9=pose. The work
+    area is one of the stack args — scan BLOB_SLOTS, dump every readable
+    pointer's region before/after. The slot whose region changes (and whose
+    delta matches the section blob) is the per-keypoint descriptor source."""
     def stop(self):
         global _blob_calls
         if _blob_calls >= BLOB_MAX:
@@ -370,14 +378,21 @@ class BlobEntryBP(gdb.Breakpoint):
             rec = _reg('rcx')          # record+104
             img = _reg('rdx')          # image data
             pose = _reg('r9')          # 4-dword pose struct
-            work = _u64(_reg('rsp') + 0x40)   # the 4004-byte work area (best-effort)
+            rsp = _reg('rsp')
             i = _blob_calls
-            print(f'[*] blob #{i}: rec+104=0x{rec:x} work=0x{work:x} pose=0x{pose:x}')
+            cands = []
+            for off in BLOB_SLOTS:
+                ptr = _u64(rsp + off)
+                if len(_read_safe(ptr, 64)) >= 64:   # readable -> a real pointer
+                    cands.append((off, ptr))
+            print(f'[*] blob #{i}: rec+104=0x{rec:x} pose=0x{pose:x} '
+                  f'ptr-args=' + ' '.join(f'+{o:#x}=0x{p:x}' for o, p in cands))
             _save('blob_record_before', f'call{i}', _read_safe(rec, BLOB_REC))
             _save('blob_pose', f'call{i}', _read_safe(pose, 16))
-            _save('blob_work_before', f'call{i}', _read_safe(work, BLOB_WORK))
             _save('blob_image', f'call{i}', _read_safe(img, BLOB_IMG))
-            BlobFinishBP(rec, work, i)
+            for off, ptr in cands:
+                _save(f'blob_arg{off:#x}_before', f'call{i}', _read_safe(ptr, BLOB_WORK))
+            BlobFinishBP(rec, cands, i)
             _blob_calls += 1
         except Exception as e:
             print(f'[!] blob entry failed: {e}')
