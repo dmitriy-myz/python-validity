@@ -285,16 +285,53 @@ print(sensor.identify(lambda e: print(f"retry: {e}")))
 
 ## Open questions
 
-- **What is the exact WS body layout?** This is now the only blocker
-  for native Linux enrollment. The body is *plaintext* signed-int32
-  feature data + headers + padding (proven by the TID recipe working
-  on the bytes as-is, no decryption step needed), but we haven't fully
-  mapped the structure. The DLL-RE notes have a partial picture:
-  32-byte minutia records starting after a magic header, stable
-  section anchors at offsets 4845/9433/13973 carrying `0xfa = 250`,
-  and 250 slots. The remaining unknowns are the per-slot tail bytes
-  (+0x14..+0x1f), the header configuration words, and the trailing
-  feature/calibration region.
+- **What is the per-field bit layout inside the WS body sections?**
+  This is the only blocker for native Linux enrollment, and black-box
+  analysis has been *exhausted* — see "WS body feature encoding
+  (black-box findings)" below. We know the packing granularity
+  (36-byte / two 144-bit units) but not the per-field bit assignment.
+  This now requires **known inputs** via `dev/frida_dump.py` (dump the
+  in-memory minutia table beside the WS body and search for known
+  values inside the 36-byte records).
+
+## WS body feature encoding (black-box findings)
+
+Everything recoverable from the output alone has been extracted. Summary
+of what the feature sections (the high-entropy data between the section
+anchors) actually are:
+
+- **Bit-packed, NOT byte-aligned records.** Entropy ~7.86 bits/byte. No
+  coordinate-range values (`x∈0..1126, y∈0..671` or `x,y∈0..112`) appear
+  at any stride/offset under any width — so fields cross byte boundaries.
+  The earlier "32-byte minutia records" idea is *wrong* for the WS body:
+  reading the in-memory record's `flag9` byte (which must be 0..8) at a
+  32-byte stride gives uniform 0..255, and x/y read as garbage int32.
+  (The 32-byte layout is the chip's *in-memory* working format, decoded
+  in `dev/DLL-RE.md`; it is serialized into this denser packed form.)
+
+- **NOT an image at any dimension.** An adjacent-row-correlation sweep
+  over 93,233 `(skip 0..700, width 4..136)` combinations peaks at only
+  **0.485** (at width 36). A real 112×112 fingerprint frame scores
+  **0.81** at its true width; zero WS-body combos exceed 0.5. The
+  `end_ptr = 18496 = 136²` match is a coincidence — width 68 and 136
+  both give ≈0 correlation, so the "68²/136² quadrant grid" idea is
+  ruled out.
+
+- **36-byte (288-bit) packing period.** Autocorrelation and the width
+  sweep both peak on the 18-multiple family (18, 36, 54, 72, …), with
+  36 strongest. So the fundamental packing unit is 144 bits and a record
+  is plausibly two of them (36 bytes), though `section_size / count`
+  (≈50) doesn't divide cleanly — the count→record mapping is unconfirmed.
+
+- **Cleanest stream is mid-section.** Row correlation roughly doubles
+  (0.23 → 0.485) once you skip past ~550 bytes into a section, i.e. past
+  the header/prelude/trailer into the pure feature payload. Target that
+  region for the Frida known-input correlation.
+
+The remaining unknowns are the per-slot tail bytes, the header
+configuration words, and the trailing feature/calibration region — all
+of which are inside the bit-packed stream and not recoverable without
+known inputs.
 
 - **What determines the trailer byte?** Captured values vary
   (0x11, 0x70, 0x86, 0xa9). Probably a record-type or subtype marker the
@@ -308,11 +345,16 @@ print(sensor.identify(lambda e: print(f"retry: {e}")))
 
 ### Resolved
 
-- ~~**What is the WS encryption scheme?**~~ Probably no encryption at
-  all. The WS body is plaintext signed-int feature data; the high
-  entropy reflects the dynamic range of int32 deltas. `db.dump_raw`
-  returns the bytes verbatim, and the TID self-MAC recipe works on the
-  cleartext bytes — both consistent with no symmetric encryption pass.
+- ~~**What is the WS encryption scheme?**~~ Likely no symmetric
+  encryption pass, but "plaintext signed-int feature data" was an
+  over-claim that only held for the low-entropy *prelude* (WS 40..223,
+  entropy 5.17, visible sign-extension). The main feature *sections* are
+  **bit-packed high-entropy data** (entropy 7.86) — see "WS body feature
+  encoding" above. The mild byte skew (0x44 over-represented ~3.5×, not
+  the perfect uniformity of AES output) argues against encryption and
+  for bit-packed binary descriptors. `db.dump_raw` returns the bytes
+  verbatim and the TID self-MAC works on them, but neither proves the
+  content is plaintext — only that storage is verbatim.
 
 - ~~**How is the TID derived?**~~ HMAC-SHA256 chain over the WS body
   itself (see "TID derivation" above).

@@ -304,32 +304,42 @@ Detailed in `dev/MOH.md`. Summary:
 
 ## Open questions / dead ends
 
-1. **What is the trailer byte?** Hash byte? Subtype-related? Per-record
+1. **What is the per-field bit layout of the WS-body feature sections?**
+   THE blocker for native enrollment. Black-box analysis is exhausted
+   (see "WS body feature encoding (black-box findings)" in `dev/MOH.md`):
+   the sections are **bit-packed** (entropy 7.86), **not an image** at
+   any (skip, width) — a 93k-combination correlation sweep peaks at 0.485
+   vs 0.81 for a real frame — and **not byte-aligned records**. The
+   packing period is **36 bytes (two 144-bit units)**. Going from
+   "36-byte packed units" to "bits a..b = x, bits c..d = y, …" needs
+   **known inputs**: dump the in-memory minutia table beside the WS body
+   via `dev/frida_dump.py` and search for known field values inside the
+   36-byte records of a clean mid-section.
+2. **What is the trailer byte?** Hash byte? Subtype-related? Per-record
    counter encoded in single byte? Captured values: `0x11`, `0x70`,
    `0x86`, `0xa9`.
-2. **What do offsets 4845, 9433, 13973 in the WS actually represent?**
-   Diffing two captures shows stable 16-byte structured anchors with a
-   counter (6, 7) and constant `0xfa = 250`. Likely section headers
-   for sub-blocks of feature data.
-3. **The 4 high bytes of the minutia head** (offsets +0..+7) and the
-   12 tail bytes (+0x14..+0x1f): probably (x, y, theta, type, quality)
-   but exact layout not cracked.
-4. **The trailing region of the WS body** (roughly offsets 8000..23052
-   that we haven't mapped to minutia records). Plaintext, but its
-   feature/calibration semantics aren't decoded. Without this region
-   the OpenCV PoC produces WS bodies the chip won't match.
+3. **What do offsets 4845, 9433, 13973 in the WS actually represent?**
+   Stable structured anchors with an index (4,5,6,7,8) and constant
+   `0xfa = 250` — section trailers separating the bit-packed feature
+   sub-blocks.
+4. **The 4 high bytes of the in-memory minutia head** (+0..+7) and the
+   tail bytes: probably (x, y, theta, type, quality). NOTE: this is the
+   *in-memory* 32-byte working record. The WS body does NOT store these
+   32-byte records — it serializes them into the bit-packed form above.
 
 ### Resolved (originally listed open questions, now answered)
 
-- ~~**Where is the encryption step?**~~ There isn't one. The WS body is
-  plaintext signed-int32 feature data, not encrypted. The Wine crypto
-  trace (see `dev/MOH.md` "TID derivation") shows that the only
-  symmetric encryption call covering the finger record is the TLS-layer
-  AES-256-CBC wrap of the whole wire payload — which the chip's TLS
-  endpoint decrypts, leaving the WS body in cleartext for storage.
-  `db.dump_raw` returns the same bytes that went in, confirming verbatim
-  storage. The high entropy reflects the dynamic range of signed-int
-  feature values, not encryption.
+- ~~**Where is the encryption step?**~~ Likely no symmetric encryption
+  pass. The Wine crypto trace shows the only cipher covering the finger
+  record is the TLS-layer AES-256-CBC wrap of the whole wire payload,
+  which the chip's TLS endpoint decrypts — leaving the WS body verbatim
+  for storage (`db.dump_raw` confirms). CAVEAT: the main feature sections
+  are bit-packed high-entropy data (7.86 bits/byte), not "plaintext
+  signed-int feature data" as earlier drafts claimed — that only held
+  for the low-entropy prelude. The byte skew (0x44 ~3.5× uniform) argues
+  against AES (which is uniform) and for bit-packed binary descriptors.
+  So: not symmetric-encrypted, but also not trivially readable — it's a
+  bit-packed serialization. See `dev/MOH.md` "WS body feature encoding".
 
 - ~~**How is the 32-byte TID at offset 23072 derived?**~~ HMAC-SHA256
   chain with a self-derived key, decoded from `enroll-fresh.log` lines
