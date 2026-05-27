@@ -44,6 +44,7 @@ DLL = 'synaWudfBioUsb.dll'
 RVA_A4900 = 0xA4900   # WS-body copy-out (session in RCX)
 RVA_AAB0 = 0xAAB0     # orchestrator (minutia ctx in RDX)
 RVA_A5B0 = 0xA5B0     # stage 5 — descriptor computation (opt-in)
+RVA_9FD20 = 0x9FD20   # frame-processor vtable dispatcher (resolves *(RCX+104))
 
 MASK = (1 << 64) - 1
 
@@ -194,6 +195,35 @@ class Stage5EntryBP(gdb.Breakpoint):
         return False
 
 
+class VtableResolveBP(gdb.Breakpoint):
+    """One-shot: at sub_18009FD20 entry, resolve the indirect frame-processor
+    target at *(RCX+104) and print its address + RVA. That target (a runtime
+    vtable slot, invisible to static decompilation) is the real host-side
+    processor that calls the orchestrator and packs the WS body."""
+    def __init__(self, spec, base):
+        super().__init__(spec)
+        self.base = base
+        self.done = False
+
+    def stop(self):
+        if self.done:
+            return False
+        try:
+            a1 = _reg('rcx')
+            target = _u64(a1 + 104)
+            rva = target - self.base
+            print(f'[*] sub_18009FD20 vtable target = 0x{target:x}  (RVA 0x{rva:x})'
+                  f'  -> decompile sub_18{rva:06x}')
+            # also dump a few neighboring slots for context
+            for off in (96, 104, 112, 120):
+                t = _u64(a1 + off)
+                print(f'      a1+{off}: 0x{t:x} (RVA 0x{t-self.base:x})')
+            self.done = True
+        except Exception as e:
+            print(f'[!] vtable resolve failed: {e}')
+        return False
+
+
 def main():
     base = find_dll_base()
     if base is None:
@@ -202,6 +232,7 @@ def main():
     print(f'[*] {DLL} base = {hex(base)}')
     WSBodyBP('*' + hex(base + RVA_A4900))
     MinutiaEntryBP('*' + hex(base + RVA_AAB0))
+    VtableResolveBP('*' + hex(base + RVA_9FD20), base)
     if STAGE5_ON:
         Stage5EntryBP('*' + hex(base + RVA_A5B0))
         print(f'[*] stage-5 descriptor hook ON (max {STAGE5_MAX} calls, '
