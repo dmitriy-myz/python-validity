@@ -152,12 +152,24 @@ Hooking `sub_18000CE80` and diffing its dumps against `moh_opencv`:
   @5px (ridge structure survives enhancement) but the exact response is
   decorrelated → that is the @2px / bit-exact wall.
 
-**Bottom line:** the bit-exact-`v30` blocker is the **image-enhancement
-front-end** inside `sub_180001A50` (pad `sub_180009F50` → downsample →
-enhance), upstream of the now-decoded response math. Next diagnostic to go
-further: hook the gradient functions `sub_180010050`/`sub_18000FDF0` to dump
-their *input* (the enhanced 57×57 image) — our operator on THAT should
-correlate.
+**Operator confirmed = Determinant of Hessian** (GDB_DUMP_GRADIN capture of
+the enhanced image, `sub_18000FDF0`'s RCX input, 57×57 int32 Q10 in
+`[0,255·1024]`). Running our **2nd-derivative** `Lxx` (Sobel-5) on that
+captured enhanced image correlates **+0.89..+0.92** with the DLL's `Ixx`
+buffer (vs ~0 for first-derivative `Ix²`). So the detector is DoH
+(`Lxx·Lyy − Lxy²`), not Harris — `dev/DLL-RE.md`'s old "Harris" label is
+wrong in operator, right in formula shape.
+
+**The remaining wall = the enhancement transform** (raw 112² frame → the
+enhanced 57² image). It is NOT recoverable from the endpoints by simple
+means: the enhanced image correlates ~0 with the resized raw frame (all
+interps, inverted, CLAHE, rank/value remap), a rotation sweep peaks at only
+0.08, and ECC affine registration fails (ecc 0.19). ⇒ it is a genuine
+content transform — orientation-field ridge enhancement / oriented filtering
+that restructures the frame into a canonical ridge image — i.e. the
+proprietary fingerprint front-end, upstream of the now-decoded detector.
+Going further would require RE'ing that filter bank + orientation estimation
+(`sub_180001A50`'s internals before the gradient stage), a large effort.
 
 ### BRIEF descriptor selection
 
