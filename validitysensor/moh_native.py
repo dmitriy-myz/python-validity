@@ -195,6 +195,36 @@ def doh(tile, size=5, v9=1):
     return ixx, iyy, ixy, resp
 
 
-# NEXT: keypoints — sub_18000CF90 (8-neighbour NMS on `resp` + threshold
-# ctx[+0x20]/[+0x24] + distance-dedup), then orientation (sub_18000D920) and
-# oriented BRIEF (sub_18000E090). See dev/DLL-RE.md.
+# ─── keypoints — NMS (sub_18000CF90) — PENDING per-tile validation ───────
+def nms(resp, t_lo, t_hi, dedup_q, margin=1):
+    """8-neighbour non-max suppression on the response map (sub_18000CF90).
+    A pixel is a keypoint iff resp>t_lo, resp>=t_hi, and strictly greater than
+    all 8 neighbours; score = |resp|; near duplicates within a radius derived
+    from dedup_q (= ((ctx[+0x48]>>6)²)>>20) are suppressed, keeping the stronger.
+
+    t_lo=ctx[+0x20], t_hi=ctx[+0x24], dedup_q=ctx[+0x48] (capture via
+    GDB_DUMP_NMS=1). DECODED from disasm; NOT yet byte-validated — the exact
+    dedup/replace ordering and 32-byte record layout are confirmed against the
+    nms_* captures before this is trusted."""
+    h, w = resp.shape
+    r2 = ((dedup_q >> 6) ** 2) >> 20
+    kps = []   # (score, x, y)
+    for y in range(margin, h - margin):
+        for x in range(margin, w - margin):
+            v = int(resp[y, x])
+            if v <= t_lo or v < t_hi:
+                continue
+            nb = resp[y-1:y+2, x-1:x+2]
+            if v <= nb.max() and not (v == nb.max() and (nb == v).sum() == 1):
+                continue
+            s = abs(v)
+            dup = next((i for i, (_, kx, ky) in enumerate(kps)
+                        if (kx - x) ** 2 + (ky - y) ** 2 <= r2), None)
+            if dup is None:
+                kps.append((s, x, y))
+            elif s > kps[dup][0]:
+                kps[dup] = (s, x, y)
+    return kps
+
+
+# NEXT after NMS: orientation (sub_18000D920) + oriented BRIEF (sub_18000E090).

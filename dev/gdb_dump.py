@@ -52,6 +52,7 @@ RVA_1A50 = 0x1A50     # feature EXTRACTOR (opt-in) — see ExtractEntryBP
 RVA_CE80 = 0xCE80     # Harris RESPONSE (opt-in) — see HarrisEntryBP
 RVA_FDF0 = 0xFDF0     # gradient I_x — its input is the ENHANCED image (opt-in)
 RVA_10380 = 0x10380   # one separable filter pass (CC20 calls it 5×) (opt-in)
+RVA_CF90 = 0xCF90     # NMS / keypoint extractor (opt-in) — see NmsEntryBP
 
 MASK = (1 << 64) - 1
 
@@ -586,6 +587,67 @@ class G380EntryBP(gdb.Breakpoint):
         return False
 
 
+# ─── NMS / keypoint extractor (sub_18000CF90) ───────────────────────────
+# sub_18000CF90(out_kp=RCX, ctx=RDX, capacity=R8d, …) -> count (EAX). Reads the
+# response plane at *(ctx+0x50)+0x50 and thresholds ctx+0x20/+0x24/+0x48, runs
+# 8-neighbour NMS + distance-dedup, writes `count` 32-byte keypoint records to
+# out_kp. We dump: the response plane + the 3 thresholds (at entry) and the
+# keypoint records (at return) — to validate moh_native's NMS port per tile.
+NMS_ON = os.environ.get('GDB_DUMP_NMS') == '1'
+NMS_MAX = int(os.environ.get('GDB_NMS_MAX', '12'))
+_nms_calls = 0
+
+
+class NmsFinishBP(gdb.FinishBreakpoint):
+    def __init__(self, out, idx):
+        super().__init__(internal=True)
+        self.out, self.idx = out, idx
+
+    def stop(self):
+        try:
+            count = _reg('rax') & 0xffffffff
+            if count > 4096:
+                count = 0
+            _save('nms_kp', f'call{self.idx}_n{count}', _read_safe(self.out, count * 0x20))
+            print(f'    nms #{self.idx}: {count} keypoints')
+        except Exception as e:
+            print(f'[!] nms finish failed: {e}')
+        return False
+
+    def out_of_scope(self):
+        pass
+
+
+class NmsEntryBP(gdb.Breakpoint):
+    def stop(self):
+        global _nms_calls
+        if _nms_calls >= NMS_MAX:
+            return False
+        try:
+            out = _reg('rcx'); ctx = _reg('rdx')
+            t20 = _u32(ctx + 0x20); t24 = _u32(ctx + 0x24); t48 = _u32(ctx + 0x48)
+            base = _u64(ctx + 0x50)                      # plane list
+            pl = base                                    # plane 0
+            w, h = _u32(pl), _u32(pl + 4)
+            i = _nms_calls
+            if 0 < w <= 512 and 0 < h <= 512:
+                resp = _u64(pl + 0x50)
+                _save('nms_resp', f'call{i}_{w}x{h}', _read_safe(resp, w * h * 4))
+            # thresholds as a tiny 3×i32 blob
+            import struct
+            _save('nms_thr', f'call{i}', struct.pack('<3i', _s32(t20), _s32(t24), _s32(t48)))
+            print(f'[*] nms #{i}: ctx=0x{ctx:x} thr=({_s32(t20)},{_s32(t24)},{_s32(t48)}) {w}x{h}')
+            NmsFinishBP(out, i)
+            _nms_calls += 1
+        except Exception as e:
+            print(f'[!] nms entry failed: {e}')
+        return False
+
+
+def _s32(v):
+    return v - (1 << 32) if v & 0x80000000 else v
+
+
 # ─── Gradient input (sub_18000FDF0) — the enhanced image ────────────────
 _gradin_calls = 0
 
@@ -680,6 +742,9 @@ def main():
     if G380_ON:
         G380EntryBP('*' + hex(base + RVA_10380))
         print(f'[*] sub_180010380 per-pass hook ON (max {G380_MAX} calls)')
+    if NMS_ON:
+        NmsEntryBP('*' + hex(base + RVA_CF90))
+        print(f'[*] NMS/keypoint hook ON (max {NMS_MAX} calls)')
     print(f'[*] breakpoints armed. dumps -> {OUTDIR}/')
     print('[*] run a full enrollment now, then Ctrl-C + detach.')
     gdb.execute('continue')
