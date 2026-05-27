@@ -142,11 +142,29 @@ if __name__ == '__main__':
     for nf in (ds, ds*ds, 2*ds+1):
         score(ixxA * nf, Ixx, tag='C A·%d' % nf)
 
-    print('\nFull sweep with per-pass >>6/<<6, Ixx = DxDx·Sy:\n')
-    for sm in (0, 3, 5, 7, 9):
+    # ── exact CC20 flow ──────────────────────────────────────────────────
+    def cc20(presmoothed, v9):
+        """Reproduce sub_18000CC20's per-block plane build for scale v9.
+        Each sub_180010380 pass = (>>6, separable kx·ky shift10, <<6); kernels
+        are 3-tap at offset ±v9 (deriv [1024,0,-1024] / smooth [c,3.33c,c])."""
+        dk = build_3tap(v9, deriv=True); sk = build_3tap(v9, deriv=False)
+        P = lambda img, kx, ky: (apply_sep(img >> 6, kx, ky, 10)) << 6
+        buf20 = presmoothed.copy()
+        buf28 = P(buf20, sk, dk)              # prep1 (0,1): smooth_x, deriv_y  -> Dy
+        buf20 = P(buf20, dk, sk)              # prep2 (1,0): deriv_x, smooth_y  -> Dx
+        buf20 = buf20 * v9                    # norm1 ·v9
+        buf28 = buf28 * v9
+        ixy   = P(buf20, sk, dk)              # (0,1): Dy(buf20)
+        ixx   = P(buf20, dk, sk)              # (1,0): Dx(buf20)
+        iyy   = P(buf28, sk, dk)              # (0,1): Dy(buf28)
+        v10 = v9 * v9
+        return ixx * v10, iyy * v10, ixy * v10
+
+    print('\nExact CC20 flow — sweep presmooth size sm, scale v9:\n')
+    for sm in (0, 3, 5, 7):
         gk = build_gaussian(sm) if sm else None
-        smi = ((apply_sep(base, gk, gk, 12)) << 6) if sm else (base << 6)
-        for ds in (1, 2):
-            dk = build_3tap(ds, True); sk = build_3tap(ds, False)
-            ixx = deriv_pass(deriv_pass(smi, dk, sk), dk, sk)
-            score(ixx, Ixx, tag='sm=%d ds=%d' % (sm, ds))
+        smi = (apply_sep(base, gk, gk, 12) << 6) if sm else (base << 6)
+        for v9 in (1, 2, 3):
+            ixx, iyy, ixy = cc20(smi, v9)
+            print('  sm=%d v9=%d:' % (sm, v9))
+            score(ixx, Ixx, tag='    Ixx'); score(iyy, Iyy, tag='    Iyy')

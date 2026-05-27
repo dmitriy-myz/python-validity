@@ -331,6 +331,32 @@ plane labels (`+0x30`=Ixx, `+0x40`=Iyy) are confirmed. Consequences:
 (The earlier "resp corr 0.949" undershot only because it compared a *computed*
 resp against this map without an exact gradient; the formula was always right.)
 
+**`sub_18000CC20` dataflow — DECODED (Hex-Rays).** Per block (struct stride
+0x70, base `B = ctx[+0x50] + i·0x70`):
+```
+scale v9 = (ctx[+0x18]·B[+0x5c] >> B[+0x60] + 0x80000) >> 20 ;  v10 = v9²
+# sub_180010380(dst, src, type_x, type_y, v9, w, h, image):
+#   in-place separable filter on dst (src!=0 ⇒ copy dst→src, filter src);
+#   each pass = dst>>=6 ; F460(kx=type_x) ; F840(ky=type_y) shift 10 ; dst<<=6
+#   type 0 = smooth [c,3.33c,c]  type 1 = deriv [1024,0,-1024]  (taps at ±v9)
+prep1: (buf48, buf28, 0,1)        prep2: (buf48, 0, 1,0)     # build Dx,Dy
+norm1: buf20[*] *= v9 ; buf28[*] *= v9
+plane: (buf20, buf38, 0,1)  → Ixy=Dy(buf20)
+       (buf20, 0,     1,0)  → Ixx=Dx(buf20)        # +0x30 ≡ buf20
+       (buf28, 0,     0,1)  → Iyy=Dy(buf28)        # +0x40 ≡ buf28
+norm2: Ixx[*]*=v10 ; Ixy[*]*=v10 ; Iyy[*]*=v10
+```
+⇒ `Ixx=v9³·DxDx`, `Iyy=v9³·DyDy`, `Ixy=v9³·DyDx` of the Gaussian-pre-smoothed
+tile, each pass deriv on one axis + smooth on the other, per-pass >>6/<<6.
+
+**PORT STATUS (dev/port_gradient.py):** primitives bit-exact; structure
+validated vs the clean `harris_Ixx/Iyy` at **corr 0.9996** (sm=5 Gaussian
+pre-smooth, v9=1 — effective ~7×7, matching the old "7×7 @0.998"). NOT yet
+byte-exact: ref/pred is spatially-varying (median ~591, std ~168), i.e. a
+truncation-pattern divergence (intermediate scaling before a `>>` differs), not
+a missing scalar. NEXT (definitive): add a gdb hook to dump buf20/buf28/buf48
+after each sub_180010380 pass and find the first per-pass divergence.
+
 REMAINING = pure implementation: port the two builders + the separable apply +
 the 3-plane dataflow in `sub_18000CC20`, then validate **bit-exact** against the
 captured `harris_Ixx/Iyy/Ixy/resp` planes (57×57) in `$FRIDA_DUMP_DIR` (already
