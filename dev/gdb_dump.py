@@ -46,6 +46,7 @@ RVA_AAB0 = 0xAAB0     # orchestrator (minutia ctx in RDX)
 RVA_A5B0 = 0xA5B0     # stage 5 — descriptor computation (opt-in)
 RVA_9FD20 = 0x9FD20   # frame-processor vtable dispatcher (resolves *(RCX+104))
 RVA_2240 = 0x2240     # WS-body PACKER (opt-in) — see PackerEntryBP below
+RVA_46E0 = 0x46E0     # per-minutia DESCRIPTOR builder (opt-in) — see DescEntryBP
 
 MASK = (1 << 64) - 1
 
@@ -62,6 +63,19 @@ PACKER_ON = os.environ.get('GDB_DUMP_PACKER') == '1'
 PACKER_MAX = int(os.environ.get('GDB_PACKER_MAX', '12'))
 PACKER_WS = int(os.environ.get('GDB_PACKER_WS', '23056'))    # WS body size
 PACKER_FEAT = int(os.environ.get('GDB_PACKER_FEAT', '32768'))  # v30 (size unknown; best-effort)
+
+# Per-minutia descriptor builder hook is opt-in. sub_1800046E0 fills the
+# 180-byte working record for one minutia from the image patch. Win64 args
+# (5th+ on the stack, read at entry before the callee touches rsp):
+#   sub_1800046E0(out, img=RDX, algo_img=R8, &cur=R9, &v44[rsp+0x28],
+#                 record=v28[rsp+0x30], h[rsp+0x38], w[rsp+0x40], …, work=4004*i, …)
+# We dump the 180-B record BEFORE/AFTER (delta = the computed minutia +
+# descriptor) and the input image. Pair with the packer's section dumps to
+# map record -> ~47-byte section slot. Fires once per minutia per frame.
+DESC_ON = os.environ.get('GDB_DUMP_DESC') == '1'
+DESC_MAX = int(os.environ.get('GDB_DESC_MAX', '40'))
+DESC_REC = 180                                                # the 180-byte working record
+DESC_IMG = int(os.environ.get('GDB_DESC_IMG', '16384'))      # input image (best-effort)
 
 # Stage-5 hook is opt-in (it fires ~9 tiles × N frames). Enable with:
 #   GDB_DUMP_STAGE5=1   and optionally  GDB_STAGE5_MAX=<n>  GDB_STAGE5_BUF=<bytes>
@@ -263,6 +277,49 @@ class PackerEntryBP(gdb.Breakpoint):
         return False
 
 
+# ─── Per-minutia descriptor builder (sub_1800046E0) ─────────────────────
+_desc_calls = 0
+
+
+class DescFinishBP(gdb.FinishBreakpoint):
+    def __init__(self, rec, idx):
+        super().__init__(internal=True)
+        self.rec, self.idx = rec, idx
+
+    def stop(self):
+        try:
+            _save('desc_record_after', f'call{self.idx}', _read_safe(self.rec, DESC_REC))
+        except Exception as e:
+            print(f'[!] desc finish failed: {e}')
+        return False
+
+    def out_of_scope(self):
+        pass
+
+
+class DescEntryBP(gdb.Breakpoint):
+    """sub_1800046E0 entry: a6 (the 180-B minutia record) is at [rsp+0x30];
+    the input image ptr is RDX. Dump record before/after (delta = computed
+    descriptor) + the image per call."""
+    def stop(self):
+        global _desc_calls
+        if _desc_calls >= DESC_MAX:
+            return False
+        try:
+            rsp = _reg('rsp')
+            rec = _u64(rsp + 0x30)     # a6 = v28, the 180-byte working record
+            img = _reg('rdx')          # a2 = image data ptr
+            i = _desc_calls
+            print(f'[*] desc #{i}: record=0x{rec:x} img=0x{img:x}')
+            _save('desc_record_before', f'call{i}', _read_safe(rec, DESC_REC))
+            _save('desc_image', f'call{i}', _read_safe(img, DESC_IMG))
+            DescFinishBP(rec, i)
+            _desc_calls += 1
+        except Exception as e:
+            print(f'[!] desc entry failed: {e}')
+        return False
+
+
 class VtableResolveBP(gdb.Breakpoint):
     """One-shot: at sub_18009FD20 entry, resolve the indirect frame-processor
     target at *(RCX+104) and print its address + RVA. That target (a runtime
@@ -309,6 +366,10 @@ def main():
         PackerEntryBP('*' + hex(base + RVA_2240))
         print(f'[*] WS-body packer hook ON (max {PACKER_MAX} calls, '
               f'ws={PACKER_WS}B feat<={PACKER_FEAT}B)')
+    if DESC_ON:
+        DescEntryBP('*' + hex(base + RVA_46E0))
+        print(f'[*] descriptor-builder hook ON (max {DESC_MAX} calls, '
+              f'rec={DESC_REC}B img<={DESC_IMG}B)')
     print(f'[*] breakpoints armed. dumps -> {OUTDIR}/')
     print('[*] run a full enrollment now, then Ctrl-C + detach.')
     gdb.execute('continue')

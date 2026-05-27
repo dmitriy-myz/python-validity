@@ -332,7 +332,87 @@ each call, so the delta = the descriptor bytes produced for a known slot
 range. That yields (minutia → descriptor) pairs directly, bypassing both
 the accumulator and the template bit-layout problem.
 
-## WS body feature encoding (black-box findings)
+## WS body layout (DECODED — live packer hook + codec RE)
+
+**This supersedes the black-box "bit-packed stream" model below.** The WS
+body is a **TLV (tag-length-value) container**, not a bit-packed stream.
+Decoded by (a) reverse-engineering the host-side packer chain in the DLL
+and (b) hooking the packer live via `dev/gdb_dump.py GDB_DUMP_PACKER=1`
+and diffing the WS body before/after every frame.
+
+### Host-side pipeline (see `dev/DLL-RE.md` for the function map)
+
+The per-frame processor `sub_1800D89C0` (reached via the object's `+104`
+function-pointer slot, dispatched by `sub_18009FD20`) does, per frame:
+
+```
+sub_180001A50(algo, &features, image, w, h, dpi=363, …)   IMAGE → features
+  └─ sub_180004C10 → sub_18000AAB0   (Harris / NMS / BRIEF orchestrator)
+sub_180002240(algo, ws_body, &stats, features, w, h)       features → WS TLV ★
+  ├─ sub_180001FE0   builds 180-byte working records (45 dwords each);
+  │     stats fields at record +0 (quality), +6/+10 (u16), +136 (coverage)
+  │  └─ sub_180008F10   descriptor-write engine (writes section payload)
+  ├─ sub_180003320   the enrollment ACCUMULATOR (persistent record stream;
+  │     answers the old "accumulator between orchestrator and serializer")
+  └─ sub_18005xx → sub_180006A80/B80/890   TLV codec (below)
+```
+
+Working dims: a `144×144` input is resampled to `round(8·144/10)=116×116`
+(not 112); DPI is forced to **363**; bad-frame counter caps at **6**.
+
+### TLV codec
+
+`sub_180006A80` writes one record: header dword `tag | (len<<16)`
+(u16 tag, u16 len, len rounded up to a multiple of 4), then memcpy of
+`len` payload bytes (`sub_1800031E0`). `sub_180006890` is the keyed slot
+manager — it finds/inserts by tag and shifts bytes (`sub_180006970`) to
+grow a slot, so the container is keyed, not a flat append array. Thin
+field wrappers: `sub_180005B70(v)` → `{tag=3, len=4, value=v}`;
+`sub_1800056C0(buf,v)` → `{tag=v+3, payload=buf}`.
+
+### Byte layout (validated against a live 8-frame enrollment)
+
+```
+WS body (23056 B = TLV1 payload at envelope offset 12):
+  [0..4)    00 00 00 00              leading zeros (the K-derivation prefix)
+  [4..8)    u32 total_size           running; final 23036
+  [8..16)   06 02 05 00 02 00 08 01  fixed config block (constant across captures)
+  [16..24)  accepted-frame id list   reverse order (e.g. 04 03 02 01 …)
+  [24..44)  per-section count table   u32×N — minutiae per section, e.g. 89,91,97,92,96
+  [44..~64) geometry/stats            7800 (0x1e78), 676 (0x2a4), signed deltas, 9279
+  [~64.. ]  N sections, one per ACCEPTED frame, ~4540 B each:
+              [u32 ordinal][u32 flags][TLV tag=5,len=4536][payload]
+              payload: leading zeros, 0xfa(250) marker, dense descriptor bytes
+  [23036..23056)  20-byte trailer (… 9a a2 a2 a3 a7 bf d2 d8 d9 da e0 00 00 00 01 00 04 00 …)
+```
+
+Empirical confirmation from the live capture (`/media/sf_vbox-rw/finger/
+frida_dumps/packer_*`): the buffer persists across frames (append-only);
+each ACCEPTED frame grows `size@+4` by exactly **4540** (4868→9408→13956
+→18496→23036); REJECTED frames (quality gate `stats[7]=1`) add only 8
+bytes (bump size + a reject counter + small marker). The per-section
+count table `[89,91,97,92,96]` *is* the old "(87,95,96,94)=372" anchors.
+
+### What this resolves and what remains
+
+- **Resolved:** the WS container format, section framing, the count
+  table, the accumulator, the working-record size (180 B), and why no
+  coordinate appeared at a fixed stride (fields are tagged + the section
+  payload is descriptor-dominated, not positional).
+- **Remaining for native enrollment:** the *intra-section payload* —
+  i.e. what `sub_180008F10` writes into each tag-5 section from the
+  180-byte working records / features. This is still the descriptor
+  algorithm. Next: decompile `sub_180008F10` and `sub_180006890`, and/or
+  hook `sub_180008F10` (input = 180-B records, output = section payload)
+  the same way we hooked the packer.
+
+## WS body feature encoding (black-box findings — SUPERSEDED, kept for history)
+
+> Superseded by "WS body layout (DECODED)" above. The conclusions here
+> ("bit-packed, not TLV, 36-byte period") were wrong: they were a
+> misreading of TLV-framed sections whose *payloads* are high-entropy
+> descriptors. Retained because the entropy/correlation measurements
+> themselves are still valid observations.
 
 Everything recoverable from the output alone has been extracted. Summary
 of what the feature sections (the high-entropy data between the section

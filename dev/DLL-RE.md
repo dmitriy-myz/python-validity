@@ -106,7 +106,8 @@ Python port it lives in `validitysensor/moh_extract.py`.
 |-----------------|-------------------------------------------------------|--------|
 | `sub_180001A50` | `CEohMohEIV` feature-extract coordinator              | body decompiled |
 | `sub_180004C10` | 250-slot context init + 9-tuple param block setup     | body decompiled |
-| `sub_1800D89C0` | Session-buffer setup. Writes `0x4C4F4356` ("VCOL") magic at offset 0, version 8 at offset 4. Session header is 152 bytes; minutia table starts at session+152. | body decompiled |
+| `sub_1800D89C0` | **THE per-frame processor** (reached via object `+104` fn-ptr slot, dispatched by `sub_18009FD20`). Runs feature-extract + WS-pack per frame; its first-frame branch is the session-buffer setup that writes `0x4C4F4356` ("VCOL") + version 8 + 152-byte header, body at session+152. Bad-frame cap 6; DPI forced 363; `144×144` input → `116×116` working. | DECODED |
+| `sub_18009FD20` | Validation + dispatcher to the `+104` slot: `arg0->fnptr[0x68](arg0, …)`. The `+96/104/112/120` slots form a fn-ptr interface table (`sub_1800D8980/D89C0/D9790/DA060`). | DECODED |
 | `sub_18001D130` | Provides `(this+24) == 101` to dispatch into MoH path  | body decompiled |
 | `sub_18001E750` | Enrollment update wrapper. Calls feature-extract per frame; tracks "bad frame" counter (cap = 6). | body decompiled |
 | `sub_18001F070` | Per-frame entry from the WUDF enrollment update FSM   | body decompiled |
@@ -217,6 +218,24 @@ not plain SHA-256 of WS. `sub_1800E0A60` is the orchestrator;
 to compute K, then T1, then the final TID. Full recipe and reference
 implementation: `dev/MOH.md` "TID derivation" and
 `validitysensor/moh_extract.compute_tid()`.
+
+### WS-body packer chain (DECODED — the descriptor serialization path)
+
+The WS body is a **TLV container**, written per-frame by this chain.
+Full byte layout + live validation in `dev/MOH.md` "WS body layout".
+
+| VA              | Role                                                  | Status |
+|-----------------|-------------------------------------------------------|--------|
+| `sub_180001A50` | Feature extraction: image → feature buffer. Calls `sub_180004C10` → orchestrator `sub_18000AAB0`. | body decompiled |
+| `sub_180002240` | **WS-body packer.** `(algo, ws, &stats, features, w, h)`. Builds a stream cursor over `ws`, runs `sub_180001FE0`, appends one ~4540-B section per accepted frame via the `sub_18005xx`/codec writers. | DECODED |
+| `sub_180001FE0` | Builds **180-byte working records** (45 dwords); record fields +0 (quality, `3000−1200·q/1024`), +6/+10 (u16 → stats), +136 (coverage). Calls `sub_180008F10` to write the section payload. | body decompiled |
+| `sub_180008F10` | **Descriptor-write engine** (435 insn) — writes the section payload from the 180-B records / features. *The remaining unknown for native enrollment.* | not decompiled |
+| `sub_180003320` | **Enrollment accumulator** — returns the persistent 180-B record stream; new region zeroed via `(*(algo+9))()`. (Resolves the old "accumulator between orchestrator and serializer".) | DECODED |
+| `sub_180006A80` | TLV record writer: header dword `tag\|(len<<16)` (len → mult of 4), then memcpy `len` payload bytes (`sub_1800031E0`). | DECODED |
+| `sub_180006890` | Keyed slot manager: find/insert by tag, grow via `sub_180006970` (byte shift). Makes the container keyed, not flat-append. | not decompiled |
+| `sub_180006B80` | Thin field writer → `sub_180006A80` with `{tag, len=4, value}`. | DECODED |
+| `sub_1800056C0` | Field writer → TLV `{tag = v+3, payload = buf}`. | DECODED |
+| `sub_180005B70` | Field writer → TLV `{tag=3, len=4, value}`. | DECODED |
 
 ### Envelope serialization (the final write step)
 
