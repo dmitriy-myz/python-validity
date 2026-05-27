@@ -152,6 +152,28 @@ Hooking `sub_18000CE80` and diffing its dumps against `moh_opencv`:
   @5px (ridge structure survives enhancement) but the exact response is
   decorrelated → that is the @2px / bit-exact wall.
 
+**Front-end call tree (located, next-session target).** The detector +
+enhancement live inside the orchestrator `sub_18000AAB0`'s stage tree:
+
+```
+sub_18000A1B0 (stage-4 glue)
+  ├─ sub_180009F50   image pad (mid-gray border) — DECODED
+  └─ sub_18000F250   DETECTOR (called from 0x18000a482)
+       ├─ sub_18000D340   112 ln, 0 mul-ops  — downsample / buffer setup
+       ├─ sub_18000D920   410 ln, 12 mul-ops — ENHANCEMENT filter (candidate)
+       ├─ sub_18000E090   437 ln, 17 mul-ops — ENHANCEMENT filter (strongest)
+       ├─ sub_1800101C0    67 ln  — gradient/structure-tensor dispatcher
+       │     └─ sub_18000FDF0 / sub_180010050 (I_x / I_y gradients)
+       └─ sub_18000CE80   Harris/DoH response — DECODED
+```
+
+The enhancement (raw→enhanced 57² image, the wall) is the multiply-heavy
+`sub_18000D920`/`sub_18000E090`. Empirically, standard ridge enhancement
+(orientation field + oriented Gabor + downsample) does NOT reproduce the
+captured enhanced image (corr ~0), so the filter must be read from these
+functions. Next: decompile `sub_18000F250` (the order + which callee emits
+the enhanced image) and `sub_18000D920`/`sub_18000E090` (the filter kernels).
+
 **Operator confirmed = Determinant of Hessian** (GDB_DUMP_GRADIN capture of
 the enhanced image, `sub_18000FDF0`'s RCX input, 57×57 int32 Q10 in
 `[0,255·1024]`). Running our **2nd-derivative** `Lxx` (Sobel-5) on that

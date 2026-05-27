@@ -52,11 +52,16 @@ descriptor. Intermediate gate: `dev/diff_v30.py compare_gradin` corr → ~1.0.
 
 ## Attack plan (ordered)
 
-1. **Map the chain inside `sub_180001A50`** from input image to the gradient
-   call `sub_18000FDF0`. Decompile `sub_180001A50`, `sub_180004C10`,
-   `sub_18000AAB0` (orchestrator), the padding `sub_180009F50`, and whatever
-   sits between them and the gradient. Identify each stage: pad → downsample
-   (112→57) → enhancement passes.
+1. **DONE (chain located).** The detector + enhancement are inside the
+   orchestrator `sub_18000AAB0` stage tree:
+   `sub_18000A1B0` → pad `sub_180009F50` → detector `sub_18000F250`, and
+   `sub_18000F250` calls `sub_18000D340` (downsample/setup, 0 mul-ops),
+   `sub_18000D920` (410 ln, 12 mul) + `sub_18000E090` (437 ln, 17 mul) = the
+   **ENHANCEMENT filters**, then `sub_1800101C0` (gradients) → `sub_18000CE80`
+   (DoH). So decompile `sub_18000F250` (stage order + which callee emits the
+   enhanced image) and `sub_18000D920`/`sub_18000E090` (the filter kernels).
+   Standard orientation+Gabor does NOT reproduce the enhanced image — read it
+   from these functions.
 
 2. **Bisect the transform with intermediate hooks.** We already capture the
    final enhanced image (`GDB_DUMP_GRADIN`, `sub_18000FDF0`'s RCX). Add hooks
