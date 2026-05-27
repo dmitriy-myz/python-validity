@@ -70,8 +70,9 @@ record.
        sub_18000AAB0 ─ 9-stage orchestrator (reshape, qsort, dedup)
                                  │
                                  ▼
-       sub_1800E0A60 ─ TID = HMAC²-SHA256(K=SHA256(WS), "Template ID")
-                       (calls sub_18004B710 multiple times)
+       [TID] ─ TID = HMAC²-SHA256(K=SHA256(WS), "Template ID")
+               (recipe verified in moh_extract.compute_tid; the exact DLL
+                function is unconfirmed — NOT sub_1800E0A60, which is memset)
                                  │
                                  ▼
        sub_180036840 ─ serialize envelope: 8-byte outer hdr + 4-byte TLV1 hdr
@@ -112,7 +113,7 @@ Python port it lives in `validitysensor/moh_extract.py`.
 | `sub_18001E750` | Enrollment update wrapper. Calls feature-extract per frame; tracks "bad frame" counter (cap = 6). | body decompiled |
 | `sub_18001F070` | Per-frame entry from the WUDF enrollment update FSM   | body decompiled |
 | `sub_180031470` | Frame counter / "progress %" accessor                 | body decompiled |
-| `sub_1800E0A60` | TID format selector wrapper (calls `sub_18004B710` then `sub_18004E640`) | body decompiled |
+| `sub_1800E0A60` | **`memset`** (broadcast byte ×8, switch for n<16, SIMD fill; 123 call sites). NOT the TID function — earlier label was wrong. `sub_1800031C0(p,v,n)` is the guarded wrapper `if(n>0) memset(p,v,n)`. | DECODED |
 | `sub_180001010` | Algorithm-ready gate. Returns HRESULT 0x80000030/0x80000032/0x80000002 if not ready, else 1. Replicated in `moh_extract.py`. | DECODED |
 
 ### Image preprocessing (stage 0)
@@ -281,10 +282,11 @@ The 250-slot minutia table is at session+152 in the session buffer
 
 The 32-byte TID at template offset 23072 is a **two-iteration
 HMAC-SHA256 chain** with a key derived from the WS body itself,
-not plain SHA-256 of WS. `sub_1800E0A60` is the orchestrator;
-`sub_18004B710` (the CryptHashData wrapper) is invoked multiple times
-to compute K, then T1, then the final TID. Full recipe and reference
-implementation: `dev/MOH.md` "TID derivation" and
+not plain SHA-256 of WS. (The exact DLL function is unconfirmed — the
+earlier "sub_1800E0A60 orchestrator" attribution was wrong; that's memset.
+`sub_18004B710` = a CryptHashData/SHA-256 wrapper is plausibly involved, but
+unverified.) The recipe itself is empirically verified end-to-end; full
+reference implementation: `dev/MOH.md` "TID derivation" and
 `validitysensor/moh_extract.compute_tid()`.
 
 ### WS-body packer chain (DECODED — the descriptor serialization path)
