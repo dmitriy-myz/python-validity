@@ -47,6 +47,7 @@ RVA_A5B0 = 0xA5B0     # stage 5 — descriptor computation (opt-in)
 RVA_9FD20 = 0x9FD20   # frame-processor vtable dispatcher (resolves *(RCX+104))
 RVA_2240 = 0x2240     # WS-body PACKER (opt-in) — see PackerEntryBP below
 RVA_46E0 = 0x46E0     # per-minutia DESCRIPTOR builder (opt-in) — see DescEntryBP
+RVA_43D0 = 0x43D0     # descriptor-BLOB filler (opt-in) — see BlobEntryBP
 
 MASK = (1 << 64) - 1
 
@@ -76,6 +77,21 @@ DESC_ON = os.environ.get('GDB_DUMP_DESC') == '1'
 DESC_MAX = int(os.environ.get('GDB_DESC_MAX', '40'))
 DESC_REC = 180                                                # the 180-byte working record
 DESC_IMG = int(os.environ.get('GDB_DESC_IMG', '16384'))      # input image (best-effort)
+
+# Descriptor-blob filler hook is opt-in. sub_1800043D0 fills record[26..]
+# and (we believe) the per-keypoint work area that becomes the section's
+# high-entropy descriptor blob. Call from sub_1800046E0:
+#   sub_1800043D0(record+104, image, image2, pose, accumulator, h, w, work, a13)
+# Win64: RCX=record+104  RDX=image  R8=image2  R9=pose
+#        [RSP+0x28]=accumulator  [RSP+0x30]=h  [RSP+0x38]=w  [RSP+0x40]=work
+# We dump record[26..] (RCX) + the work area before/after (deltas = what it
+# computed) + the pose (R9) + the image once. Pair the work-area delta with
+# the section descriptor blob to crack the per-keypoint feature encoding.
+BLOB_ON = os.environ.get('GDB_DUMP_BLOB') == '1'
+BLOB_MAX = int(os.environ.get('GDB_BLOB_MAX', '40'))
+BLOB_REC = 76                                                 # record[26..44] (RCX = record+104)
+BLOB_WORK = int(os.environ.get('GDB_BLOB_WORK', '4096'))     # the 4004-byte work area
+BLOB_IMG = int(os.environ.get('GDB_BLOB_IMG', '16384'))      # input image (best-effort)
 
 # Stage-5 hook is opt-in (it fires ~9 tiles × N frames). Enable with:
 #   GDB_DUMP_STAGE5=1   and optionally  GDB_STAGE5_MAX=<n>  GDB_STAGE5_BUF=<bytes>
@@ -320,6 +336,54 @@ class DescEntryBP(gdb.Breakpoint):
         return False
 
 
+# ─── Descriptor-blob filler (sub_1800043D0) ─────────────────────────────
+_blob_calls = 0
+
+
+class BlobFinishBP(gdb.FinishBreakpoint):
+    def __init__(self, rec, work, idx):
+        super().__init__(internal=True)
+        self.rec, self.work, self.idx = rec, work, idx
+
+    def stop(self):
+        try:
+            _save('blob_record_after', f'call{self.idx}', _read_safe(self.rec, BLOB_REC))
+            if self.work:
+                _save('blob_work_after', f'call{self.idx}', _read_safe(self.work, BLOB_WORK))
+        except Exception as e:
+            print(f'[!] blob finish failed: {e}')
+        return False
+
+    def out_of_scope(self):
+        pass
+
+
+class BlobEntryBP(gdb.Breakpoint):
+    """sub_1800043D0 entry: RCX=record+104, RDX=image, R9=pose,
+    work area at [rsp+0x40]. Dump record[26..] + work before/after (deltas =
+    the per-keypoint descriptor) + pose + image."""
+    def stop(self):
+        global _blob_calls
+        if _blob_calls >= BLOB_MAX:
+            return False
+        try:
+            rec = _reg('rcx')          # record+104
+            img = _reg('rdx')          # image data
+            pose = _reg('r9')          # 4-dword pose struct
+            work = _u64(_reg('rsp') + 0x40)   # the 4004-byte work area (best-effort)
+            i = _blob_calls
+            print(f'[*] blob #{i}: rec+104=0x{rec:x} work=0x{work:x} pose=0x{pose:x}')
+            _save('blob_record_before', f'call{i}', _read_safe(rec, BLOB_REC))
+            _save('blob_pose', f'call{i}', _read_safe(pose, 16))
+            _save('blob_work_before', f'call{i}', _read_safe(work, BLOB_WORK))
+            _save('blob_image', f'call{i}', _read_safe(img, BLOB_IMG))
+            BlobFinishBP(rec, work, i)
+            _blob_calls += 1
+        except Exception as e:
+            print(f'[!] blob entry failed: {e}')
+        return False
+
+
 class VtableResolveBP(gdb.Breakpoint):
     """One-shot: at sub_18009FD20 entry, resolve the indirect frame-processor
     target at *(RCX+104) and print its address + RVA. That target (a runtime
@@ -370,6 +434,10 @@ def main():
         DescEntryBP('*' + hex(base + RVA_46E0))
         print(f'[*] descriptor-builder hook ON (max {DESC_MAX} calls, '
               f'rec={DESC_REC}B img<={DESC_IMG}B)')
+    if BLOB_ON:
+        BlobEntryBP('*' + hex(base + RVA_43D0))
+        print(f'[*] descriptor-blob hook ON (max {BLOB_MAX} calls, '
+              f'rec={BLOB_REC}B work<={BLOB_WORK}B img<={BLOB_IMG}B)')
     print(f'[*] breakpoints armed. dumps -> {OUTDIR}/')
     print('[*] run a full enrollment now, then Ctrl-C + detach.')
     gdb.execute('continue')
