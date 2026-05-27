@@ -435,6 +435,37 @@ section bytes:
     scratch buffers; none of that reaches the section. (Earlier drafts
     wrongly credited `sub_1800043D0`/`sub_180008980` with the blob.)
 
+### Isolation experiment — the descriptor is load-bearing (DEFINITIVE)
+
+`dev/splice_experiment.py` built variants from a known-good reference (one
+that matches the live finger), changing one v30 field at a time, each with a
+recomputed TID, then stored + `identify()`:
+
+| variant | v30 records | identify() |
+|---------|-------------|------------|
+| `control`   | reference unchanged              | **MATCH** |
+| `zero_desc` | real coords, descriptors = 0     | fail |
+| `our_desc`  | real coords, our 128-bit descriptor at those coords | fail |
+| `our_both`  | our coords + our descriptors     | fail |
+
+Conclusions (hard, empirical):
+
+- **`control` matches** ⇒ the whole rebuild path is correct — splice,
+  `compute_tid`, `_build_envelope`, storage. A template reassembled from real
+  `v30` records matches, so every decoded structural layer is validated.
+- **`zero_desc` fails** ⇒ coordinates alone are not sufficient; the matcher
+  reads the descriptor bytes.
+- **`our_desc` fails** ⇒ our raw-image BRIEF descriptor, even at the *correct*
+  coordinates, is not close enough. The matcher needs the **specific
+  enhanced-image DoH descriptor**.
+
+So **current knowledge is NOT enough for native enrollment.** The load-bearing
+unknown is the descriptor, whose generation is gated by the ridge-enhancement
+front-end — proven (above) to be a content transform not recoverable from the
+raw frame. Reproducing it bit-exactly is the only path to native enrollment,
+and it is a large, uncertain RE effort. The working answer for real use stays
+**Wine-enroll → replay** (see "Workflow").
+
 ### Implication for native enrollment
 
 The descriptor encoding is no longer an unknown transform: a section is
