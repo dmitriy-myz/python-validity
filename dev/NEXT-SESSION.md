@@ -54,7 +54,33 @@ variant (real coords + OUR descriptor computed via the reproduced pipeline)
 must **match** on `identify()`. That is the definition of done for the
 descriptor. Intermediate gate: `dev/diff_v30.py compare_gradin` corr → ~1.0.
 
-## Attack plan (ordered)
+## STATUS: RE COMPLETE — now an implementation task
+
+Every stage from raw frame → `v30` is decoded as classical CV with known
+tables (see `dev/DLL-RE.md` "Descriptor algorithm — FULLY DECODED"). No
+unknowns remain to reverse; what's left is **porting + bit-exact validation**:
+
+1. **Tiling**: 3×3 grid of 57×57 tiles (step `h/3`=37, overlap 20, mid-gray
+   128 pad). `sub_18000A850` blit + `sub_180009F50` pad (both DECODED).
+2. **DoH per tile** (Q12): `(Ixx>>12)(Iyy>>12) − (Ixy>>12)²` on `tile<<10`,
+   gradients via Sobel-like `sub_18000FDF0`/`180010050` (need exact kernel),
+   NMS → keypoints. Validate vs captured `harris_resp`/`gradin`.
+3. **Orientation** (`sub_18000D920`): radius-6 Gaussian-weighted gradient
+   histogram (42 bins, table `dword_180120C00` dumped) → orientation+quality.
+4. **Oriented BRIEF** (`sub_18000E090`): rotate by orientation (cos/sin
+   `·65536`), block-aggregate gradients, apply BRIEF pairs (`sub_18000E6B0` /
+   `BRIEF_SEED_TABLE`) → 128-bit descriptor.
+5. **Assemble** `v30` ([x][y][16B desc] ×250), splice via the existing
+   `moh_opencv` path, recompute TID. **Validate**: `dev/splice_experiment.py`
+   `our_desc` variant must match on `identify()`.
+
+Validate each stage against the captured dumps (`compare_harris`,
+`compare_gradin`, `decode_records`) before chaining. Tables to pull from the
+DLL: `dword_180120C00` (file 0x11f800); cos/sin are `round(cos/sin(deg)·65536)`;
+BRIEF pairs from `sub_18000E6B0`. Exact Sobel kernel: decompile
+`sub_18000FDF0`/`sub_180010050` if step-2 byte-match falls short.
+
+## (historical) Attack plan — superseded by the status above
 
 1. **DONE — there is no enhancement; the input is a tile.** `sub_18000AAB0`
    (decompiled) tiles the working image 3×3 and runs the DoH detector

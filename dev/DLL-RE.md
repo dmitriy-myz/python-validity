@@ -211,6 +211,47 @@ proprietary fingerprint front-end, upstream of the now-decoded detector.
 Going further would require RE'ing that filter bank + orientation estimation
 (`sub_180001A50`'s internals before the gradient stage), a large effort.
 
+### Descriptor algorithm — FULLY DECODED (oriented BRIEF on gradients)
+
+Per minutia, `sub_18000F350` calls two passes (`a2+80` holds the tile's
+gradient buffers: `+32`=Ix, `+40`=Iy, Q-scaled; `a2+52`=patch radius):
+
+**1. Orientation — `sub_18000D920`** → writes `record[+12]` (orientation) and
+`record[+10]` (quality byte):
+- Sample Gaussian-weighted gradients over a **radius-6 circular patch**
+  (mask `dx²+dy²<36`). Weight = `dword_180120C00[|dy|][|dx|]` (7×7 quarter
+  of a 13×13 window; center 1669 → edge 0). Values dumped:
+  `[[1669,1541,1212,812,464,226,94],[1541,1422,1119,750,428,208,86],
+    [1212,1119,880,590,337,164,68],[812,750,590,395,226,110,46],
+    [464,428,337,226,129,63,26],[226,208,164,110,63,31,13],
+    [94,86,68,46,26,13,0]]`.
+- Per sample: angle = `sub_1800030A0(gy,gx)` (atan2). Build a **42-bin
+  orientation histogram** weighted by gradient, smeared over 7 adjacent bins
+  (mod 42). Dominant bin via `sub_18000D850` → orientation
+  `record[+12] = sub_180003150(Σgy, Σgx)` (atan2, Q16 radians, full-scale
+  `π·65536 = 205887.4`). Quality `record[+10]` from the peak energy.
+
+**2. Descriptor — `sub_18000E090`** → packs bits into `*a1` (the descriptor):
+- Read orientation; `idx = (record[+12]/205887.4)·180` → `cos = dword_180131050[idx]`,
+  `sin = dword_1801315F0[idx]` (both `·65536`, idx 0..180, ridge orient mod 180).
+- **Rotate** the sampling grid by (cos,sin), sample the Ix/Iy gradients at the
+  rotated positions (OOB → `0x800000`), project onto the rotated frame
+  (`gx·cos+gy·sin`, `gy·cos−gx·sin`), aggregate into blocks (`a2+52` patch,
+  `a2+96`/`a2+104` block table).
+- Apply **binary test pairs** `a2+112` (count `a2+44`; built by
+  `sub_18000E6B0` from `BRIEF_SEED_TABLE`): bit set if
+  `block[pair[0]] > block[pair[1]]`. Pack bits LSB-first into `*a1` →
+  the 128-bit descriptor.
+
+Tables (file offsets, `.rdata` VMA 0x18010a000 → file 0x108c00):
+`dword_180120C00` @ file 0x11f800 (49 i32); `dword_180131050` (cos·65536) and
+`dword_1801315F0` (sin·65536) are just `round(cos/sin(deg)·65536)`, 181 i32.
+The BRIEF pairs come from `sub_18000E6B0` (`moh_extract.BRIEF_SEED_TABLE`).
+
+**This completes the pipeline RE.** Everything from raw frame to `v30` is now
+classical CV with known tables — see `dev/NEXT-SESSION.md` for the
+implementation plan (port + validate against captured `v30`).
+
 ### BRIEF descriptor selection
 
 | VA              | Role                                                  | Status |
