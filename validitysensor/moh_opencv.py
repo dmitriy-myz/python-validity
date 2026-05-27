@@ -360,11 +360,67 @@ def build_working_state(records: List[bytes],
     return bytes(buf)
 
 
+# ─── DECODED v30 record format (dev/MOH.md "v30 record layout") ─────────
+# v30 stores 250 minutiae as 18-byte records: [x:u8][y:u8][128-bit
+# descriptor:16B]. Sections hold v30 verbatim; the WS body is a TLV
+# container. We can't yet *compute* the DLL's enhanced-image DoH descriptor,
+# but we can write our minutiae into the correct record slots of a captured
+# reference WS body (exact framing) and recompute the TID — a structurally
+# valid template the chip will store. Matching needs the real descriptor.
+V30_RECORD_LEN = 18
+V30_RECORDS_PER_SECTION = 250
+
+
+def build_v30_record(x: int, y: int, descriptor_128: int) -> bytes:
+    """One 18-byte v30 minutia record: [x][y][16-byte little-endian desc]."""
+    return bytes((x & 0xff, y & 0xff)) + (descriptor_128 & ((1 << 128) - 1)).to_bytes(16, 'little')
+
+
+def find_v30_regions(ws: bytes, min_run: int = 30) -> List[int]:
+    """Locate each section's v30 record array by detecting long runs of
+    18-byte records whose leading (x,y) bytes are valid 112px coordinates."""
+    regions, p, n = [], 0, len(ws)
+    while p < n - V30_RECORD_LEN * min_run:
+        good, q = 0, p
+        while q + 1 < n and 0 < ws[q] <= 112 and ws[q + 1] <= 112:
+            good += 1
+            q += V30_RECORD_LEN
+        if good >= min_run:
+            regions.append(p)
+            p += V30_RECORDS_PER_SECTION * V30_RECORD_LEN
+        else:
+            p += 1
+    return regions
+
+
+def splice_minutiae(reference_ws: bytes, records: List[bytes]) -> bytes:
+    """Overwrite every detected v30 record region of a reference WS body with
+    our records (truncated/zero-padded to 250 per region). Framing untouched."""
+    ws = bytearray(reference_ws)
+    recs = (records[:V30_RECORDS_PER_SECTION]
+            + [b'\0' * V30_RECORD_LEN] * (V30_RECORDS_PER_SECTION - len(records)))
+    regions = find_v30_regions(reference_ws)
+    for base in regions:
+        for i, r in enumerate(recs):
+            off = base + i * V30_RECORD_LEN
+            ws[off:off + V30_RECORD_LEN] = r
+    log.info("spliced %d minutiae into %d v30 regions at %s",
+             min(len(records), V30_RECORDS_PER_SECTION), len(regions), regions)
+    return bytes(ws)
+
+
 # ─── End-to-end: image → 23 KB envelope ────────────────────────────────
 
 def extract_template(image: np.ndarray,
-                     subtype: int = DEFAULT_SUBTYPE) -> bytes:
-    """Run the full pipeline: 112×112 grayscale image → 23 KB blob.
+                     subtype: int = DEFAULT_SUBTYPE,
+                     reference_template: bytes = None) -> bytes:
+    """Run the pipeline: 112×112 grayscale image → 23 KB blob.
+
+    If `reference_template` (a captured 23136-byte template or its 23056-byte
+    WS body) is given, our minutiae are spliced into its v30 record slots in
+    the decoded [x][y][128-bit descriptor] format and the TID is recomputed —
+    a chip-storable template with our features. Without a reference, falls
+    back to the legacy `build_working_state` scaffold.
 
     Returns bytes suitable for db.new_finger() → 0x47 new_record.
     """
@@ -379,42 +435,38 @@ def extract_template(image: np.ndarray,
         cv2.BORDER_CONSTANT, value=FILL_GRAY,
     )
 
-    # 2-4. Compute Harris response over padded image
+    # 2-5. Harris response → NMS → top-N minutiae
     response = compute_harris_response(padded)
-    log.debug("Harris response range: [%.2f, %.2f]",
-              float(response.min()), float(response.max()))
-
-    # 5. NMS to extract top-N minutiae
     minutiae = extract_minutiae(response, MAX_MINUTIAE,
-                                 border=PATCH_RADIUS,
-                                 min_distance=MIN_DIST_NMS)
+                                 border=PATCH_RADIUS, min_distance=MIN_DIST_NMS)
     log.info("extracted %d minutiae (cap %d)", len(minutiae), MAX_MINUTIAE)
 
-    # 6-7. Compute BRIEF descriptor per minutia and pack into 32-byte records
-    tests = brief_select_tests(scale=PATCH_RADIUS, num_tests=64)
-    records: List[bytes] = []
-    for (py, px, score) in minutiae:
-        descriptor = compute_brief_descriptor(padded, px, py, tests)
-        x = px - PATCH_RADIUS
-        y = py - PATCH_RADIUS
-        score_i = int(min(max(score, -2**31), 2**31 - 1))
-        records.append(pack_minutia(
-            x, y, descriptor,
-            active=1,
-            flag9=tile_index(x, y, SENSOR_W, SENSOR_H),
-            score_c=score_i,
-            score_10=score_i,
-        ))
+    # 6. 128-bit binary descriptor per minutia (v30 uses 128 bits, ~50% set)
+    tests = brief_select_tests(scale=PATCH_RADIUS, num_tests=128)
 
-    # 8. Build working state buffer + derive TID via the DLL's HMAC recipe
-    ws = build_working_state(records, padded)
+    if reference_template is not None:
+        # 7-8. Build 18-byte v30 records and splice into the reference WS body
+        ref = reference_template
+        ws_body = ref[12:12 + WS_SIZE] if len(ref) >= 12 + WS_SIZE else ref
+        assert len(ws_body) == WS_SIZE, f"reference WS must be {WS_SIZE}B, got {len(ws_body)}"
+        records = [build_v30_record(px - PATCH_RADIUS, py - PATCH_RADIUS,
+                                    compute_brief_descriptor(padded, px, py, tests))
+                   for (py, px, _score) in minutiae]
+        ws = splice_minutiae(ws_body, records)
+    else:
+        # legacy scaffold (old 32-byte-record model — kept for compatibility)
+        legacy = [pack_minutia(px - PATCH_RADIUS, py - PATCH_RADIUS,
+                               compute_brief_descriptor(padded, px, py, tests),
+                               flag9=tile_index(px - PATCH_RADIUS, py - PATCH_RADIUS,
+                                                SENSOR_W, SENSOR_H))
+                  for (py, px, _s) in minutiae]
+        ws = build_working_state(legacy, padded)
+
+    # TID via the DLL's HMAC recipe, then the byte-exact TLV envelope
     template_id = compute_tid(ws)
-
-    # 9. TLV envelope (already byte-exact)
     envelope = _build_envelope(subtype, ws, template_id)
     log.info("envelope size: %d bytes (ws=%d, tid=%d)",
              len(envelope), len(ws), len(template_id))
-
     return envelope
 
 
@@ -432,6 +484,10 @@ def main():
                         format='%(levelname)s %(name)s: %(message)s')
 
     path = sys.argv[1]
+    reference = None
+    if len(sys.argv) > 2:           # optional reference template for splicing
+        reference = open(sys.argv[2], 'rb').read()
+        print(f"splicing into reference {sys.argv[2]} ({len(reference)} bytes)")
     image = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if image is None:
         print(f"Could not read {path}", file=sys.stderr); sys.exit(1)
@@ -440,7 +496,7 @@ def main():
                     path, image.shape, SENSOR_H, SENSOR_W)
         image = cv2.resize(image, (SENSOR_W, SENSOR_H))
 
-    envelope = extract_template(image)
+    envelope = extract_template(image, reference_template=reference)
     print(f"\nEnvelope: {len(envelope)} bytes (expected 23136)")
     print(f"  header (first 16):  {envelope[:16].hex()}")
     ws_size = int.from_bytes(envelope[10:12], 'little')
