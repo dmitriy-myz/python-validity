@@ -363,11 +363,17 @@ details that blind reconstruction missed:
    final planes still positively-correlated) but shows up in single-deriv passes.
 3. chaining confirmed from the dumps: `call3_before == call1_after` ⇒ for these
    tiles **v9=1** (norm1/norm2 are identity).
-The Gaussian PRE-SMOOTH (sub_1800101C0, gradin→CC20 input) is the only piece not
-yet byte-checked end-to-end (the g380 run captured CC20's input directly, so the
-gradient is exact regardless); validate it when a run captures both gradin and
-g380. Edge regions of F460/F840 also still TODO for full-tile (not just
-interior) exactness.
+**Gaussian PRE-SMOOTH now BYTE-EXACT too** (combined gradin+g380 run): CC20's
+input = `<<6( Gaussian₅(tile, shift 12) )` — Gaussian size 5, applied to the Q10
+tile directly (NOT >>6 first), shift 12, then <<6. 0 mismatches (border 2) vs
+g380 call1_before. ⇒ **the whole DoH front-end `gradin → Ixx/Iyy/Ixy/resp` is
+byte-exact end-to-end** (dev/port_gradient.py `doh()`; 0 mismatches at border 5).
+This also validates the FF00/FEC0 Gaussian-builder port. The Gaussian size (5
+here) comes from ctx[+0x14] via sub_1800101C0's size calc — parametrize when a
+varying-scale tile appears. REMAINING for full-tile (not interior) exactness:
+the F460/F840 edge-region (L/M/R) logic — my replicate-edge diverges within ~5px
+of the boundary (pre-smooth±2 ⊗ derivatives); the interior is exact and NMS
+excludes borders anyway.
 
 REMAINING = pure implementation: port the two builders + the separable apply +
 the 3-plane dataflow in `sub_18000CC20`, then validate **bit-exact** against the

@@ -90,6 +90,38 @@ def conv_axis(img, kernel, shift, axis):
 def apply_sep(img, kx, ky, shift):
     return conv_axis(conv_axis(img, kx, shift, axis=1), ky, shift, axis=0)
 
+
+# ─── full DoH front-end (byte-exact vs g380/gradin captures) ──────────────
+def presmooth(tile, size=5):
+    """sub_18000F250 → sub_1800101C0: separable Gaussian smooth (shift 12) of
+    the Q10 tile, then <<6.  Byte-exact vs CC20's input (g380 call1_before)."""
+    gk = build_gaussian(size)
+    return (apply_sep(tile.astype(np.int64), gk, gk, 12)) << 6
+
+
+def cc20_planes(smoothed, v9=1):
+    """sub_18000CC20: build Ixx/Iyy/Ixy from the pre-smoothed tile.  Each
+    sub_180010380 pass = (>>6, separable kx·ky shift10, <<6); kernels at ±v9
+    (deriv [1024,0,-1024] / smooth [96,320,96]).  Byte-exact vs g380 planes."""
+    dk = build_3tap(v9, deriv=True); sk = build_3tap(v9, deriv=False)
+    P = lambda img, kx, ky: (apply_sep(img >> 6, kx, ky, 10)) << 6
+    buf20 = smoothed.copy()
+    buf28 = P(buf20, sk, dk)              # prep1 (0,1)  -> Dy
+    buf20 = P(buf20, dk, sk)              # prep2 (1,0)  -> Dx
+    buf20 = buf20 * v9; buf28 = buf28 * v9            # norm1 ·v9
+    ixy = P(buf20, sk, dk)                # plane1 (0,1) Ixy = Dy(Dx)
+    ixx = P(buf20, dk, sk)                # plane2 (1,0) Ixx = Dx(Dx)
+    iyy = P(buf28, sk, dk)                # plane3 (0,1) Iyy = Dy(Dy)
+    v10 = v9 * v9
+    return ixx * v10, iyy * v10, ixy * v10            # norm2 ·v9²
+
+
+def doh(tile, size=5, v9=1):
+    """gradin tile (Q10) → Ixx, Iyy, Ixy, response (Q12 det-of-Hessian)."""
+    ixx, iyy, ixy = cc20_planes(presmooth(tile, size), v9)
+    resp = (ixx >> 12) * (iyy >> 12) - (ixy >> 12) ** 2
+    return ixx, iyy, ixy, resp
+
 # ─── load captures ────────────────────────────────────────────────────────
 def load(name, call='call0'):
     f = sorted(glob.glob(os.path.join(DUMP, '%s_*_%s_*.bin' % (name, call))))[0]
@@ -170,7 +202,7 @@ if __name__ == '__main__':
         f = sorted(glob.glob(os.path.join(DUMP, 'g380_%s_*_call%d_t%s*.bin' % (kind, call, t))))
         if not f:
             return None
-        a = np.fromfile(f[0], dtype=np.int32)
+        a = np.fromfile(f[-1], dtype=np.int32)   # newest run
         sh = (57, 57) if a.size == 3249 else (57, 58)
         return a.reshape(sh)
 
@@ -187,3 +219,26 @@ if __name__ == '__main__':
                   % (nm, bool(mm == 0), mm, pred[I].size))
     else:
         print('\n(no g380_* per-pass captures found — run GDB_DUMP_G380=1)')
+
+    # ── full chain (needs a run with BOTH gradin + g380): tile → doh() ────
+    gt = sorted(glob.glob(os.path.join(DUMP, 'gradin_image_*_call0_*.bin')))
+    g380b = sorted(glob.glob(os.path.join(DUMP, 'g380_before_*_call1_t10*.bin')))
+    if gt and g380b:
+        # match the run whose timestamps interleave (same prefix //100000)
+        ts = lambda f: int(os.path.basename(f).split('_')[2])
+        gts = {ts(f) // 100000 for f in g380b}
+        tilef = [f for f in gt if ts(f) // 100000 in gts]
+        if tilef:
+            tile = np.fromfile(tilef[-1], dtype=np.int32).reshape(57, 57)
+            inp2 = g380('before', 1, '10')   # picks newest = combined run
+            sm = presmooth(tile)
+            print('\nFULL CHAIN (combined gradin+g380 run):')
+            print('  presmooth vs CC20 input (b=2): EXACT=%s'
+                  % bool((sm[2:-2, 2:-2] == inp2[2:-2, 2:-2]).all()))
+            ixx, iyy, ixy, resp = doh(tile)
+            for nm, pred, ref in [('Ixx', ixx, g380('after', 3, '10')),
+                                  ('Iyy', iyy, g380('after', 4, '01')),
+                                  ('Ixy', ixy, g380('after', 2, '01'))]:
+                I = np.s_[5:-5, 5:-5]
+                print('  %s gradin→plane (b=5): EXACT=%s  mism=%d'
+                      % (nm, bool((pred[I] == ref[I]).all()), int((pred[I] != ref[I]).sum())))
