@@ -152,26 +152,32 @@ Hooking `sub_18000CE80` and diffing its dumps against `moh_opencv`:
   @5px (ridge structure survives enhancement) but the exact response is
   decorrelated → that is the @2px / bit-exact wall.
 
-**Front-end call tree (located, next-session target).** The detector +
-enhancement live inside the orchestrator `sub_18000AAB0`'s stage tree:
+**Front-end call tree (located via Hex-Rays — supersedes earlier objdump
+guess that put the enhancement in sub_18000F250; that was a bad disasm
+range).** Decoded from the C of `sub_18000A1B0` and `sub_18000F250`:
 
 ```
-sub_18000A1B0 (stage-4 glue)
-  ├─ sub_180009F50   image pad (mid-gray border) — DECODED
-  └─ sub_18000F250   DETECTOR (called from 0x18000a482)
-       ├─ sub_18000D340   112 ln, 0 mul-ops  — downsample / buffer setup
-       ├─ sub_18000D920   410 ln, 12 mul-ops — ENHANCEMENT filter (candidate)
-       ├─ sub_18000E090   437 ln, 17 mul-ops — ENHANCEMENT filter (strongest)
-       ├─ sub_1800101C0    67 ln  — gradient/structure-tensor dispatcher
-       │     └─ sub_18000FDF0 / sub_180010050 (I_x / I_y gradients)
-       └─ sub_18000CE80   Harris/DoH response — DECODED
+sub_18000A1B0 (orchestrator stage-4 glue) — input a2 = already ~57² image
+  ├─ img_q16[i] = a2[i] << 16                     uint8 -> Q16
+  ├─ sub_180009F50(v41, 0x800000, …, img_q16, …)  PAD ONLY (mid-gray border,
+  │                                               0x800000=128.0 Q16; no filter)
+  ├─ sub_18000A120(a9, …)                         setup
+  ├─ sub_18000C920(…, a9, v41, a1, …) -> a1       builds DoH context (feeds CE80's a5)
+  └─ sub_18000F250(v41, w, h, a9, a1, …)          DETECTOR:
+        ├─ img >>= 6 ; sub_1800101C0(img,…) ; img <<= 6   gradients on v41
+        └─ sub_18000CE80(a9, a1, …)               DoH response — DECODED
 ```
 
-The enhancement (raw→enhanced 57² image, the wall) is the multiply-heavy
-`sub_18000D920`/`sub_18000E090`. Empirically, standard ridge enhancement
-(orientation field + oriented Gabor + downsample) does NOT reproduce the
-captured enhanced image (corr ~0), so the filter must be read from these
-functions. Next: decompile `sub_18000F250` (the order + which callee emits
+So `gradin = v41 >> 6`, and `v41 = pad(a2)` — i.e. `sub_18000F250` only does
+gradients + DoH, and `sub_180009F50` is just a border (our port is correct,
+just incomplete in role). **`a2` (stage-4 input) is already the enhanced,
+downsampled ~57² image** (gradin minus border, pre `>>6`). Therefore the
+enhancement + 112→57 downsample are **upstream, inside the orchestrator
+`sub_18000AAB0` before stage-4** (`sub_18000A1B0` is reached via the stage-4
+dispatcher `sub_18000A4B0`). Standard orientation+Gabor does NOT reproduce
+the enhanced image (corr ~0). **Next: trace `sub_18000AAB0` → its early
+stages to find where raw 112² becomes enhanced ~57², or bracket it with a
+hook on `sub_18000A1B0` input (a2) vs the orchestrator input.** Next: decompile `sub_18000F250` (the order + which callee emits
 the enhanced image) and `sub_18000D920`/`sub_18000E090` (the filter kernels).
 
 **Operator confirmed = Determinant of Hessian** (GDB_DUMP_GRADIN capture of

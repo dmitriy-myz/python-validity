@@ -52,16 +52,22 @@ descriptor. Intermediate gate: `dev/diff_v30.py compare_gradin` corr → ~1.0.
 
 ## Attack plan (ordered)
 
-1. **DONE (chain located).** The detector + enhancement are inside the
-   orchestrator `sub_18000AAB0` stage tree:
-   `sub_18000A1B0` → pad `sub_180009F50` → detector `sub_18000F250`, and
-   `sub_18000F250` calls `sub_18000D340` (downsample/setup, 0 mul-ops),
-   `sub_18000D920` (410 ln, 12 mul) + `sub_18000E090` (437 ln, 17 mul) = the
-   **ENHANCEMENT filters**, then `sub_1800101C0` (gradients) → `sub_18000CE80`
-   (DoH). So decompile `sub_18000F250` (stage order + which callee emits the
-   enhanced image) and `sub_18000D920`/`sub_18000E090` (the filter kernels).
-   Standard orientation+Gabor does NOT reproduce the enhanced image — read it
-   from these functions.
+1. **PARTLY DONE (detector decoded; enhancement still upstream).** From the
+   Hex-Rays of `sub_18000A1B0` + `sub_18000F250`:
+   - `sub_18000F250` = gradients (`sub_1800101C0`) + DoH (`sub_18000CE80`)
+     with a `>>6/<<6` Q-scale wrapper; it does NOT enhance.
+   - `sub_18000A1B0` pads its input (`sub_180009F50`, border only) → `v41`,
+     and `gradin = v41 >> 6`. So **its input `a2` is already the enhanced,
+     downsampled ~57² image.**
+   - ⇒ the enhancement + 112→57 downsample are UPSTREAM in the orchestrator
+     `sub_18000AAB0` (stage-4 `sub_18000A1B0` is reached via dispatcher
+     `sub_18000A4B0`). My earlier "enhancement = sub_18000D920/E090" was a
+     bad-disasm-range artifact — discard it.
+   - NEXT: get the Hex-Rays of `sub_18000AAB0` (or `sub_18000A4B0`) and walk
+     its early stages to find where raw 112² → enhanced ~57². OR bracket
+     empirically: hook `sub_18000A1B0` entry (dump a2) and the orchestrator
+     input, and bisect. (`sub_18000C920` builds the DoH context that feeds
+     `sub_18000CE80`'s a5 — may matter for the response, check it too.)
 
 2. **Bisect the transform with intermediate hooks.** We already capture the
    final enhanced image (`GDB_DUMP_GRADIN`, `sub_18000FDF0`'s RCX). Add hooks
