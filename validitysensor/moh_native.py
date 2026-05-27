@@ -5,7 +5,8 @@ Pipeline (all stages classical CV; no proprietary enhancement):
 
     working image (112²)
       → 3×3 grid of 57×57 tiles (mid-gray pad)          [tile_image]      DONE
-      → per tile: Q12 Determinant-of-Hessian → keypoints [doh_response]   approx (gradient kernel TBD)
+      → per tile: Q12 Determinant-of-Hessian → Ixx/Iyy/Ixy/resp [doh]    BYTE-EXACT (interior)
+      → 8-neighbour NMS → keypoints                      [TODO sub_18000CF90]
       → orientation (Gaussian-weighted grad histogram)   [orientation]    decoded; impl WIP
       → oriented BRIEF descriptor                        [descriptor]     decoded; impl WIP
       → [x][y][128-bit desc] × 250 → v30                 [build_v30]       format known
@@ -98,24 +99,102 @@ EXP_TABLE = np.array([
 ], dtype=np.int64)
 
 
-# ─── DoH detector (Q12) — kernels now DECODED (see module docstring) ─────
-def doh_response(tile_q10, kxx, kyy, kxy):
-    """Determinant-of-Hessian response on a tile (gradin = tile<<10).
-    out = (Ixx>>12)*(Iyy>>12) - (Ixy>>12)**2, int32 (sub_18000CE80).
-
-    NOTE: this is the APPROXIMATE single-linear-kernel version (kxx/kyy
-    recover at corr ~0.95-0.998 by regression; kxy does not). The real DLL
-    forms the planes by composing 3-tap [1,0,-1] / [1,3.33,1] separable
-    passes with per-tap >>10 truncation (the bit-exact path — see the module
-    docstring). Replace this with the decoded port + compare_harris."""
-    import cv2
-    img = (tile_q10.astype(np.int64) >> 6).astype(np.float64)
-    ixx = cv2.filter2D(img, cv2.CV_64F, kxx).astype(np.int64)
-    iyy = cv2.filter2D(img, cv2.CV_64F, kyy).astype(np.int64)
-    ixy = cv2.filter2D(img, cv2.CV_64F, kxy).astype(np.int64)
-    return (ixx >> 12) * (iyy >> 12) - (ixy >> 12) ** 2
+# ─── 32-bit fixed-point helpers (match x86 imul/sar/idiv semantics) ──────
+_M32 = (1 << 32)
+def _s32(x):
+    x &= _M32 - 1
+    return x - _M32 if x & 0x80000000 else x
+def _sar32(x, n):
+    return _s32(_s32(x) >> n)
+def _idiv32(a, b):
+    a, b = _s32(a), _s32(b)
+    q = abs(a) // abs(b)
+    return -q if (a < 0) ^ (b < 0) else q
 
 
-# orientation() and descriptor() are decoded (dev/DLL-RE.md "Descriptor
-# algorithm") and will be filled in once the gradient kernels are exact —
-# they consume the same Ix/Iy buffers the DoH stage produces.
+# ─── kernel builders (byte-exact vs the DLL; see dev/port_gradient.py) ────
+def gauss_tap(coef, x):
+    """sub_18000FEC0: one Gaussian tap = EXP_TABLE[|quantized -coef·x²|]."""
+    t = _sar32(_s32(coef * x), 2)
+    t = _sar32(_s32(t * x), 8)
+    q = (_s32(t) * 0x51eb851f) >> 35
+    if q < 0:
+        q += 1
+    i = -(q >> 13)
+    return int(EXP_TABLE[min(max(i, 0), len(EXP_TABLE) - 1)])
+
+
+def build_gaussian(n):
+    """sub_18000FF00: normalized 1D Gaussian (size n) → [(offset, tap)], Q12."""
+    sigma = _sar32(_s32(0x26600 * n + 0x59acd), 10)
+    coef = _idiv32(0xe0000000, _s32(sigma * sigma))
+    taps, s = [], 0
+    for i in range(n):
+        t = _sar32(gauss_tap(coef, 512 * (2 * i - n + 1)), 4)
+        taps.append(t); s += t
+    norm = _sar32(_idiv32(0x40000000, s), 3)
+    half = n // 2
+    return [(i - half, _sar32(_s32(t * norm), 15)) for i, t in enumerate(taps)]
+
+
+def build_3tap(scale, deriv):
+    """sub_180010280: sparse 3-point kernel at offsets ±scale.
+    deriv → [1024,0,-1024]; smooth → [c, round(c·3.33), c], c=2^20/(scale·0x2aaa).
+    For scale 1: smooth = [96,320,96] (sum 512)."""
+    if deriv:
+        return [(-scale, 1024), (0, 0), (scale, -1024)]
+    c = _idiv32(0x100000, _s32(scale * 0x2aaa))
+    mid = _sar32(_s32(c * 0xd55) + (1 << 9), 10)
+    return [(-scale, c), (0, mid), (scale, c)]
+
+
+# ─── separable apply: per-tap (pixel·tap)>>shift, convolution, replicate ──
+def _conv_axis(img, kernel, shift, axis):
+    n = img.shape[axis]
+    idx = np.arange(n)
+    acc = np.zeros(img.shape, dtype=np.int64)
+    for off, tap in kernel:
+        if tap == 0:
+            continue
+        src = np.clip(idx - off, 0, n - 1)           # convolution (kernel reversed)
+        acc += (np.take(img, src, axis=axis).astype(np.int64) * tap) >> shift
+    return acc
+
+
+def apply_sep(img, kx, ky, shift):
+    return _conv_axis(_conv_axis(img, kx, shift, 1), ky, shift, 0)
+
+
+# ─── DoH front-end — BYTE-EXACT vs gradin/g380 captures (interior) ────────
+def presmooth(tile, size=5):
+    """sub_18000F250 → sub_1800101C0: separable Gaussian (shift 12) of the Q10
+    tile, then <<6.  == CC20 input (g380 call1_before), 0 mismatch border 2."""
+    gk = build_gaussian(size)
+    return (apply_sep(tile.astype(np.int64), gk, gk, 12)) << 6
+
+
+def cc20_planes(smoothed, v9=1):
+    """sub_18000CC20: Ixx/Iyy/Ixy from the pre-smoothed tile.  Each
+    sub_180010380 pass = (>>6, separable kx·ky shift10, <<6)."""
+    dk = build_3tap(v9, True); sk = build_3tap(v9, False)
+    P = lambda im, kx, ky: (apply_sep(im >> 6, kx, ky, 10)) << 6
+    buf20 = smoothed.copy()
+    buf28 = P(buf20, sk, dk)                          # prep1 → Dy
+    buf20 = P(buf20, dk, sk)                          # prep2 → Dx
+    buf20 = buf20 * v9; buf28 = buf28 * v9            # norm1 ·v9
+    ixy = P(buf20, sk, dk); ixx = P(buf20, dk, sk); iyy = P(buf28, sk, dk)
+    v10 = v9 * v9
+    return ixx * v10, iyy * v10, ixy * v10            # norm2 ·v9²
+
+
+def doh(tile, size=5, v9=1):
+    """gradin tile (Q10) → (Ixx, Iyy, Ixy, response).  Byte-exact (interior).
+    response = (Ixx>>12)·(Iyy>>12) − (Ixy>>12)² (sub_18000CE80)."""
+    ixx, iyy, ixy = cc20_planes(presmooth(tile, size), v9)
+    resp = (ixx >> 12) * (iyy >> 12) - (ixy >> 12) ** 2
+    return ixx, iyy, ixy, resp
+
+
+# NEXT: keypoints — sub_18000CF90 (8-neighbour NMS on `resp` + threshold
+# ctx[+0x20]/[+0x24] + distance-dedup), then orientation (sub_18000D920) and
+# oriented BRIEF (sub_18000E090). See dev/DLL-RE.md.
