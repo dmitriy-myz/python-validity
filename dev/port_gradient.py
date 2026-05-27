@@ -63,14 +63,15 @@ def build_gaussian(n, sigma=0):
     return [(i - half, sar32(s32(t * norm), 15)) for i, t in enumerate(taps)]
 
 # ─── sub_180010280: sparse 3-point kernel (smoothing / derivative) ────────
-# size n = 2*scale+1; taps live at offsets -scale, 0, +scale.
+# taps live at offsets -scale, 0, +scale.  c = 2^20/(scale·0x2aaa) (NOT n·…),
+# so scale=1 → c=96, mid=320, smoothing = [96,320,96] (sum 512, gain 0.5).
+# Verified byte-exact against g380_* per-pass captures.
 def build_3tap(scale, deriv):
-    n = 2 * scale + 1
     if deriv:
         return [(-scale, 1024), (0, 0), (scale, -1024)]
-    c = idiv32(0x100000, s32(n * 0x2aaa))                # 2^20/(n·10922)
-    mid = sar32(s32(c * 0xd55), 10)                      # c·3413>>10 ≈ 3.33c
-    return [(-scale, c), (0, mid), (scale, c)]
+    c = idiv32(0x100000, s32(scale * 0x2aaa))            # 2^20/(scale·10922)
+    mid = sar32(s32(c * 0xd55) + (1 << 9), 10)           # round(c·3413/1024) ≈ 3.33c
+    return [(-scale, c), (0, mid), (scale, c)]            # scale=1 → [96,320,96] sum 512
 
 # ─── separable apply: per-tap (pixel·tap)>>shift, replicate edges ─────────
 def conv_axis(img, kernel, shift, axis):
@@ -81,7 +82,7 @@ def conv_axis(img, kernel, shift, axis):
     for off, tap in kernel:
         if tap == 0:
             continue
-        src = np.clip(idx + off, 0, n - 1)               # replicate (clamp)
+        src = np.clip(idx - off, 0, n - 1)               # convolution (kernel reversed); replicate edge
         shifted = np.take(img, src, axis=axis)
         acc += (shifted.astype(np.int64) * tap) >> shift  # arithmetic, per-tap
     return acc
@@ -160,11 +161,29 @@ if __name__ == '__main__':
         v10 = v9 * v9
         return ixx * v10, iyy * v10, ixy * v10
 
-    print('\nExact CC20 flow — sweep presmooth size sm, scale v9:\n')
-    for sm in (0, 3, 5, 7):
-        gk = build_gaussian(sm) if sm else None
-        smi = (apply_sep(base, gk, gk, 12) << 6) if sm else (base << 6)
-        for v9 in (1, 2, 3):
-            ixx, iyy, ixy = cc20(smi, v9)
-            print('  sm=%d v9=%d:' % (sm, v9))
-            score(ixx, Ixx, tag='    Ixx'); score(iyy, Iyy, tag='    Iyy')
+    # ── BYTE-EXACT validation against the per-pass g380 captures ─────────
+    # The g380 run dumped the real CC20 input (call1 'before' = buf20) and the
+    # plane outputs (block0: call2=Ixy, call3=Ixx, call4=Iyy), so we validate
+    # cc20() directly — independent of the Gaussian pre-smooth and of the
+    # (different-run) harris_* captures.
+    def g380(kind, call, t):
+        f = sorted(glob.glob(os.path.join(DUMP, 'g380_%s_*_call%d_t%s*.bin' % (kind, call, t))))
+        if not f:
+            return None
+        a = np.fromfile(f[0], dtype=np.int32)
+        sh = (57, 57) if a.size == 3249 else (57, 58)
+        return a.reshape(sh)
+
+    inp = g380('before', 1, '10')
+    if inp is not None:
+        ixx, iyy, ixy = cc20(inp.astype(np.int64), 1)
+        print('\nBYTE-EXACT check vs same-run g380 plane captures (interior):')
+        for nm, pred, ref in [('Ixx', ixx, g380('after', 3, '10')),
+                              ('Iyy', iyy, g380('after', 4, '01')),
+                              ('Ixy', ixy, g380('after', 2, '01'))]:
+            I = np.s_[3:-3, 3:-3]
+            mm = int((pred[I] != ref[I]).sum())
+            print('  %s interior(b=3): EXACT=%s  mism=%d/%d'
+                  % (nm, bool(mm == 0), mm, pred[I].size))
+    else:
+        print('\n(no g380_* per-pass captures found — run GDB_DUMP_G380=1)')

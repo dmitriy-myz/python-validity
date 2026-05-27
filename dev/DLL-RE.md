@@ -349,13 +349,25 @@ norm2: Ixx[*]*=v10 ; Ixy[*]*=v10 ; Iyy[*]*=v10
 ⇒ `Ixx=v9³·DxDx`, `Iyy=v9³·DyDy`, `Ixy=v9³·DyDx` of the Gaussian-pre-smoothed
 tile, each pass deriv on one axis + smooth on the other, per-pass >>6/<<6.
 
-**PORT STATUS (dev/port_gradient.py):** primitives bit-exact; structure
-validated vs the clean `harris_Ixx/Iyy` at **corr 0.9996** (sm=5 Gaussian
-pre-smooth, v9=1 — effective ~7×7, matching the old "7×7 @0.998"). NOT yet
-byte-exact: ref/pred is spatially-varying (median ~591, std ~168), i.e. a
-truncation-pattern divergence (intermediate scaling before a `>>` differs), not
-a missing scalar. NEXT (definitive): add a gdb hook to dump buf20/buf28/buf48
-after each sub_180010380 pass and find the first per-pass divergence.
+**PORT STATUS (dev/port_gradient.py): BYTE-EXACT** ✅ — `Ixx`/`Iyy`/`Ixy`
+reproduce the per-pass `GDB_DUMP_G380` captures with **0 mismatches** (interior;
+edges pending the exact L/M/R region logic). The per-pass dumps cracked three
+details that blind reconstruction missed:
+1. **smoothing `c = 0x100000/(scale·0x2aaa)`** uses `scale` (=v9), NOT
+   `n=2·scale+1` ⇒ scale 1 → c=96, and `mid = round(c·0xd55/1024) = 320`
+   (the DLL ROUNDS, `(c·0xd55+512)>>10`), so the smoothing 3-tap is
+   **[96,320,96]** (sum 512, gain 0.5) — earlier [32,106,32] was ÷3 too small
+   (the spurious "~591/3.01×" factor).
+2. **F460/F840 are true CONVOLUTIONS (kernel reversed)**, so the derivative is
+   `in[x+1]−in[x−1]` (not `in[x−1]−in[x+1]`). Sign cancels in Dx∘Dx (why the
+   final planes still positively-correlated) but shows up in single-deriv passes.
+3. chaining confirmed from the dumps: `call3_before == call1_after` ⇒ for these
+   tiles **v9=1** (norm1/norm2 are identity).
+The Gaussian PRE-SMOOTH (sub_1800101C0, gradin→CC20 input) is the only piece not
+yet byte-checked end-to-end (the g380 run captured CC20's input directly, so the
+gradient is exact regardless); validate it when a run captures both gradin and
+g380. Edge regions of F460/F840 also still TODO for full-tile (not just
+interior) exactness.
 
 REMAINING = pure implementation: port the two builders + the separable apply +
 the 3-plane dataflow in `sub_18000CC20`, then validate **bit-exact** against the
