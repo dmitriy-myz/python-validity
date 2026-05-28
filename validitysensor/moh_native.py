@@ -80,11 +80,21 @@ GAUSS_Q = np.array([
     [  94,   86,   68,  46,  26,  13,  0],
 ], dtype=np.int64)
 
-# cos/sin tables are round(cos/sin(deg) * 65536), idx 0..180 (ridge orient mod 180)
-COS_Q16 = np.round(np.cos(np.deg2rad(np.arange(181))) * 65536).astype(np.int64)
-SIN_Q16 = np.round(np.sin(np.deg2rad(np.arange(181))) * 65536).astype(np.int64)
+# cos/sin tables are round(cos/sin(deg) * 65536), idx 0..359 (FULL circle —
+# E090 uses directed orient [0, 2π), NOT ridge-mod-π).  Verified byte-exact
+# against the DLL .rdata tables at 0x180131050 (cos) and 0x1801315F0 (sin).
+COS_Q16 = np.round(np.cos(np.deg2rad(np.arange(360))) * 65536).astype(np.int64)
+SIN_Q16 = np.round(np.sin(np.deg2rad(np.arange(360))) * 65536).astype(np.int64)
 
 ATAN2_FULLSCALE = np.pi * 65536        # 205887.4 — sub_180003150 Q16-radian full scale
+
+
+def orient_to_index(orient_q16):
+    """Convert kp[+0xc] orient_q16 (Q16 radians, [0, π·65536)) to cos/sin table
+    index in [0, 180].  Exact formula from E090 at e0c4/e0ec/e0fe:
+        index = (int) (orient_q16 · 180 / (π · 65536))
+    (cvttsd2si = trunc toward zero, but orient_q16 >= 0)."""
+    return int(orient_q16 * 180.0 / (np.pi * 65536.0))
 
 
 # ─── exp lookup table unk_180130F80 (dumped from the DLL .rdata) ─────────
@@ -234,6 +244,114 @@ def nms(resp, t_lo=671, t_hi=168, dedup_q=72064, margin=10):
 
 
 # NEXT after NMS: orientation (sub_18000D920) + oriented BRIEF (sub_18000E090).
+
+
+# ─── E090 oriented-BRIEF descriptor — disasm-decoded; impl pending capture ─
+# E090 reads gradient buffers from *(ctx[+0x50]): a struct with i32 stride@+0,
+# i32 height@+4, qword gradX_ptr@+0x20, qword gradY_ptr@+0x28. (E090's r8
+# turned out to be a scratch-pool descriptor, NOT the gradient.) Pipeline:
+#   1. Rotation+sampling (e380-e427): 16×16 grid xL,yL ∈ [-7..8]
+#        px = subpix_x + xL·cos − yL·sin + 0x8000      (Q16 → pixel via >>16)
+#        py = subpix_y + xL·sin + yL·cos + 0x8000
+#        if 0<=px<stride and 0<=py<height: gx=gradX[py*stride+px], gy=gradY[..]
+#                                    else: gx = gy = 0x800000   (mid-gray)
+#        rotated_gx[i] = (cos·(gx>>8) + sin·(gy>>8))>>8
+#        rotated_gy[i] = (cos·(gy>>8) − sin·(gx>>8))>>8
+#   2. Aggregation (e4a0-e5c0): 29 windows from *(ctx[+0x60]) (3 i32 each:
+#      window_size_idx, dy_off, dx_off). For each window, sum rotated_gx and
+#      rotated_gy over a r12d×r12d patch at index ((dy_off+7)·16 + dx_off+7),
+#      where r12d = small_local_table[window_size_idx] holding {7, ?, 3, ...}.
+#      Output: 58 i32 = the BRIEF compare input buffer.
+#   3. BRIEF compare (brief_pack below — BYTE-EXACT ✅).
+#
+# COS_Q16/SIN_Q16 are already defined above (orientation tables, 181 entries).
+# Orient index from kp[+0xc] orient_q16: idx = trunc(orient_q16 · 180 /
+# (pi·65536)) — read 8-byte FP constants from 0x180130ee0 (=180.0) and
+# 0x180130ee8 (=pi·65536=205887.416...). Range [0,180); ridge orient mod π.
+#
+# To enable this port we still need a capture of *(ctx[+0x50]) struct,
+# gradX/gradY arrays, and the 29-entry *(ctx[+0x60]) table. Hooks updated in
+# dev/gdb_dump.py (descbrief_gradstruct/_gradX/_gradY/_aggrtbl); re-run
+# enrollment with GDB_DUMP_DESC_BRIEF=1 to grab them.
+
+
+def _rotate_sample_pair(gx, gy, cos_q16, sin_q16):
+    """E090 inner rotation: takes raw (gx, gy) i32 samples, returns rotated pair.
+    Bit-exact emulation of the x86 imul/sar sequence at e3cd-e418."""
+    gx8 = np.int32(gx) >> 8
+    gy8 = np.int32(gy) >> 8
+    rgx = (np.int32(cos_q16 * gx8) >> 8) + (np.int32(sin_q16 * gy8) >> 8)
+    rgy = (np.int32(cos_q16 * gy8) >> 8) - (np.int32(sin_q16 * gx8) >> 8)
+    return np.int32(rgx), np.int32(rgy)
+
+
+def desc_sample_rotate(grad_x, grad_y, subpix_x_q16, subpix_y_q16, orient_idx,
+                       N=7):
+    """E090 rotation+sampling (stage 1).  Returns two int32 arrays of length
+    (2N+2)² = 256 (for N=7) — the rotated_gx/rotated_gy buffers that the
+    aggregation stage sums over.
+
+    Indexing matches the DLL: position[(yL+N)*(2N+2) + (xL+N)] for xL,yL in
+    [-N..N+1].  (The +1 is because the outer cmp is `r11d <= ctx[+0x34]+1`.)
+    """
+    stride = grad_x.shape[1]
+    height = grad_x.shape[0]
+    cos_q = int(COS_Q16[orient_idx])
+    sin_q = int(SIN_Q16[orient_idx])
+    span = 2 * N + 2                                   # = 16 for N=7
+    rgx = np.zeros(span * span, dtype=np.int64)
+    rgy = np.zeros(span * span, dtype=np.int64)
+    for yi in range(span):
+        yL = yi - N
+        for xi in range(span):
+            xL = xi - N
+            px_q = subpix_x_q16 + xL * cos_q - yL * sin_q + 0x8000
+            py_q = subpix_y_q16 + xL * sin_q + yL * cos_q + 0x8000
+            px = px_q >> 16
+            py = py_q >> 16
+            if 0 <= px < stride and 0 <= py < height:
+                gx = int(grad_x[py, px])
+                gy = int(grad_y[py, px])
+            else:
+                gx = gy = 0x800000
+            gx8 = gx >> 8
+            gy8 = gy >> 8
+            # imul truncates to i32; emulate via masked signed conversion.
+            def _s32(v):
+                v &= 0xFFFFFFFF
+                return v - (1 << 32) if v & 0x80000000 else v
+            rx = _s32(_s32(cos_q * gx8) >> 8) + _s32(_s32(sin_q * gy8) >> 8)
+            ry = _s32(_s32(cos_q * gy8) >> 8) - _s32(_s32(sin_q * gx8) >> 8)
+            idx = yi * span + xi
+            rgx[idx] = _s32(rx)
+            rgy[idx] = _s32(ry)
+    return rgx.astype(np.int32), rgy.astype(np.int32)
+
+
+def desc_aggregate(rgx, rgy, aggr_table, win_sizes, N=7):
+    """E090 aggregation (stage 2).  For each of len(aggr_table) entries
+    (= ctx[+0x68] = 29), sum rotated_gx and rotated_gy over a w×w window where
+    w = win_sizes[entry.size_idx]; window origin = ((dy+N)·(2N+2) + dx+N).
+
+    Returns the 58-i32 BRIEF input buffer: [gx0, gy0, gx1, gy1, ...].
+    """
+    span = 2 * N + 2
+    out = np.zeros(2 * len(aggr_table), dtype=np.int32)
+    for i, (size_idx, dy_off, dx_off) in enumerate(aggr_table):
+        w = int(win_sizes[size_idx])
+        if w <= 0:
+            continue
+        y0 = dy_off + N
+        x0 = dx_off + N
+        # disasm uses (y0)*(2N+2) + x0 with origin offset (+7), and sums w×w.
+        sx = sy = 0
+        for yy in range(w):
+            base = (y0 + yy) * span + x0
+            sx += int(rgx[base:base + w].sum())
+            sy += int(rgy[base:base + w].sum())
+        out[2 * i + 0] = np.int32(sx)
+        out[2 * i + 1] = np.int32(sy)
+    return out
 
 
 # ─── BRIEF bit-pack — BYTE-EXACT ✅ ──────────────────────────────────────

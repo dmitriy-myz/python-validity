@@ -766,13 +766,49 @@ class DescBriefEntryBP(gdb.Breakpoint):
                               _read_safe(tbl_ptr, 16 * 1024))
                 except Exception:
                     pass
-            # CORRECTED: E090's r8 (saved as r10) IS the gradient buffer (per
-            # disasm e5e7 [r10+rax*4] pixel sample, e0da imul·0x74 stride 116).
-            # Dump it once per unique r8 (constant per-tile).
+            # E090's r8 is a scratch-pool descriptor (6 qwords: count, arena_ptr,
+            # arena_end, flags, 0, 0) — sub_180003320 carves rotated_gx/gy slices
+            # out of it. NOT the gradient buffer.
+            # The actual gradient lives at *(ctx[+0x50]): a struct {i32 stride@+0,
+            # i32 height@+4, qword gradX_ptr@+0x20, qword gradY_ptr@+0x28}. The
+            # sampling loop reads gradX[y*stride+x] / gradY[y*stride+x] per pixel.
+            # The aggregation table at *(ctx[+0x60]) holds 29 × 12 bytes
+            # (3 i32 per entry: window_size_idx, dy_offset, dx_offset).
             if r8 and r8 not in _db_grad_seen:
                 _db_grad_seen.add(r8)
-                _save('descbrief_grad', f'grad{len(_db_grad_seen)-1:03d}',
-                      _read_safe(r8, 144 * 144 * 4))   # generous size, covers up to 144×144 i32
+                # Keep a smaller r8 dump (scratch arena descriptor + adjacent state).
+                _save('descbrief_scratch', f'grad{len(_db_grad_seen)-1:03d}',
+                      _read_safe(r8, 4 * 1024))
+            if ctx not in _db_gradstruct_seen:
+                _db_gradstruct_seen.add(ctx)
+                try:
+                    gs_ptr = _u64(ctx + 0x50)
+                    if gs_ptr:
+                        gs = _read_safe(gs_ptr, 0x40)
+                        _save('descbrief_gradstruct',
+                              f'ctx{len(_db_gradstruct_seen)-1:03d}', gs)
+                        if len(gs) >= 0x30:
+                            stride = int.from_bytes(gs[0:4], 'little', signed=True)
+                            height = int.from_bytes(gs[4:8], 'little', signed=True)
+                            gx_ptr = int.from_bytes(gs[0x20:0x28], 'little')
+                            gy_ptr = int.from_bytes(gs[0x28:0x30], 'little')
+                            n = max(0, stride) * max(0, height) * 4
+                            if 0 < n <= 256 * 256 * 4 and gx_ptr:
+                                _save('descbrief_gradX',
+                                      f'ctx{len(_db_gradstruct_seen)-1:03d}_{stride}x{height}',
+                                      _read_safe(gx_ptr, n))
+                            if 0 < n <= 256 * 256 * 4 and gy_ptr:
+                                _save('descbrief_gradY',
+                                      f'ctx{len(_db_gradstruct_seen)-1:03d}_{stride}x{height}',
+                                      _read_safe(gy_ptr, n))
+                    aggr_ptr = _u64(ctx + 0x60)
+                    if aggr_ptr:
+                        # 29 entries × 12 bytes = 348; over-grab 1KB for safety
+                        _save('descbrief_aggrtbl',
+                              f'ctx{len(_db_gradstruct_seen)-1:03d}',
+                              _read_safe(aggr_ptr, 1024))
+                except Exception as e:
+                    print(f'[!] grad/aggr dump failed: {e}')
             DescBriefFinishBP(kp, i)
             _db_calls += 1
         except Exception as e:
@@ -782,6 +818,7 @@ class DescBriefEntryBP(gdb.Breakpoint):
 
 _db_ctx_seen = set()
 _db_grad_seen = set()
+_db_gradstruct_seen = set()
 
 
 # ─── BRIEF pre-sampled values buffer (inside E090 at 0x18000E5D0) ────────
