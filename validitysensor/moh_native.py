@@ -704,39 +704,74 @@ def _descriptor_at(gradX, gradY, subpix_x_q16, subpix_y_q16, orient_q16):
     return brief_pack(samples)
 
 
+def _parabolic_subpix(resp, x, y):
+    """Standard 3-point parabolic subpixel refinement on a response map.
+
+    Fits 1D parabolas to (resp[y,x-1], resp[y,x], resp[y,x+1]) along x and
+    (resp[y-1,x], resp[y,x], resp[y+1,x]) along y, finds the apex, returns
+    (sx_q16, sy_q16). Clips fractional offsets to [-0.5, 0.5] so the apex
+    stays inside the original pixel cell. Falls back to (x, y) for pixels
+    on the response-map boundary.
+
+    NOTE: this is the standard formula — not byte-exact vs the DLL's
+    refinement (which we haven't fully traced). Good enough for the
+    chip's fuzzy matcher; produces fractional subpix in the same
+    ballpark as the captured orient_before coordinates."""
+    h, w = resp.shape
+    if not (1 <= x <= w - 2 and 1 <= y <= h - 2):
+        return (x * 65536), (y * 65536)
+    rxm = int(resp[y, x - 1]); rxc = int(resp[y, x]); rxp = int(resp[y, x + 1])
+    rym = int(resp[y - 1, x]); ryp = int(resp[y + 1, x])
+    denom_x = rxm - 2 * rxc + rxp
+    denom_y = rym - 2 * rxc + ryp
+    dx = (rxm - rxp) / (2 * denom_x) if denom_x != 0 else 0.0
+    dy = (rym - ryp) / (2 * denom_y) if denom_y != 0 else 0.0
+    # Clip to [-0.5, 0.5] — apex outside this range means the peak isn't
+    # actually at this pixel, so trust the integer position.
+    dx = max(-0.5, min(0.5, dx))
+    dy = max(-0.5, min(0.5, dy))
+    sx_q16 = int(round((x + dx) * 65536))
+    sy_q16 = int(round((y + dy) * 65536))
+    return sx_q16, sy_q16
+
+
 def extract_frame_native(image_q16, h=112, w=112,
-                          t_lo=671, t_hi=168, dedup_q=72064, nms_margin=10):
+                          t_lo=671, t_hi=168, dedup_q=72064, nms_margin=10,
+                          subpix_refine=True):
     """Single-frame native feature extractor.
 
     Args:
         image_q16: int32 array of shape (h, w), mid-gray = 0x800000. This is
             the exact buffer F250 receives at rcx (Q16 image).
+        subpix_refine: if True (default), refine each NMS keypoint via a
+            standard 3-point parabolic fit on the DoH response map before
+            computing orient + descriptor. WITHOUT this, descriptors are
+            computed at integer pixel positions; the DLL uses fractional
+            subpix (we measured: 23.641 vs 23 → patch center off by 1
+            pixel → chip's matcher doesn't find a match). The fit isn't
+            byte-exact vs the DLL but produces fractional subpix in the
+            same ballpark as captured orient_before coords.
 
     Returns:
         list of (gx_int, gy_int, orient_q16, desc_16B) tuples — the global
-        keypoint list after the A960 bound filter. Use build_v30() to format
-        as a v30 record array."""
+        keypoint list after the A960 bound filter."""
     image_q16 = np.asarray(image_q16, dtype=np.int64)
     assert image_q16.shape == (h, w), \
         f"expected ({h}, {w}), got {image_q16.shape}"
 
     per_tile_kps = []
     for ti, tj, tile in tile_image(image_q16):
-        # Tile is Q16. Compute the descriptor gradient (CC20 first-pass on
-        # the F250 pre-smooth of the tile) — gradX, gradY are the buffers
-        # E090 and D920 read.
         gradX, gradY = descriptor_gradient(tile)
-        # DoH front-end → response map → NMS keypoints (tile-local).
         _, _, _, resp = doh(tile)
         kps_local = nms(resp, t_lo=t_lo, t_hi=t_hi, dedup_q=dedup_q,
                         margin=nms_margin)
         records = []
         for score, lx, ly in kps_local:
-            # Integer subpix (NMS gives pixel-centered coords; subpix
-            # refinement is a TODO — the DLL does parabolic fit somewhere
-            # we haven't fully ported).
-            sx_q16 = (lx * 65536) & 0xFFFFFFFF
-            sy_q16 = (ly * 65536) & 0xFFFFFFFF
+            if subpix_refine:
+                sx_q16, sy_q16 = _parabolic_subpix(resp, lx, ly)
+            else:
+                sx_q16 = (lx * 65536) & 0xFFFFFFFF
+                sy_q16 = (ly * 65536) & 0xFFFFFFFF
             orient = orient_d920(gradX, gradY, sx_q16, sy_q16)
             desc = _descriptor_at(gradX, gradY, sx_q16, sy_q16, orient)
             records.append((sx_q16, sy_q16, orient, bytes(desc)))
