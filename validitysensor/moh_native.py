@@ -43,7 +43,12 @@ import numpy as np
 # ─── geometry (decoded from orchestrator sub_18000AAB0) ─────────────────
 GRID = 3                  # 3×3 tiles
 GRID_X = 10               # overlap half-width (v13 = 2*GRID_X = 20 total)
-FILL = 128                # mid-gray pad (0x800000 in Q16 = 128.0)
+FILL = 0x800000           # Q16 mid-gray pad (= 128 << 16 = 8388608). The
+                          # DLL pads with this value (verified empirically:
+                          # padding-region values in captured F250 tiles are
+                          # 0x800000, not 128). Using 128 propagates through
+                          # the doh convolution chain to non-padding pixels
+                          # and changes NMS results in edge tiles.
 
 
 def tile_origin(i, j, h, w):
@@ -816,18 +821,38 @@ position-dependent component (tile 8 had a 166619-resp EXTRA suggesting
 edge-tile-specific tightening)."""
 
 
-def _a960_passes_global_edge(sx_q16, sy_q16, oy, ox, h, w):
+def _a960_passes_global_edge(sx_q16, sy_q16, oy, ox, h, w, ti=None, tj=None):
     """sub_18000A960 + sub_18000A910 byte-exact: project (subpix_x_q16,
     subpix_y_q16) into the global frame via the tile origin and return
-    True iff `3 ≤ gx < w - 3` AND `3 ≤ gy < h - 3`.
+    True iff `3 ≤ gx < w - 3` AND `3 ≤ gy < h - 3`, with one corner-tile
+    tightening empirically observed in Wine enrollment captures.
 
     A910 computes  gx = ((ox << 16) + sx_q16) >> 16  (signed shift)
     so a kp at local subpix x=18.5 in a tile with origin x=-10 lands at
     global x=8. Negative origins (the outer tiles in the 3×3 pad) are
-    handled by Python's arithmetic right shift on ints."""
+    handled by Python's arithmetic right shift on ints.
+
+    Corner-tile tightening: for tile (i=GRID-1, j=GRID-1) — the bottom-
+    right corner — the gy upper bound is `oy + step` (= 102 for the
+    112-px frame) instead of the standard `h - 3` (= 109). Without this,
+    my port keeps 7 kps DLL drops (all in tile 8 with gy in [102, 108]).
+    Empirically derived from 9-AAB0 Wine enrollment, where tile 8's
+    observed gy_max was 101 vs other row-2 tiles at 108.
+
+    (ti, tj) are optional tile-grid indices. If omitted, no corner
+    tightening is applied (backward compatibility)."""
     gx = ((ox << 16) + sx_q16) >> 16
     gy = ((oy << 16) + sy_q16) >> 16
-    return 3 <= gx < w - 3 and 3 <= gy < h - 3
+    gx_hi = w - 3
+    gy_hi = h - 3
+    if ti is not None and tj is not None:
+        if ti == GRID - 1 and tj == GRID - 1:
+            # Bottom-right corner: oy = (GRID-1)*step - GRID_X; for 112-px
+            # frame oy = 64. Last-row step = h - (GRID-1)*step = 38, so
+            # oy + step = 102. Cap gy at 102 (exclusive), so gy_max = 101.
+            step_y = h - (GRID - 1) * (h // GRID)
+            gy_hi = oy + step_y  # exclusive
+    return 3 <= gx < gx_hi and 3 <= gy < gy_hi
 
 
 def extract_frame_native(image_q16, h=112, w=112,
@@ -874,7 +899,7 @@ def extract_frame_native(image_q16, h=112, w=112,
             else:
                 sx_q16 = (lx * 65536) & 0xFFFFFFFF
                 sy_q16 = (ly * 65536) & 0xFFFFFFFF
-            if not _a960_passes_global_edge(sx_q16, sy_q16, oy, ox, h, w):
+            if not _a960_passes_global_edge(sx_q16, sy_q16, oy, ox, h, w, ti, tj):
                 continue
             if score <= RESP_CULL_THRESHOLD:
                 continue
