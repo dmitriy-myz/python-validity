@@ -54,6 +54,7 @@ RVA_FDF0 = 0xFDF0     # gradient I_x — its input is the ENHANCED image (opt-in
 RVA_10380 = 0x10380   # one separable filter pass (CC20 calls it 5×) (opt-in)
 RVA_CF90 = 0xCF90     # NMS / keypoint extractor (opt-in) — see NmsEntryBP
 RVA_D920 = 0xD920     # orientation per keypoint (opt-in) — see OrientEntryBP
+RVA_E090 = 0xE090     # oriented BRIEF descriptor (opt-in) — see DescBriefEntryBP
 
 MASK = (1 << 64) - 1
 
@@ -680,14 +681,82 @@ class OrientEntryBP(gdb.Breakpoint):
         if _orient_calls >= ORIENT_MAX:
             return False
         try:
-            kp = _reg('rcx')
+            kp = _reg('rcx'); ctx = _reg('rdx'); arg3 = _reg('r8')
             i = _orient_calls
             _save('orient_before', f'kp{i:04d}', _read_safe(kp, 32))
+            # also dump the ctx struct (r13/rdx) and arg3 buffers, once per ctx.
+            # D920 reads ctx[+0x48] (u32) and ctx[+0x50] (pointer to gradient buf);
+            # 0x80 bytes covers the plane-struct layout (same shape as CC20's).
+            if ctx not in _orient_ctx_seen:
+                _orient_ctx_seen.add(ctx)
+                _save('orient_ctx', f'ctx{len(_orient_ctx_seen)-1:03d}', _read_safe(ctx, 0x80))
+                # follow ctx+0x50 to dump the gradient buffer pointed to (size from
+                # ctx+0..4 = w,h if it's a plane struct; clamp to <=64KB to be safe)
+                try:
+                    buf_ptr = _u64(ctx + 0x50)
+                    w = _u32(ctx); h = _u32(ctx + 4)
+                    if 0 < w <= 512 and 0 < h <= 512 and buf_ptr:
+                        n = min(w * h * 4, 0x10000)
+                        _save('orient_buf50', f'ctx{len(_orient_ctx_seen)-1:03d}_{w}x{h}',
+                              _read_safe(buf_ptr, n))
+                except Exception:
+                    pass
             OrientFinishBP(kp, i)
             _orient_calls += 1
         except Exception as e:
             print(f'[!] orient entry failed: {e}')
         return False
+
+
+_orient_ctx_seen = set()
+
+
+# ─── Oriented BRIEF descriptor (sub_18000E090) ───────────────────────────
+# E090(rcx=kp_ptr, rdx=ctx, r8=?, r9=desc_out_ptr). Reads kp[+0xc]=orient_q16,
+# kp[+0x14]=x_q16, kp[+0x18]=y_q16; writes a 16-byte (128-bit) descriptor at r9.
+# Dumps kp (with orientation pre-filled) and the 16B descriptor after the call.
+DESC_BRIEF_ON = os.environ.get('GDB_DUMP_DESC_BRIEF') == '1'
+DESC_BRIEF_MAX = int(os.environ.get('GDB_DESC_BRIEF_MAX', '1024'))
+_db_calls = 0
+
+
+class DescBriefFinishBP(gdb.FinishBreakpoint):
+    def __init__(self, kp, out, idx):
+        super().__init__(internal=True)
+        self.kp, self.out, self.idx = kp, out, idx
+
+    def stop(self):
+        try:
+            _save('descbrief_kp_after', f'kp{self.idx:04d}', _read_safe(self.kp, 32))
+            _save('descbrief_out', f'kp{self.idx:04d}', _read_safe(self.out, 16))
+        except Exception as e:
+            print(f'[!] descbrief finish failed: {e}')
+        return False
+
+    def out_of_scope(self):
+        pass
+
+
+class DescBriefEntryBP(gdb.Breakpoint):
+    def stop(self):
+        global _db_calls
+        if _db_calls >= DESC_BRIEF_MAX:
+            return False
+        try:
+            kp = _reg('rcx'); ctx = _reg('rdx'); out = _reg('r9')
+            i = _db_calls
+            _save('descbrief_kp_before', f'kp{i:04d}', _read_safe(kp, 32))
+            if ctx not in _db_ctx_seen:
+                _db_ctx_seen.add(ctx)
+                _save('descbrief_ctx', f'ctx{len(_db_ctx_seen)-1:03d}', _read_safe(ctx, 0x80))
+            DescBriefFinishBP(kp, out, i)
+            _db_calls += 1
+        except Exception as e:
+            print(f'[!] descbrief entry failed: {e}')
+        return False
+
+
+_db_ctx_seen = set()
 
 
 # ─── Gradient input (sub_18000FDF0) — the enhanced image ────────────────
@@ -790,6 +859,9 @@ def main():
     if ORIENT_ON:
         OrientEntryBP('*' + hex(base + RVA_D920))
         print(f'[*] orientation hook ON (max {ORIENT_MAX} calls)')
+    if DESC_BRIEF_ON:
+        DescBriefEntryBP('*' + hex(base + RVA_E090))
+        print(f'[*] BRIEF descriptor hook ON (max {DESC_BRIEF_MAX} calls)')
     print(f'[*] breakpoints armed. dumps -> {OUTDIR}/')
     print('[*] run a full enrollment now, then Ctrl-C + detach.')
     gdb.execute('continue')
