@@ -53,6 +53,7 @@ RVA_CE80 = 0xCE80     # Harris RESPONSE (opt-in) — see HarrisEntryBP
 RVA_FDF0 = 0xFDF0     # gradient I_x — its input is the ENHANCED image (opt-in)
 RVA_10380 = 0x10380   # one separable filter pass (CC20 calls it 5×) (opt-in)
 RVA_CF90 = 0xCF90     # NMS / keypoint extractor (opt-in) — see NmsEntryBP
+RVA_D920 = 0xD920     # orientation per keypoint (opt-in) — see OrientEntryBP
 
 MASK = (1 << 64) - 1
 
@@ -648,6 +649,47 @@ def _s32(v):
     return v - (1 << 32) if v & 0x80000000 else v
 
 
+# ─── Orientation per keypoint (sub_18000D920) ────────────────────────────
+# D920(rcx=kp_ptr, rdx=ctx, r8=buf) — writes orientation/quality into the 32-byte
+# keypoint record (field +0xc and others). Dumping the record before+after each
+# call reveals exactly which fields it sets, for porting + byte-validating.
+ORIENT_ON = os.environ.get('GDB_DUMP_ORIENT') == '1'
+ORIENT_MAX = int(os.environ.get('GDB_ORIENT_MAX', '1024'))
+_orient_calls = 0
+
+
+class OrientFinishBP(gdb.FinishBreakpoint):
+    def __init__(self, kp, idx):
+        super().__init__(internal=True)
+        self.kp, self.idx = kp, idx
+
+    def stop(self):
+        try:
+            _save('orient_after', f'kp{self.idx:04d}', _read_safe(self.kp, 32))
+        except Exception as e:
+            print(f'[!] orient finish failed: {e}')
+        return False
+
+    def out_of_scope(self):
+        pass
+
+
+class OrientEntryBP(gdb.Breakpoint):
+    def stop(self):
+        global _orient_calls
+        if _orient_calls >= ORIENT_MAX:
+            return False
+        try:
+            kp = _reg('rcx')
+            i = _orient_calls
+            _save('orient_before', f'kp{i:04d}', _read_safe(kp, 32))
+            OrientFinishBP(kp, i)
+            _orient_calls += 1
+        except Exception as e:
+            print(f'[!] orient entry failed: {e}')
+        return False
+
+
 # ─── Gradient input (sub_18000FDF0) — the enhanced image ────────────────
 _gradin_calls = 0
 
@@ -745,6 +787,9 @@ def main():
     if NMS_ON:
         NmsEntryBP('*' + hex(base + RVA_CF90))
         print(f'[*] NMS/keypoint hook ON (max {NMS_MAX} calls)')
+    if ORIENT_ON:
+        OrientEntryBP('*' + hex(base + RVA_D920))
+        print(f'[*] orientation hook ON (max {ORIENT_MAX} calls)')
     print(f'[*] breakpoints armed. dumps -> {OUTDIR}/')
     print('[*] run a full enrollment now, then Ctrl-C + detach.')
     gdb.execute('continue')
