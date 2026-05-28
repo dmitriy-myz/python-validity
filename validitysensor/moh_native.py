@@ -459,13 +459,22 @@ def merge_tile_kps_to_global(per_tile_kps, h, w, margin=3):
     the DLL's bound check (margin ≤ global_xy < dim-margin).
 
     `per_tile_kps`: iterable of (i, j, kp_list) where (i, j) is the tile
-        grid position (matches tile_image) and kp_list is iterable of
+        grid position (matches tile_image — ROW-MAJOR: tile 0 = (0,0),
+        tile 1 = (0,1), …, tile 8 = (2,2)) and kp_list is iterable of
         records whose first two fields are (subpix_x_q16, subpix_y_q16).
         Any remaining fields are preserved unchanged.
 
     Returns: list of (gx_int, gy_int, *rest) tuples, in tile-by-kp order
         (matches sub_18000A960's iteration). Keypoints failing the bound
-        check are dropped."""
+        check are dropped.
+
+    The DLL stamps each kp record with its tile index at byte +0x9
+    (range 0..8). Frame transitions are signalled by +0x9 wrapping
+    (going from 8 back down to a lower value on the next D920 call).
+    `dev/validate_merge.py` uses this to attribute captured kps to
+    tiles byte-exact; 1024/1024 captured kps fit in [3, 109) when
+    attributed via +0x9 + row-major (i = +0x9 // 3, j = +0x9 % 3).
+    """
     out = []
     for i, j, kp_list in per_tile_kps:
         oy, ox = tile_origin(i, j, h, w)
