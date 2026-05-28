@@ -745,7 +745,7 @@ class DescBriefFinishBP(gdb.FinishBreakpoint):
 
 class DescBriefEntryBP(gdb.Breakpoint):
     def stop(self):
-        global _db_calls
+        global _db_calls, _db_last_grad_sig, _db_tile_seq
         if _db_calls >= DESC_BRIEF_MAX:
             return False
         try:
@@ -779,36 +779,50 @@ class DescBriefEntryBP(gdb.Breakpoint):
                 # Keep a smaller r8 dump (scratch arena descriptor + adjacent state).
                 _save('descbrief_scratch', f'grad{len(_db_grad_seen)-1:03d}',
                       _read_safe(r8, 4 * 1024))
-            if ctx not in _db_gradstruct_seen:
-                _db_gradstruct_seen.add(ctx)
-                try:
-                    gs_ptr = _u64(ctx + 0x50)
-                    if gs_ptr:
-                        gs = _read_safe(gs_ptr, 0x40)
-                        _save('descbrief_gradstruct',
-                              f'ctx{len(_db_gradstruct_seen)-1:03d}', gs)
-                        if len(gs) >= 0x30:
-                            stride = int.from_bytes(gs[0:4], 'little', signed=True)
-                            height = int.from_bytes(gs[4:8], 'little', signed=True)
-                            gx_ptr = int.from_bytes(gs[0x20:0x28], 'little')
-                            gy_ptr = int.from_bytes(gs[0x28:0x30], 'little')
-                            n = max(0, stride) * max(0, height) * 4
+            # Dedupe by gradient CONTENT (first 32 bytes hash) — the ctx ADDRESS
+            # is reused across tiles, but the gradient buffer the struct points
+            # to gets overwritten per tile.  Capture whenever the content
+            # changes; tag the file with the kp index where the change was
+            # first observed, so the validation harness can map each kp to
+            # the right gradient via `kp_idx >= grad_kp_tag`.
+            try:
+                gs_ptr = _u64(ctx + 0x50)
+                if gs_ptr:
+                    gs = _read_safe(gs_ptr, 0x40)
+                    if len(gs) >= 0x30:
+                        stride = int.from_bytes(gs[0:4], 'little', signed=True)
+                        height = int.from_bytes(gs[4:8], 'little', signed=True)
+                        gx_ptr = int.from_bytes(gs[0x20:0x28], 'little')
+                        gy_ptr = int.from_bytes(gs[0x28:0x30], 'little')
+                        n = max(0, stride) * max(0, height) * 4
+                        # Hash the leading bytes of gradX as the change signal.
+                        sig = b''
+                        if 0 < n <= 256 * 256 * 4 and gx_ptr:
+                            sig = _read_safe(gx_ptr, 64)
+                        if sig and sig != _db_last_grad_sig:
+                            _db_last_grad_sig = sig
+                            tile_seq = _db_tile_seq
+                            _db_tile_seq += 1
+                            tag = f't{tile_seq:02d}_kp{i:04d}'
+                            _save('descbrief_gradstruct', tag, gs)
                             if 0 < n <= 256 * 256 * 4 and gx_ptr:
-                                _save('descbrief_gradX',
-                                      f'ctx{len(_db_gradstruct_seen)-1:03d}_{stride}x{height}',
+                                _save('descbrief_gradX', f'{tag}_{stride}x{height}',
                                       _read_safe(gx_ptr, n))
                             if 0 < n <= 256 * 256 * 4 and gy_ptr:
-                                _save('descbrief_gradY',
-                                      f'ctx{len(_db_gradstruct_seen)-1:03d}_{stride}x{height}',
+                                _save('descbrief_gradY', f'{tag}_{stride}x{height}',
                                       _read_safe(gy_ptr, n))
+                # Aggregation table: capture once per unique ctx (the table
+                # itself is rebuilt by E6B0 — see sub_18000A5B0 — but identical
+                # contents across tiles, so address-dedupe is fine here).
+                if ctx not in _db_gradstruct_seen:
+                    _db_gradstruct_seen.add(ctx)
                     aggr_ptr = _u64(ctx + 0x60)
                     if aggr_ptr:
-                        # 29 entries × 12 bytes = 348; over-grab 1KB for safety
                         _save('descbrief_aggrtbl',
                               f'ctx{len(_db_gradstruct_seen)-1:03d}',
                               _read_safe(aggr_ptr, 1024))
-                except Exception as e:
-                    print(f'[!] grad/aggr dump failed: {e}')
+            except Exception as e:
+                print(f'[!] grad/aggr dump failed: {e}')
             DescBriefFinishBP(kp, i)
             _db_calls += 1
         except Exception as e:
@@ -819,6 +833,8 @@ class DescBriefEntryBP(gdb.Breakpoint):
 _db_ctx_seen = set()
 _db_grad_seen = set()
 _db_gradstruct_seen = set()
+_db_last_grad_sig = b''
+_db_tile_seq = 0
 
 
 # ─── BRIEF pre-sampled values buffer (inside E090 at 0x18000E5D0) ────────

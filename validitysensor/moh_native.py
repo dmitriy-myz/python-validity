@@ -291,8 +291,11 @@ def desc_sample_rotate(grad_x, grad_y, subpix_x_q16, subpix_y_q16, orient_idx,
     (2N+2)² = 256 (for N=7) — the rotated_gx/rotated_gy buffers that the
     aggregation stage sums over.
 
-    Indexing matches the DLL: position[(yL+N)*(2N+2) + (xL+N)] for xL,yL in
-    [-N..N+1].  (The +1 is because the outer cmp is `r11d <= ctx[+0x34]+1`.)
+    Storage order matches the DLL: COLUMN-MAJOR — xL is the OUTER loop variable
+    in the disasm (e306 cmp r11d, ..+1), yL is inner (e424 cmp r10d, ..+1), and
+    rdi/rbp advance by 4 once per inner iter.  So index = (xL+N)*(2N+2) + (yL+N).
+    The aggregation step `field1*span + field2` then walks rows of xL (NOT yL):
+    `field1` = dx (xL offset), `field2` = dy (yL offset).
     """
     stride = grad_x.shape[1]
     height = grad_x.shape[0]
@@ -301,10 +304,15 @@ def desc_sample_rotate(grad_x, grad_y, subpix_x_q16, subpix_y_q16, orient_idx,
     span = 2 * N + 2                                   # = 16 for N=7
     rgx = np.zeros(span * span, dtype=np.int64)
     rgy = np.zeros(span * span, dtype=np.int64)
-    for yi in range(span):
-        yL = yi - N
-        for xi in range(span):
-            xL = xi - N
+
+    def _s32(v):
+        v &= 0xFFFFFFFF
+        return v - (1 << 32) if v & 0x80000000 else v
+
+    for xi in range(span):                              # outer = xL
+        xL = xi - N
+        for yi in range(span):                          # inner = yL
+            yL = yi - N
             px_q = subpix_x_q16 + xL * cos_q - yL * sin_q + 0x8000
             py_q = subpix_y_q16 + xL * sin_q + yL * cos_q + 0x8000
             px = px_q >> 16
@@ -316,13 +324,12 @@ def desc_sample_rotate(grad_x, grad_y, subpix_x_q16, subpix_y_q16, orient_idx,
                 gx = gy = 0x800000
             gx8 = gx >> 8
             gy8 = gy >> 8
-            # imul truncates to i32; emulate via masked signed conversion.
-            def _s32(v):
-                v &= 0xFFFFFFFF
-                return v - (1 << 32) if v & 0x80000000 else v
+            # rotated_gy uses `NEG ecx; SAR ecx,8` (e413/e415) — NEG first, then
+            # arithmetic shift.  For non-multiples of 256, `(-v) >> 8 ≠ -(v >> 8)`
+            # by one (the SAR rounds toward −∞).  Reproduce exactly:
             rx = _s32(_s32(cos_q * gx8) >> 8) + _s32(_s32(sin_q * gy8) >> 8)
-            ry = _s32(_s32(cos_q * gy8) >> 8) - _s32(_s32(sin_q * gx8) >> 8)
-            idx = yi * span + xi
+            ry = _s32(_s32(cos_q * gy8) >> 8) + _s32(_s32(-(sin_q * gx8)) >> 8)
+            idx = xi * span + yi
             rgx[idx] = _s32(rx)
             rgy[idx] = _s32(ry)
     return rgx.astype(np.int32), rgy.astype(np.int32)
@@ -331,22 +338,28 @@ def desc_sample_rotate(grad_x, grad_y, subpix_x_q16, subpix_y_q16, orient_idx,
 def desc_aggregate(rgx, rgy, aggr_table, win_sizes, N=7):
     """E090 aggregation (stage 2).  For each of len(aggr_table) entries
     (= ctx[+0x68] = 29), sum rotated_gx and rotated_gy over a w×w window where
-    w = win_sizes[entry.size_idx]; window origin = ((dy+N)·(2N+2) + dx+N).
+    w = win_sizes[entry.size_idx].
+
+    Buffer is column-major (xL outer / yL inner — see desc_sample_rotate); so
+    `field1` = dx (multiplies span), `field2` = dy (added).  Window origin:
+        base = (dx+N)·(2N+2) + (dy+N).
+    The disasm at e521-e52a sums rgx/rgy in pairs from rdx, rdx+4 (and r8 buf
+    likewise) — equivalent to a contiguous w-long span starting at `base`,
+    repeated w times with stride 2N+2 (= the byte step at e552 `add rdx, r14`).
 
     Returns the 58-i32 BRIEF input buffer: [gx0, gy0, gx1, gy1, ...].
     """
     span = 2 * N + 2
     out = np.zeros(2 * len(aggr_table), dtype=np.int32)
-    for i, (size_idx, dy_off, dx_off) in enumerate(aggr_table):
+    for i, (size_idx, dx_off, dy_off) in enumerate(aggr_table):
         w = int(win_sizes[size_idx])
         if w <= 0:
             continue
-        y0 = dy_off + N
         x0 = dx_off + N
-        # disasm uses (y0)*(2N+2) + x0 with origin offset (+7), and sums w×w.
+        y0 = dy_off + N
         sx = sy = 0
-        for yy in range(w):
-            base = (y0 + yy) * span + x0
+        for xx in range(w):
+            base = (x0 + xx) * span + y0
             sx += int(rgx[base:base + w].sum())
             sy += int(rgy[base:base + w].sum())
         out[2 * i + 0] = np.int32(sx)
