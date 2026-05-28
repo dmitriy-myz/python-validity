@@ -7,6 +7,7 @@ Pipeline (all stages classical CV; no proprietary enhancement):
       → 3×3 grid of 57×57 tiles (mid-gray pad)          [tile_image]      DONE
       → per tile: Q12 Determinant-of-Hessian → Ixx/Iyy/Ixy/resp [doh]    BYTE-EXACT (interior)
       → 8-neighbour NMS → keypoints                      [nms]            BYTE-EXACT
+      → BRIEF bit-pack (per-kp 128 binary tests)         [brief_pack]     BYTE-EXACT
       → orientation (Gaussian-weighted grad histogram)   [orientation]    decoded; impl WIP
       → oriented BRIEF descriptor                        [descriptor]     decoded; impl WIP
       → [x][y][128-bit desc] × 250 → v30                 [build_v30]       format known
@@ -233,3 +234,41 @@ def nms(resp, t_lo=671, t_hi=168, dedup_q=72064, margin=10):
 
 
 # NEXT after NMS: orientation (sub_18000D920) + oriented BRIEF (sub_18000E090).
+
+
+# ─── BRIEF bit-pack — BYTE-EXACT ✅ ──────────────────────────────────────
+# sub_18000E090 BRIEF compare loop @ e5e0-e60e:
+#     bit[j] = 1 if samples[tbl[j].idx1] > samples[tbl[j].idx2] else 0
+# packed little-endian into 16 bytes (sub_18000DF20 @ e660: byte_idx=j>>3,
+# bit_pos=j&7, dst[byte_idx] |= bit << bit_pos). 128 tests → 16-byte descriptor.
+# Validated 500/500 byte-exact vs descbrief_samples + descbrief_desc captures.
+#
+# The index-pair table is runtime-generated (NOT in the DLL .rdata; we tried
+# the 4 candidate tables). First 128 entries × 8B = 1024B snapshot is stored
+# in validitysensor/brief_table.bin (loaded lazily below). Reproducing the
+# generator algorithm is the remaining piece.
+_BRIEF_TABLE = None
+
+
+def _load_brief_table():
+    global _BRIEF_TABLE
+    if _BRIEF_TABLE is None:
+        import os
+        p = os.path.join(os.path.dirname(__file__), 'brief_table.bin')
+        _BRIEF_TABLE = np.frombuffer(open(p, 'rb').read(), dtype=np.int32).reshape(-1, 2)
+    return _BRIEF_TABLE
+
+
+def brief_pack(samples, table=None, count=128):
+    """sub_18000DF20 BRIEF bit-pack — byte-exact (500/500 vs DLL captures).
+    samples: 1D int32 array of pre-sampled gradient values around the keypoint
+             (E090 pre-fills these by orientation-rotated sampling — NOT yet
+             byte-validated; use captured `descbrief_samples_*` as oracle).
+    table: index-pair array (N, 2) of test indices; defaults to brief_table.bin.
+    count: number of binary tests (= descriptor bits; 128 here)."""
+    if table is None:
+        table = _load_brief_table()
+    a = samples[table[:count, 0]]
+    b = samples[table[:count, 1]]
+    bits = (a > b).astype(np.uint8)
+    return np.packbits(bits, bitorder='little')   # → 16-byte descriptor
