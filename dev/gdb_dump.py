@@ -795,10 +795,16 @@ class DescBriefEntryBP(gdb.Breakpoint):
                         gx_ptr = int.from_bytes(gs[0x20:0x28], 'little')
                         gy_ptr = int.from_bytes(gs[0x28:0x30], 'little')
                         n = max(0, stride) * max(0, height) * 4
-                        # Hash the leading bytes of gradX as the change signal.
+                        # Signature = (height, stride, full gradX content hash).
+                        # The leading bytes alone don't catch every transition
+                        # (top-edge pixels can be near-constant); hash the
+                        # whole buffer for an unambiguous change signal.
                         sig = b''
                         if 0 < n <= 256 * 256 * 4 and gx_ptr:
-                            sig = _read_safe(gx_ptr, 64)
+                            import hashlib
+                            raw = _read_safe(gx_ptr, n)
+                            sig = (f'{stride}x{height}|'.encode()
+                                   + hashlib.sha1(raw).digest())
                         if sig and sig != _db_last_grad_sig:
                             _db_last_grad_sig = sig
                             tile_seq = _db_tile_seq
