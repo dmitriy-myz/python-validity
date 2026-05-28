@@ -818,6 +818,99 @@ class Sensor:
 
         return tinfo
 
+    def enroll_native(self, identity: SidIdentity, subtype: int,
+                       reference_template: bytes,
+                       update_cb: typing.Callable[[typing.Any, typing.Optional[Exception]], None] = lambda *a, **k: None,
+                       max_attempts: int = 6):
+        """Enroll a finger using the byte-exact native pipeline (no DLL).
+
+        Captures one frame, runs validitysensor.moh_native.native_template_via_splice
+        against `reference_template` (a previously-captured 23136-byte template
+        used purely as a structural scaffold — its descriptors are replaced
+        with ours; its (x, y) coordinates are reused), then stores the result
+        via the normal db.new_finger() path.
+
+        Args:
+            identity: the SidIdentity to enroll under.
+            subtype: the WinBio subtype (= finger position) for the record.
+            reference_template: bytes of a captured 23136-byte template.
+                Must come from the SAME sensor/firmware as the target.
+            update_cb: progress callback (compat with enroll()).
+            max_attempts: how many capture retries on transient errors.
+
+        Returns: the recid created in the chip's storage (StgWindsor)."""
+        import numpy as np
+        from .moh_native import native_template_via_splice
+
+        if len(reference_template) != 23136:
+            raise ValueError(
+                f'reference_template must be 23136 bytes, got {len(reference_template)}')
+
+        last_err = None
+        for attempt in range(max_attempts):
+            try:
+                glow_start_scan()
+                x, y, w1, w2, img_data = self.capture(CaptureMode.ENROLL)
+                img = np.frombuffer(img_data, dtype=np.uint8).reshape(x, y)
+                img = np.transpose(img)         # sensor returns transposed
+
+                # Resize 144→112 if needed (the DLL resamples; we use 112×112
+                # for the per-tile pipeline). Skip if already at the target.
+                if img.shape != (112, 112):
+                    try:
+                        import cv2
+                        img112 = cv2.resize(img, (112, 112),
+                                            interpolation=cv2.INTER_LINEAR)
+                    except ImportError:
+                        # Fallback: nearest-neighbour
+                        h, w = img.shape
+                        ys = (np.arange(112) * h // 112)
+                        xs = (np.arange(112) * w // 112)
+                        img112 = img[ys[:, None], xs[None, :]]
+                else:
+                    img112 = img
+
+                # Convert to Q16 (mid-gray = 0x800000) — F250's input format
+                img_q16 = img112.astype(np.int32) << 16
+
+                envelope = native_template_via_splice(
+                    img_q16, reference_template, subtype=subtype)
+
+                # The envelope already matches make_finger_data's tinfo layout
+                # (verified: subtype/version/payload/trailing header + TLV1
+                # ws_body + TLV2 tid + 32 zeros = 23136 bytes), so we can
+                # pass it straight to db.new_finger.
+                usr = db.lookup_user(identity)
+                if usr is None:
+                    usr = db.new_user(identity)
+                else:
+                    usr = usr.dbid
+
+                recid = db.new_finger(usr, envelope)
+                usb.wait_int()
+                glow_end_scan()
+                update_cb({'native': True, 'recid': recid}, None)
+                return recid
+
+            except usb_core.USBError:
+                glow_end_scan()
+                raise
+            except CancelledException:
+                glow_end_scan()
+                raise
+            except Exception as e:
+                last_err = e
+                update_cb(None, e)
+                logging.exception('enroll_native attempt %d failed', attempt)
+                # Brief pause before retry
+                from time import sleep as _sleep
+                _sleep(0.1)
+
+        glow_end_scan()
+        raise RuntimeError(f'enroll_native: all {max_attempts} attempts failed; '
+                            f'last error: {last_err}')
+
+
     # TODO: Better typing information needed.
     def enroll(self, identity: SidIdentity, subtype: int,
                update_cb: typing.Callable[[typing.Any, typing.Optional[Exception]], None]):
