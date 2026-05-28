@@ -43,27 +43,41 @@ import numpy as np
 # ─── geometry (decoded from orchestrator sub_18000AAB0) ─────────────────
 GRID = 3                  # 3×3 tiles
 GRID_X = 10               # overlap half-width (v13 = 2*GRID_X = 20 total)
-TILE = 57                 # 2*GRID_X + step  (= 20 + 37 for a 112 image)
 FILL = 128                # mid-gray pad (0x800000 in Q16 = 128.0)
 
 
 def tile_origin(i, j, h, w):
-    """Top-left (row, col) of tile (i,j). step = h/3; origin = i*step - GRID_X.
+    """Top-left (row, col) of tile (i,j). step = h/GRID; origin = i*step - GRID_X.
     Verified against captures: tile(0,0)@(-10,-10), tile(0,1)@(-10,27)."""
     return i * (h // GRID) - GRID_X, j * (w // GRID) - GRID_X
 
 
+def tile_size(i, j, h, w):
+    """Per-tile (height, width). The last row/col absorbs the dim-vs-GRID
+    remainder, so for the 112-px frame the col-2 and row-2 tiles are 58
+    (= 38 step + 2*GRID_X) while inner tiles are 57 (= 37 step + 2*GRID_X).
+    Matches captured F250 raw_tile sizes (57x57 / 58x57 / 57x58 / 58x58)."""
+    step_y = h // GRID
+    step_x = w // GRID
+    th = (h - (GRID - 1) * step_y) + 2 * GRID_X if i == GRID - 1 else step_y + 2 * GRID_X
+    tw = (w - (GRID - 1) * step_x) + 2 * GRID_X if j == GRID - 1 else step_x + 2 * GRID_X
+    return th, tw
+
+
 def tile_image(img):
-    """Yield (i, j, tile) for the 3×3 grid. Each tile is TILE×TILE, mid-gray
-    padded where it falls outside the image. Matches the DLL's sub_18000A850
-    blit + sub_180009F50 pad (gradin == this, corr 1.000)."""
+    """Yield (i, j, tile) for the 3×3 grid. Tile size is (57|58)x(57|58)
+    depending on position (last row/col absorbs the 112-3*37=1 remainder),
+    mid-gray padded where it falls outside the image. Matches the DLL's
+    sub_18000A850 blit + sub_180009F50 pad (F250 raw_tile captures sized
+    57x57 / 58x57 / 57x58 / 58x58 for the 9 tiles)."""
     h, w = img.shape
     for i in range(GRID):
         for j in range(GRID):
             oy, ox = tile_origin(i, j, h, w)
-            tile = np.full((TILE, TILE), FILL, dtype=img.dtype)
+            th, tw = tile_size(i, j, h, w)
+            tile = np.full((th, tw), FILL, dtype=img.dtype)
             sy0, sx0 = max(0, oy), max(0, ox)
-            sy1, sx1 = min(h, oy + TILE), min(w, ox + TILE)
+            sy1, sx1 = min(h, oy + th), min(w, ox + tw)
             if sy1 > sy0 and sx1 > sx0:
                 tile[sy0 - oy:sy1 - oy, sx0 - ox:sx1 - ox] = img[sy0:sy1, sx0:sx1]
             yield i, j, tile
@@ -791,6 +805,17 @@ FRAME_KP_CAP = 250
 follows the per-tile A960 edge cull."""
 
 
+RESP_CULL_THRESHOLD = 55500
+"""Empirical: DLL drops kps with abs(resp) <= ~55500 even after A960's edge
+filter. Where this threshold comes from isn't pinned down — it's likely a
+dynamic resp cull somewhere between F300's D5D0 (subpix) and A960's edge
+filter. Verified against 2026-05-28 frame 0 capture: 250/250 cap kps
+have resp > 55500 and all kps below 55331 are EXTRA. Match-quality test
+will confirm whether this empirical rule is sufficient or if there's a
+position-dependent component (tile 8 had a 166619-resp EXTRA suggesting
+edge-tile-specific tightening)."""
+
+
 def _a960_passes_global_edge(sx_q16, sy_q16, oy, ox, h, w):
     """sub_18000A960 + sub_18000A910 byte-exact: project (subpix_x_q16,
     subpix_y_q16) into the global frame via the tile origin and return
@@ -850,6 +875,8 @@ def extract_frame_native(image_q16, h=112, w=112,
                 sx_q16 = (lx * 65536) & 0xFFFFFFFF
                 sy_q16 = (ly * 65536) & 0xFFFFFFFF
             if not _a960_passes_global_edge(sx_q16, sy_q16, oy, ox, h, w):
+                continue
+            if score <= RESP_CULL_THRESHOLD:
                 continue
             pool.append((score, tile_id, ti, tj, sx_q16, sy_q16))
 
