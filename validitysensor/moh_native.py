@@ -784,44 +784,64 @@ def _descriptor_at(gradX, gradY, subpix_x_q16, subpix_y_q16, orient_q16):
     return brief_pack(samples)
 
 
+FRAME_KP_CAP = 250
+"""sub_18000AAB0 caps the per-frame kp_array to 250 (constant 0xfa at
+[rdi+0x04] in the inline ctx struct staged by the AAB0 caller at line
+180004cb4..180004cd4). Applied after the global resp-desc sort that
+follows the per-tile A960 edge cull."""
+
+
+def _a960_passes_global_edge(sx_q16, sy_q16, oy, ox, h, w):
+    """sub_18000A960 + sub_18000A910 byte-exact: project (subpix_x_q16,
+    subpix_y_q16) into the global frame via the tile origin and return
+    True iff `3 ≤ gx < w - 3` AND `3 ≤ gy < h - 3`.
+
+    A910 computes  gx = ((ox << 16) + sx_q16) >> 16  (signed shift)
+    so a kp at local subpix x=18.5 in a tile with origin x=-10 lands at
+    global x=8. Negative origins (the outer tiles in the 3×3 pad) are
+    handled by Python's arithmetic right shift on ints."""
+    gx = ((ox << 16) + sx_q16) >> 16
+    gy = ((oy << 16) + sy_q16) >> 16
+    return 3 <= gx < w - 3 and 3 <= gy < h - 3
+
+
 def extract_frame_native(image_q16, h=112, w=112,
                           t_lo=671, t_hi=168, dedup_q=72064, nms_margin=10,
-                          subpix_refine=True):
+                          subpix_refine=True, frame_kp_cap=FRAME_KP_CAP):
     """Single-frame native feature extractor.
+
+    Faithful to sub_18000AAB0's 3×3 tile orchestrator: per-tile NMS + subpix
+    + global-edge cull (A960), then a global qsort by abs(resp) descending,
+    cap to 250 (constant 0xfa), then a re-sort by (tile_id ASC, resp DESC)
+    via comparator A810 before D920+E090 run.
 
     Args:
         image_q16: int32 array of shape (h, w), mid-gray = 0x800000. This is
             the exact buffer F250 receives at rcx (Q16 image).
         subpix_refine: if True (default), refine each NMS keypoint via the
             byte-exact sub_18000D5D0 Hessian-Newton port (subpix_refine_kp).
-            Keypoints with a singular Hessian or |Δ| > 1 pixel are CULLED
-            (matches sub_18000D570 memmove-down semantics). 1000/1000
-            validated against captured orient_before kp[+0x14, +0x18].
-            WITHOUT this, descriptors are computed at integer pixel positions
-            and the chip's matcher doesn't find a match (we measured: e.g.
-            23.641 vs 23 puts the descriptor patch center off by 1 pixel).
 
     Returns:
         list of (gx_int, gy_int, orient_q16, desc_16B) tuples — the global
-        keypoint list after the A960 bound filter."""
+        keypoint list after merge."""
     image_q16 = np.asarray(image_q16, dtype=np.int64)
     assert image_q16.shape == (h, w), \
         f"expected ({h}, {w}), got {image_q16.shape}"
 
-    per_tile_kps = []
+    # Phase 1: per-tile detect + subpix + A960 edge filter. Collect
+    # surviving kps into a global pool tagged by tile_id. Keep gradX/gradY
+    # per tile for the later orient+descriptor pass.
+    per_tile_grads = {}
+    pool = []   # list of (score, tile_id, ti, tj, sx_q16, sy_q16)
     for ti, tj, tile in tile_image(image_q16):
         gradX, gradY = descriptor_gradient(tile)
-        # F250's rcx is Q16; doh() expects Q10. The captured `resp` and the
-        # DLL's NMS+D5D0 work on the Q10-derived plane, so shift the input.
+        per_tile_grads[(ti, tj)] = (gradX, gradY)
         _, _, _, resp = doh(tile >> 6)
-        kps_local = nms(resp, t_lo=t_lo, t_hi=t_hi, dedup_q=dedup_q,
-                        margin=nms_margin)
-        records = []
-        for score, lx, ly in kps_local:
+        oy, ox = tile_origin(ti, tj, h, w)
+        tile_id = ti * GRID + tj
+        for score, lx, ly in nms(resp, t_lo=t_lo, t_hi=t_hi,
+                                  dedup_q=dedup_q, margin=nms_margin):
             if subpix_refine:
-                # sub_18000D5D0 byte-exact. Returns None for keypoints the
-                # DLL would CULL (singular Hessian or |Δ| > 1 pixel) — exactly
-                # matches sub_18000D570's memmove-down behaviour.
                 r = subpix_refine_kp(resp, lx, ly)
                 if r is None:
                     continue
@@ -829,10 +849,39 @@ def extract_frame_native(image_q16, h=112, w=112,
             else:
                 sx_q16 = (lx * 65536) & 0xFFFFFFFF
                 sy_q16 = (ly * 65536) & 0xFFFFFFFF
-            orient = orient_d920(gradX, gradY, sx_q16, sy_q16)
-            desc = _descriptor_at(gradX, gradY, sx_q16, sy_q16, orient)
-            records.append((sx_q16, sy_q16, orient, bytes(desc)))
-        per_tile_kps.append((ti, tj, records))
+            if not _a960_passes_global_edge(sx_q16, sy_q16, oy, ox, h, w):
+                continue
+            pool.append((score, tile_id, ti, tj, sx_q16, sy_q16))
+
+    # Phase 2: global qsort by abs(resp) descending (comparator A7C0), then
+    # cap to frame_kp_cap (= 250).
+    pool.sort(key=lambda r: -r[0])
+    pool = pool[:frame_kp_cap]
+
+    # Phase 3: re-sort by (tile_id ASC, abs(resp) DESC) (comparator A810).
+    # Python's sort is stable, so primary key alone preserves resp order
+    # within each tile group — but the explicit secondary key is safer.
+    pool.sort(key=lambda r: (r[1], -r[0]))
+
+    # Phase 4: per-kp orient + descriptor, grouped back into per-tile lists
+    # for merge_tile_kps_to_global.
+    per_tile_kps = []
+    current_key = None
+    current_records = None
+    current_tij = None
+    for score, tile_id, ti, tj, sx_q16, sy_q16 in pool:
+        if tile_id != current_key:
+            if current_records is not None:
+                per_tile_kps.append((current_tij[0], current_tij[1], current_records))
+            current_key = tile_id
+            current_tij = (ti, tj)
+            current_records = []
+        gradX, gradY = per_tile_grads[(ti, tj)]
+        orient = orient_d920(gradX, gradY, sx_q16, sy_q16)
+        desc = _descriptor_at(gradX, gradY, sx_q16, sy_q16, orient)
+        current_records.append((sx_q16, sy_q16, orient, bytes(desc)))
+    if current_records is not None:
+        per_tile_kps.append((current_tij[0], current_tij[1], current_records))
 
     return merge_tile_kps_to_global(per_tile_kps, h, w)
 
