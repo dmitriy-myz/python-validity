@@ -57,11 +57,11 @@ def main():
     # Imports that need the venv + libusb actually wired
     from validitysensor.init import open as open_device
     from validitysensor.sensor import sensor as Sensor, RebootException
-    from validitysensor.sid import SidIdentity
+    from validitysensor.sid import sid_from_string
 
     subtype = int(args.subtype, 0)
     user_sid = args.user or 'S-1-5-21-111111111-1111111111-1111111111-2000'
-    identity = SidIdentity(user_sid)
+    identity = sid_from_string(user_sid)
 
     with open(args.ref, 'rb') as f:
         ref = f.read()
