@@ -876,17 +876,20 @@ class Sensor:
                 # frame data — the DLL uses 8 frames during a real enroll).
                 logging.info(f'enroll_native: capturing {num_frames} frame(s)...')
                 per_frame_kps = []
+                # Per-frame retry covers BOTH capture errors (e.g. "Scanning
+                # problem: 8080000" — finger lifted too early) AND weak
+                # captures with too few keypoints. Weak frames produce v30
+                # regions full of zero-padded records, which the chip's
+                # matcher treats as wildcards → stored template matches ANY
+                # finger (false positives). Reject + retry the frame instead.
+                MIN_KPS_PER_FRAME = 200
                 for f in range(num_frames):
-                    # Per-frame retry: if the sensor errors mid-capture
-                    # (e.g. "Scanning problem: 8080000" — finger lifted too
-                    # early), retry JUST this frame instead of restarting
-                    # the whole enrollment.
+                    kps = None
                     for frame_attempt in range(max_attempts):
                         glow_start_scan()
                         logging.info(f'  frame {f+1}/{num_frames}: place finger')
                         try:
                             x, y, w1, w2, img_data = self.capture(CaptureMode.ENROLL)
-                            break
                         except usb_core.USBError:
                             glow_end_scan()
                             raise
@@ -902,26 +905,37 @@ class Sensor:
                                 raise
                             from time import sleep as _sleep
                             _sleep(0.1)
-                    glow_end_scan()
-                    img = np.frombuffer(img_data, dtype=np.uint8).reshape(x, y)
-                    img = np.transpose(img)
-                    if img.shape != (112, 112):
-                        try:
-                            import cv2
-                            img112 = cv2.resize(img, (112, 112),
-                                                interpolation=cv2.INTER_LINEAR)
-                        except ImportError:
-                            h, w = img.shape
-                            ys = (np.arange(112) * h // 112)
-                            xs = (np.arange(112) * w // 112)
-                            img112 = img[ys[:, None], xs[None, :]]
-                    else:
-                        img112 = img
-                    img_q16 = img112.astype(np.int32) << 16
+                            continue
+                        glow_end_scan()
+                        img = np.frombuffer(img_data, dtype=np.uint8).reshape(x, y)
+                        img = np.transpose(img)
+                        if img.shape != (112, 112):
+                            try:
+                                import cv2
+                                img112 = cv2.resize(img, (112, 112),
+                                                    interpolation=cv2.INTER_LINEAR)
+                            except ImportError:
+                                h, w = img.shape
+                                ys = (np.arange(112) * h // 112)
+                                xs = (np.arange(112) * w // 112)
+                                img112 = img[ys[:, None], xs[None, :]]
+                        else:
+                            img112 = img
+                        img_q16 = img112.astype(np.int32) << 16
 
-                    logging.info(f'  frame {f+1}: extracting features...')
-                    kps = extract_frame_native(img_q16, h=112, w=112)
-                    logging.info(f'  frame {f+1}: {len(kps)} kp(s)')
+                        logging.info(f'  frame {f+1}: extracting features...')
+                        kps = extract_frame_native(img_q16, h=112, w=112)
+                        logging.info(f'  frame {f+1}: {len(kps)} kp(s)')
+                        if len(kps) < MIN_KPS_PER_FRAME:
+                            logging.warning(f'  frame {f+1} weak: only {len(kps)} kps '
+                                              f'(need >= {MIN_KPS_PER_FRAME}), retrying')
+                            kps = None
+                            continue
+                        break
+                    if kps is None:
+                        raise RuntimeError(
+                            f'frame {f+1}: exhausted {max_attempts} attempts '
+                            f'without a clean capture (>= {MIN_KPS_PER_FRAME} kps)')
                     per_frame_kps.append(kps)
 
                 # 2. Build envelope. Distribute frames across 4 v30 sections
