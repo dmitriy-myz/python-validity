@@ -55,6 +55,7 @@ RVA_10380 = 0x10380   # one separable filter pass (CC20 calls it 5×) (opt-in)
 RVA_CF90 = 0xCF90     # NMS / keypoint extractor (opt-in) — see NmsEntryBP
 RVA_D920 = 0xD920     # orientation per keypoint (opt-in) — see OrientEntryBP
 RVA_E090 = 0xE090     # oriented BRIEF descriptor (opt-in) — see DescBriefEntryBP
+RVA_E5D0 = 0xE5D0     # inside E090: right after `r10 = [rsp+0x58]` — see DescSamplesBP
 
 MASK = (1 << 64) - 1
 
@@ -754,6 +755,17 @@ class DescBriefEntryBP(gdb.Breakpoint):
             if ctx not in _db_ctx_seen:
                 _db_ctx_seen.add(ctx)
                 _save('descbrief_ctx', f'ctx{len(_db_ctx_seen)-1:03d}', _read_safe(ctx, 0x80))
+                # also dump the BRIEF index-pair table at ctx[+0x70] (each entry
+                # is 2 i32 indices into the pre-sampled buffer; inner loop count
+                # is ctx[+0x2c], but an outer loop runs multiple times to fill
+                # 128 bits — be generous with the size)
+                try:
+                    tbl_ptr = _u64(ctx + 0x70)
+                    if tbl_ptr:
+                        _save('descbrief_brieftbl', f'ctx{len(_db_ctx_seen)-1:03d}',
+                              _read_safe(tbl_ptr, 16 * 1024))
+                except Exception:
+                    pass
             # CORRECTED: E090's r8 (saved as r10) IS the gradient buffer (per
             # disasm e5e7 [r10+rax*4] pixel sample, e0da imul·0x74 stride 116).
             # Dump it once per unique r8 (constant per-tile).
@@ -770,6 +782,31 @@ class DescBriefEntryBP(gdb.Breakpoint):
 
 _db_ctx_seen = set()
 _db_grad_seen = set()
+
+
+# ─── BRIEF pre-sampled values buffer (inside E090 at 0x18000E5D0) ────────
+# Right after `mov r10, QWORD PTR [rsp+0x58]` (e5cb), r10 holds the per-keypoint
+# pre-sampled gradient values buffer that the BRIEF compare loop reads. Dump
+# its contents (generous 16KB; _read_safe shrinks if unmapped) so we have the
+# DLL's exact comparison inputs.
+DESC_SAMPLES_ON = os.environ.get('GDB_DUMP_DESC_SAMPLES') == '1'
+DESC_SAMPLES_MAX = int(os.environ.get('GDB_DESC_SAMPLES_MAX', '1024'))
+_ds_calls = 0
+
+
+class DescSamplesBP(gdb.Breakpoint):
+    def stop(self):
+        global _ds_calls
+        if _ds_calls >= DESC_SAMPLES_MAX:
+            return False
+        try:
+            buf = _reg('r10')
+            i = _ds_calls
+            _save('descbrief_samples', f'kp{i:04d}', _read_safe(buf, 16 * 1024))
+            _ds_calls += 1
+        except Exception as e:
+            print(f'[!] desc samples failed: {e}')
+        return False
 
 
 # ─── Gradient input (sub_18000FDF0) — the enhanced image ────────────────
@@ -875,6 +912,9 @@ def main():
     if DESC_BRIEF_ON:
         DescBriefEntryBP('*' + hex(base + RVA_E090))
         print(f'[*] BRIEF descriptor hook ON (max {DESC_BRIEF_MAX} calls)')
+    if DESC_SAMPLES_ON:
+        DescSamplesBP('*' + hex(base + RVA_E5D0))
+        print(f'[*] BRIEF samples hook ON at E5D0 (max {DESC_SAMPLES_MAX} calls)')
     print(f'[*] breakpoints armed. dumps -> {OUTDIR}/')
     print('[*] run a full enrollment now, then Ctrl-C + detach.')
     gdb.execute('continue')
