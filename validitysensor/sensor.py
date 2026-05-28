@@ -818,33 +818,49 @@ class Sensor:
 
         return tinfo
 
-    def enroll_native(self, identity: SidIdentity, subtype: int,
+    def enroll_native(self, parent_dbid: int, subtype: int,
                        reference_template: bytes,
+                       trailer: bytes = b'\x11',
                        update_cb: typing.Callable[[typing.Any, typing.Optional[Exception]], None] = lambda *a, **k: None,
                        max_attempts: int = 6):
         """Enroll a finger using the byte-exact native pipeline (no DLL).
 
-        Captures one frame, runs validitysensor.moh_native.native_template_via_splice
-        against `reference_template` (a previously-captured 23136-byte template
-        used purely as a structural scaffold — its descriptors are replaced
-        with ours; its (x, y) coordinates are reused), then stores the result
-        via the normal db.new_finger() path.
+        Captures one frame, builds a 23136-byte template via the native
+        pipeline (extract_frame_native splices our keypoints into the WS
+        body framing from reference_template, recomputes TID), and stores
+        it via the proven Wine-replay storage protocol:
+            typ=6 direct, storage=3, 1-byte trailer appended.
+        This is the same path dev/bisect_ws.py:send_finger() uses — NOT
+        the db.new_finger() / type=0xb-becomes-6 magic path which doesn't
+        actually work without an active 0x68/0x6b enrollment session.
 
         Args:
-            identity: the SidIdentity to enroll under.
+            parent_dbid: the existing user dbid the new finger attaches to.
+                Use `db.dump_raw()` to see what users exist. Storing under
+                a non-existent dbid succeeds at the storage layer BUT the
+                chip's matcher will silently fail to find the enrollment.
             subtype: the WinBio subtype (= finger position) for the record.
-            reference_template: bytes of a captured 23136-byte template.
-                Must come from the SAME sensor/firmware as the target.
+            reference_template: bytes of a 23136-byte chip-acceptable
+                template from this sensor — its descriptors get replaced
+                with ours; its WS framing bytes are reused.
+            trailer: 1-byte record-type marker appended to the wire payload.
+                Default 0x11 (matches enroll.log captures). Per bisect_ws
+                trailer-sweep results: any value works.
             update_cb: progress callback (compat with enroll()).
             max_attempts: how many capture retries on transient errors.
 
-        Returns: the recid created in the chip's storage (StgWindsor)."""
+        Returns: the recid created in the chip's storage."""
         import numpy as np
-        from .moh_native import native_template_via_splice
+        from .moh_native import native_template
+        from .tls import tls
+        from .flash import call_cleanups
+        from . import blobs
 
         if len(reference_template) != 23136:
             raise ValueError(
                 f'reference_template must be 23136 bytes, got {len(reference_template)}')
+        if len(trailer) != 1:
+            raise ValueError(f'trailer must be 1 byte, got {len(trailer)}')
 
         last_err = None
         for attempt in range(max_attempts):
@@ -854,15 +870,13 @@ class Sensor:
                 img = np.frombuffer(img_data, dtype=np.uint8).reshape(x, y)
                 img = np.transpose(img)         # sensor returns transposed
 
-                # Resize 144→112 if needed (the DLL resamples; we use 112×112
-                # for the per-tile pipeline). Skip if already at the target.
+                # Resize 144→112 if needed
                 if img.shape != (112, 112):
                     try:
                         import cv2
                         img112 = cv2.resize(img, (112, 112),
                                             interpolation=cv2.INTER_LINEAR)
                     except ImportError:
-                        # Fallback: nearest-neighbour
                         h, w = img.shape
                         ys = (np.arange(112) * h // 112)
                         xs = (np.arange(112) * w // 112)
@@ -873,20 +887,25 @@ class Sensor:
                 # Convert to Q16 (mid-gray = 0x800000) — F250's input format
                 img_q16 = img112.astype(np.int32) << 16
 
-                envelope = native_template_via_splice(
-                    img_q16, reference_template, subtype=subtype)
+                envelope = native_template(img_q16, reference_template,
+                                            subtype=subtype)
 
-                # The envelope already matches make_finger_data's tinfo layout
-                # (verified: subtype/version/payload/trailing header + TLV1
-                # ws_body + TLV2 tid + 32 zeros = 23136 bytes), so we can
-                # pass it straight to db.new_finger.
-                usr = db.lookup_user(identity)
-                if usr is None:
-                    usr = db.new_user(identity)
-                else:
-                    usr = usr.dbid
+                # Store via the proven replay protocol (matches bisect_ws's
+                # send_finger pattern): typ=6 direct, storage=3, +trailer.
+                db.db_info()
+                assert_status(tls.cmd(blobs.db_write_enable()))
+                try:
+                    msg = (pack('<BHHHH', 0x47, parent_dbid, 6, 3, len(envelope))
+                           + envelope + trailer)
+                    rsp = tls.cmd(msg)
+                    status, = unpack('<H', rsp[:2])
+                    if status != 0:
+                        raise RuntimeError(
+                            f'chip rejected new_finger: status=0x{status:04x}')
+                    recid, = unpack('<H', rsp[2:4])
+                finally:
+                    call_cleanups()
 
-                recid = db.new_finger(usr, envelope)
                 usb.wait_int()
                 glow_end_scan()
                 update_cb({'native': True, 'recid': recid}, None)
@@ -902,7 +921,6 @@ class Sensor:
                 last_err = e
                 update_cb(None, e)
                 logging.exception('enroll_native attempt %d failed', attempt)
-                # Brief pause before retry
                 from time import sleep as _sleep
                 _sleep(0.1)
 

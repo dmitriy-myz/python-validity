@@ -44,8 +44,13 @@ def main():
     ap.add_argument('--ref', required=True, help='reference template (23136B)')
     ap.add_argument('--subtype', default='0xf5',
                     help='WinBio subtype, hex or decimal (default 0xf5)')
-    ap.add_argument('--user', default=None,
-                    help='SID to enroll under (defaults to a fresh test SID)')
+    ap.add_argument('--parent', type=int, default=5,
+                    help='parent user dbid (use db.dump_raw() to list; '
+                         'default 5 matches dev/bisect_ws.py DEFAULT_PARENT)')
+    ap.add_argument('--trailer', default='0x11',
+                    help='1-byte record-type marker appended to the wire '
+                         'payload (default 0x11; per bisect_ws trailer-sweep '
+                         'results, any value works)')
     ap.add_argument('--match', action='store_true',
                     help='after enroll, capture again and try to identify')
     ap.add_argument('--dry-run', action='store_true',
@@ -53,9 +58,11 @@ def main():
                          'write it to /tmp/native_envelope.bin instead')
     ap.add_argument('--store-ref', action='store_true',
                     help='isolation test: store the reference template VERBATIM '
-                         '(no native processing) — should succeed if the chip '
-                         'is willing to accept the ref. If THIS fails, the '
-                         'problem is not our pipeline.')
+                         '(via the proven typ=6/storage=3+trailer path). If '
+                         'this fails, the problem is not our envelope.')
+    ap.add_argument('--list-users', action='store_true',
+                    help='dump the chip DB tree (db.dump_raw) and exit; '
+                         'use to find a real parent dbid to pass via --parent')
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -65,11 +72,11 @@ def main():
     # Imports that need the venv + libusb actually wired
     from validitysensor.init import open as open_device
     from validitysensor.sensor import sensor as Sensor, RebootException
-    from validitysensor.sid import sid_from_string
+    from validitysensor.db import db
 
     subtype = int(args.subtype, 0)
-    user_sid = args.user or 'S-1-5-21-111111111-1111111111-1111111111-2000'
-    identity = sid_from_string(user_sid)
+    parent = args.parent
+    trailer = bytes([int(args.trailer, 0) & 0xFF])
 
     with open(args.ref, 'rb') as f:
         ref = f.read()
@@ -80,6 +87,11 @@ def main():
     except RebootException:
         log.info('sensor rebooted — re-opening')
         open_device()
+
+    if args.list_users:
+        log.info('chip DB tree (find user dbids here):')
+        db.dump_raw()
+        return 0
 
     if args.dry_run:
         # Capture + build envelope but don't talk to the chip.
@@ -107,26 +119,37 @@ def main():
         with open('/tmp/native_envelope.bin', 'wb') as f:
             f.write(envelope)
         log.info(f'✓ wrote /tmp/native_envelope.bin ({len(envelope)} bytes)')
-        log.info('  diff against ref:')
         diff = sum(1 for a, b in zip(envelope, ref) if a != b)
-        log.info(f'    {diff}/{len(envelope)} bytes differ ({100*diff/len(envelope):.1f}%)')
+        log.info(f'  diff against ref: {diff}/{len(envelope)} bytes '
+                  f'({100*diff/len(envelope):.1f}%)')
         return 0
 
     if args.store_ref:
-        log.info(f'ISOLATION TEST: storing reference template verbatim...')
-        from validitysensor.db import db
-        usr = db.lookup_user(identity)
-        if usr is None:
-            usr = db.new_user(identity)
-        else:
-            usr = usr.dbid
-        recid = db.new_finger(usr, ref)
-        log.info(f'✓ stored ref verbatim, recid={recid}')
+        from struct import pack, unpack
+        from validitysensor.tls import tls
+        from validitysensor.flash import call_cleanups
+        from validitysensor import blobs
+        from validitysensor.util import assert_status
+        log.info(f'ISOLATION TEST: storing reference template verbatim '
+                  f'(typ=6, storage=3, parent={parent}, trailer=0x{trailer.hex()})')
+        db.db_info()
+        assert_status(tls.cmd(blobs.db_write_enable()))
+        try:
+            msg = pack('<BHHHH', 0x47, parent, 6, 3, len(ref)) + ref + trailer
+            rsp = tls.cmd(msg)
+            status, = unpack('<H', rsp[:2])
+            if status != 0:
+                log.error(f'chip rejected ref verbatim: status=0x{status:04x}')
+                return 2
+            recid, = unpack('<H', rsp[2:4])
+            log.info(f'✓ ref stored verbatim, recid={recid}')
+        finally:
+            call_cleanups()
         return 0
 
-    log.info(f'enrolling subtype 0x{subtype:x} under SID {user_sid} ...')
+    log.info(f'enrolling subtype 0x{subtype:x} under parent dbid {parent} ...')
     log.info('place finger now')
-    recid = Sensor.enroll_native(identity, subtype, ref)
+    recid = Sensor.enroll_native(parent, subtype, ref, trailer=trailer)
     log.info(f'✓ native enrollment stored, recid={recid}')
 
     if args.match:
