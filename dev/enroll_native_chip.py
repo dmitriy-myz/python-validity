@@ -55,7 +55,7 @@ def main():
     log = logging.getLogger('enroll_native_chip')
 
     # Imports that need the venv + libusb actually wired
-    from validitysensor.init import open_device
+    from validitysensor.init import open as open_device
     from validitysensor.sensor import sensor as Sensor, RebootException
     from validitysensor.sid import SidIdentity
 

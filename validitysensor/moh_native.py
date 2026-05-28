@@ -745,29 +745,38 @@ def extract_frame_native(image_q16, h=112, w=112,
     return merge_tile_kps_to_global(per_tile_kps, h, w)
 
 
-def native_template_via_splice(image_q16, reference_template, subtype=None):
-    """End-to-end native template generator using a reference template as
-    the WS-body scaffold. Replaces every v30 record region in the reference
-    with descriptors computed by the native pipeline AT THE REFERENCE'S
-    KEYPOINT COORDINATES, then recomputes the TID.
+def native_template(image_q16, reference_template, subtype=None,
+                     fill_all_sections=True):
+    """End-to-end native enrollment template.
 
-    This bypasses the multi-frame accumulation + WS body assembly we
-    haven't fully decoded — useful as a first end-to-end smoke test: if
-    the chip accepts the result, the byte-exact native descriptor matches
-    the DLL's at given coords.
+    Detects keypoints in `image_q16` with the byte-exact native pipeline
+    (DoH → NMS → orient → descriptor — same code paths the DLL runs),
+    formats them into 18-byte v30 records `[u8 x][u8 y][16B desc]`,
+    overwrites every v30 region of the reference template's WS body with
+    those records, recomputes the TID, and returns the new envelope.
+
+    The reference template is used PURELY for WS body framing bytes (the
+    24-byte header, section counts, anchors between v30 regions, trailing
+    pad). The chip doesn't validate framing — it just runs the matcher
+    over the v30 record data — so any chip-accepted template from the
+    same sensor works as a structural scaffold. The (x, y) coordinates
+    in the reference are NOT reused; ours come from our keypoint detector.
 
     Args:
-        image_q16: (h, w) int32 Q16 image (mid-gray = 0x800000).
-        reference_template: bytes of a previously-stored (chip-accepted)
-            23136-byte template envelope.
-        subtype: override subtype (default: take from reference at offset 0).
+        image_q16: (h, w) int32 Q16 image (mid-gray = 0x800000). The
+            sensor returns uint8; convert via `img.astype(np.int32) << 16`.
+        reference_template: bytes of a 23136-byte chip-accepted template
+            envelope from this sensor (e.g. one previously enrolled via
+            Wine). Provides the WS body framing only.
+        subtype: override subtype (default: read from reference[0:2]).
+        fill_all_sections: if True (default), write our records into every
+            v30 region of the WS body (4 regions for typical 4-frame
+            enrollment). If False, only fill the first region.
 
     Returns:
-        bytes of a new 23136-byte envelope with our descriptors and
-        recomputed TID."""
+        23136-byte envelope ready for db.new_finger() (= chip cmd 0x47)."""
     from .moh_extract import compute_tid, _build_envelope
-    from .moh_opencv import (WS_SIZE, V30_RECORD_LEN, find_v30_regions,
-                              build_v30_record)
+    from .moh_opencv import WS_SIZE, V30_RECORD_LEN, find_v30_regions
     import struct
 
     if subtype is None:
@@ -776,38 +785,38 @@ def native_template_via_splice(image_q16, reference_template, subtype=None):
     ws_body = bytearray(reference_template[12:12 + WS_SIZE])
     assert len(ws_body) == WS_SIZE, f"WS body must be {WS_SIZE}B, got {len(ws_body)}"
 
-    h, w = image_q16.shape
+    # 1. Detect OUR keypoints + descriptors from OUR image.
+    kps = extract_frame_native(image_q16, h=image_q16.shape[0],
+                                w=image_q16.shape[1])
+    # kps: list of (gx_int, gy_int, orient_q16, desc_16B), already
+    # bound-filtered to [3, 109) by A960's check.
 
-    # For each v30 record region in the reference WS, replace each record's
-    # descriptor with the byte-exact one computed from our image at that
-    # record's (x, y). Coords stay the same — only the descriptor changes.
-    for base in find_v30_regions(bytes(ws_body)):
-        i = base
-        while i + V30_RECORD_LEN <= len(ws_body) and \
-              0 < ws_body[i] <= 112 and ws_body[i + 1] <= 112:
-            gx, gy = ws_body[i], ws_body[i + 1]
-            # Determine which tile this kp belongs to (row-major 3×3).
-            # Use the first tile origin where (gx, gy) is in [origin, origin+57).
-            ti = (gy + 10) * 3 // h
-            tj = (gx + 10) * 3 // w
-            ti = max(0, min(2, ti)); tj = max(0, min(2, tj))
-            oy, ox = tile_origin(ti, tj, h, w)
-            # Tile-local subpix at integer (gx-ox, gy-oy).
-            lx = gx - ox; ly = gy - oy
-            tile = np.full((TILE, TILE), FILL, dtype=image_q16.dtype)
-            sy0, sx0 = max(0, oy), max(0, ox)
-            sy1, sx1 = min(h, oy + TILE), min(w, ox + TILE)
-            if sy1 > sy0 and sx1 > sx0:
-                tile[sy0 - oy:sy1 - oy, sx0 - ox:sx1 - ox] = \
-                    image_q16[sy0:sy1, sx0:sx1]
-            gradX, gradY = descriptor_gradient(tile)
-            sx_q16 = (lx * 65536) & 0xFFFFFFFF
-            sy_q16 = (ly * 65536) & 0xFFFFFFFF
-            orient = orient_d920(gradX, gradY, sx_q16, sy_q16)
-            desc = _descriptor_at(gradX, gradY, sx_q16, sy_q16, orient)
-            ws_body[i + 2:i + V30_RECORD_LEN] = bytes(desc)
-            i += V30_RECORD_LEN
+    # 2. Build v30 records: [u8 x][u8 y][16B desc].
+    records = [bytes((gx & 0xFF, gy & 0xFF)) + (desc[:16] if len(desc) >= 16
+                                                 else desc + bytes(16 - len(desc)))
+               for (gx, gy, _orient, desc) in kps]
 
+    # 3. Replace v30 regions in the reference WS body. Each region holds up
+    # to 250 records; pad with zeros if we have fewer.
+    regions = find_v30_regions(bytes(ws_body))
+    if not regions:
+        raise RuntimeError("no v30 regions found in reference template — "
+                            "is it from a 06cb:00a2 sensor?")
+    target_regions = regions if fill_all_sections else regions[:1]
+    for base in target_regions:
+        section_records_bytes = (
+            b''.join(records[:250]) + bytes(V30_RECORD_LEN) *
+            max(0, 250 - len(records))
+        )[:250 * V30_RECORD_LEN]
+        ws_body[base:base + len(section_records_bytes)] = section_records_bytes
+
+    # 4. Recompute TID over the new WS body, wrap in the envelope.
     ws_body_bytes = bytes(ws_body)
     tid = compute_tid(ws_body_bytes)
     return _build_envelope(subtype, ws_body_bytes, tid)
+
+
+# Legacy name kept for the dev/enroll_native.py CLI. Same as native_template
+# now (the splice-at-ref-coords variant was misleading — chip-acceptable
+# templates use OUR detected keypoints, not the reference's).
+native_template_via_splice = native_template
