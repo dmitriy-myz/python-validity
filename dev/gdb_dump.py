@@ -51,6 +51,9 @@ RVA_43D0 = 0x43D0     # descriptor-BLOB filler (opt-in) — see BlobEntryBP
 RVA_1A50 = 0x1A50     # feature EXTRACTOR (opt-in) — see ExtractEntryBP
 RVA_CE80 = 0xCE80     # Harris RESPONSE (opt-in) — see HarrisEntryBP
 RVA_FDF0 = 0xFDF0     # gradient I_x — its input is the ENHANCED image (opt-in)
+RVA_F250 = 0xF250     # DoH chain wrapper — rcx=tile (Q10) at entry, pre-smoothed
+                       #   in-place + DoH response builder. Hook captures the RAW
+                       #   tile that becomes the descriptor gradient (opt-in).
 RVA_10380 = 0x10380   # one separable filter pass (CC20 calls it 5×) (opt-in)
 RVA_CF90 = 0xCF90     # NMS / keypoint extractor (opt-in) — see NmsEntryBP
 RVA_D920 = 0xD920     # orientation per keypoint (opt-in) — see OrientEntryBP
@@ -879,6 +882,34 @@ class DescSamplesBP(gdb.Breakpoint):
 _gradin_calls = 0
 
 
+F250_ON = os.environ.get('GDB_DUMP_F250') == '1'
+F250_MAX = int(os.environ.get('GDB_F250_MAX', '64'))
+_f250_calls = 0
+
+
+class F250EntryBP(gdb.Breakpoint):
+    """sub_18000F250 entry: RCX=image (Q10 i32 in-place), RDX=w, R8d=h, R9=ctx.
+    Captures the RAW tile that becomes ctx[+0x50]+0x48 (= gradX_ptr) after
+    F250's in-place Gaussian smooth. Pair with descbrief_gradIn to derive the
+    pre-smoothing kernel byte-exact."""
+    def stop(self):
+        global _f250_calls
+        if _f250_calls >= F250_MAX:
+            return False
+        try:
+            img = _reg('rcx')
+            w = _reg('rdx') & 0xffffffff
+            h = _reg('r8') & 0xffffffff
+            i = _f250_calls
+            if 0 < w <= 512 and 0 < h <= 512:
+                _save('f250_raw_tile', f'call{i:03d}_{w}x{h}',
+                      _read_safe(img, w * h * 4))
+            _f250_calls += 1
+        except Exception as e:
+            print(f'[!] F250 entry failed: {e}')
+        return False
+
+
 class GradinEntryBP(gdb.Breakpoint):
     """sub_18000FDF0 entry: RCX=input image, R8d=w, R9d=h (int32 pixels).
     Dump the enhanced image the detector actually runs on."""
@@ -966,6 +997,9 @@ def main():
     if GRADIN_ON:
         GradinEntryBP('*' + hex(base + RVA_FDF0))
         print(f'[*] gradient-input hook ON (max {GRADIN_MAX} calls)')
+    if F250_ON:
+        F250EntryBP('*' + hex(base + RVA_F250))
+        print(f'[*] F250 raw-tile hook ON (max {F250_MAX} calls)')
     if G380_ON:
         G380EntryBP('*' + hex(base + RVA_10380))
         print(f'[*] sub_180010380 per-pass hook ON (max {G380_MAX} calls)')
