@@ -788,12 +788,16 @@ class DescBriefEntryBP(gdb.Breakpoint):
             try:
                 gs_ptr = _u64(ctx + 0x50)
                 if gs_ptr:
-                    gs = _read_safe(gs_ptr, 0x40)
+                    gs = _read_safe(gs_ptr, 0x100)     # extended: CC20 reads at +0x5c/+0x60
                     if len(gs) >= 0x30:
                         stride = int.from_bytes(gs[0:4], 'little', signed=True)
                         height = int.from_bytes(gs[4:8], 'little', signed=True)
                         gx_ptr = int.from_bytes(gs[0x20:0x28], 'little')
                         gy_ptr = int.from_bytes(gs[0x28:0x30], 'little')
+                        # Also try the "+0x48" buffer that CC20 reads (likely
+                        # the pre-smoothed image — same pre-pass input that
+                        # the descriptor gradients are derived from).
+                        in_ptr = int.from_bytes(gs[0x48:0x50], 'little') if len(gs) >= 0x50 else 0
                         n = max(0, stride) * max(0, height) * 4
                         # Signature = (height, stride, full gradX content hash).
                         # The leading bytes alone don't catch every transition
@@ -817,6 +821,9 @@ class DescBriefEntryBP(gdb.Breakpoint):
                             if 0 < n <= 256 * 256 * 4 and gy_ptr:
                                 _save('descbrief_gradY', f'{tag}_{stride}x{height}',
                                       _read_safe(gy_ptr, n))
+                            if 0 < n <= 256 * 256 * 4 and in_ptr:
+                                _save('descbrief_gradIn', f'{tag}_{stride}x{height}',
+                                      _read_safe(in_ptr, n))
                 # Aggregation table: capture once per unique ctx (the table
                 # itself is rebuilt by E6B0 — see sub_18000A5B0 — but identical
                 # contents across tiles, so address-dedupe is fine here).
