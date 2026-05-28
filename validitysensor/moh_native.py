@@ -805,21 +805,15 @@ FRAME_KP_CAP = 250
 follows the per-tile A960 edge cull."""
 
 
-RESP_CULL_THRESHOLD = 0
-"""Was set to 55500 as an empirical match for one captured frame's
-min-CAP-resp. Removed because that value is FRAME-SPECIFIC (it's just the
-resp of the 250th-ranked kp in that particular capture, not a static cull
-constant the DLL uses). On weak finger placements it left only ~100 valid
-kps with 150 zero-padded v30 records — the chip's matcher then treated
-the padding as wildcards, matching ANY finger against the stored template.
-
-Now relying on the global resp-desc sort + cap-to-250 to select the same
-top-250 the DLL keeps. For all 8 of 9 tiles in the captured frame the
-DLL's 250 cap kps all rank above the post-A960 extras by resp, so
-top-250-by-resp naturally selects them. Tile 8 has one anomalous
-high-resp extra (166619) that DLL drops — likely a corner-tile-specific
-extra cull not yet decoded; this drops match quality by 1-2 kps per
-frame, which is acceptable."""
+RESP_CULL_THRESHOLD = 55500
+"""Empirical: DLL drops kps with abs(resp) <= ~55500 even after A960's edge
+filter. Where this threshold comes from isn't pinned down — it's likely a
+dynamic resp cull somewhere between F300's D5D0 (subpix) and A960's edge
+filter. Verified against 2026-05-28 frame 0 capture: 250/250 cap kps
+have resp > 55500 and all kps below 55331 are EXTRA. Match-quality test
+will confirm whether this empirical rule is sufficient or if there's a
+position-dependent component (tile 8 had a 166619-resp EXTRA suggesting
+edge-tile-specific tightening)."""
 
 
 def _a960_passes_global_edge(sx_q16, sy_q16, oy, ox, h, w):
@@ -881,6 +875,8 @@ def extract_frame_native(image_q16, h=112, w=112,
                 sx_q16 = (lx * 65536) & 0xFFFFFFFF
                 sy_q16 = (ly * 65536) & 0xFFFFFFFF
             if not _a960_passes_global_edge(sx_q16, sy_q16, oy, ox, h, w):
+                continue
+            if score <= RESP_CULL_THRESHOLD:
                 continue
             pool.append((score, tile_id, ti, tj, sx_q16, sy_q16))
 
