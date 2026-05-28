@@ -822,7 +822,8 @@ class Sensor:
                        reference_template: bytes,
                        trailer: bytes = b'\x11',
                        update_cb: typing.Callable[[typing.Any, typing.Optional[Exception]], None] = lambda *a, **k: None,
-                       max_attempts: int = 6):
+                       max_attempts: int = 6,
+                       num_frames: int = 1):
         """Enroll a finger using the byte-exact native pipeline (no DLL).
 
         Captures one frame, builds a 23136-byte template via the native
@@ -862,36 +863,69 @@ class Sensor:
         if len(trailer) != 1:
             raise ValueError(f'trailer must be 1 byte, got {len(trailer)}')
 
+        from .moh_native import extract_frame_native
+        from .moh_extract import compute_tid, _build_envelope
+        from .moh_opencv import WS_SIZE, V30_RECORD_LEN, find_v30_regions
+        import struct
+
         last_err = None
         for attempt in range(max_attempts):
             try:
-                glow_start_scan()
-                x, y, w1, w2, img_data = self.capture(CaptureMode.ENROLL)
-                img = np.frombuffer(img_data, dtype=np.uint8).reshape(x, y)
-                img = np.transpose(img)         # sensor returns transposed
+                # 1. Capture N frames (default 1; multi-frame enrollment
+                # fills the WS body's 4 v30 sections with different per-
+                # frame data — the DLL uses 8 frames during a real enroll).
+                logging.info(f'enroll_native: capturing {num_frames} frame(s)...')
+                per_frame_kps = []
+                for f in range(num_frames):
+                    glow_start_scan()
+                    logging.info(f'  frame {f+1}/{num_frames}: place finger')
+                    x, y, w1, w2, img_data = self.capture(CaptureMode.ENROLL)
+                    glow_end_scan()
+                    img = np.frombuffer(img_data, dtype=np.uint8).reshape(x, y)
+                    img = np.transpose(img)
+                    if img.shape != (112, 112):
+                        try:
+                            import cv2
+                            img112 = cv2.resize(img, (112, 112),
+                                                interpolation=cv2.INTER_LINEAR)
+                        except ImportError:
+                            h, w = img.shape
+                            ys = (np.arange(112) * h // 112)
+                            xs = (np.arange(112) * w // 112)
+                            img112 = img[ys[:, None], xs[None, :]]
+                    else:
+                        img112 = img
+                    img_q16 = img112.astype(np.int32) << 16
 
-                # Resize 144→112 if needed
-                if img.shape != (112, 112):
-                    try:
-                        import cv2
-                        img112 = cv2.resize(img, (112, 112),
-                                            interpolation=cv2.INTER_LINEAR)
-                    except ImportError:
-                        h, w = img.shape
-                        ys = (np.arange(112) * h // 112)
-                        xs = (np.arange(112) * w // 112)
-                        img112 = img[ys[:, None], xs[None, :]]
-                else:
-                    img112 = img
+                    logging.info(f'  frame {f+1}: extracting features...')
+                    kps = extract_frame_native(img_q16, h=112, w=112)
+                    logging.info(f'  frame {f+1}: {len(kps)} kp(s)')
+                    per_frame_kps.append(kps)
 
-                # Convert to Q16 (mid-gray = 0x800000) — F250's input format
-                img_q16 = img112.astype(np.int32) << 16
+                # 2. Build envelope. Distribute frames across 4 v30 sections
+                # (round-robin if num_frames != 4). The reference's WS framing
+                # bytes stay (header, anchors, section counts).
+                logging.info('enroll_native: building envelope...')
+                ws_body = bytearray(reference_template[12:12 + WS_SIZE])
+                regions = find_v30_regions(bytes(ws_body))
+                for idx, base in enumerate(regions):
+                    src_frame = per_frame_kps[idx % len(per_frame_kps)]
+                    records_bytes = (
+                        b''.join(
+                            bytes((gx & 0xFF, gy & 0xFF)) + (desc[:16] if len(desc) >= 16
+                                                              else desc + bytes(16 - len(desc)))
+                            for (gx, gy, _o, desc) in src_frame[:250]
+                        )
+                        + bytes(V30_RECORD_LEN) * max(0, 250 - len(src_frame))
+                    )[:250 * V30_RECORD_LEN]
+                    ws_body[base:base + len(records_bytes)] = records_bytes
+                ws_body_bytes = bytes(ws_body)
+                tid = compute_tid(ws_body_bytes)
+                envelope = _build_envelope(subtype, ws_body_bytes, tid)
+                logging.info(f'  envelope: {len(envelope)} bytes')
 
-                envelope = native_template(img_q16, reference_template,
-                                            subtype=subtype)
-
-                # Store via the proven replay protocol (matches bisect_ws's
-                # send_finger pattern): typ=6 direct, storage=3, +trailer.
+                # 3. Store via the proven replay protocol.
+                logging.info('enroll_native: storing on chip...')
                 db.db_info()
                 assert_status(tls.cmd(blobs.db_write_enable()))
                 try:
@@ -907,7 +941,6 @@ class Sensor:
                     call_cleanups()
 
                 usb.wait_int()
-                glow_end_scan()
                 update_cb({'native': True, 'recid': recid}, None)
                 return recid
 
