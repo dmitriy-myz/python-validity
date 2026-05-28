@@ -754,15 +754,13 @@ class DescBriefEntryBP(gdb.Breakpoint):
             if ctx not in _db_ctx_seen:
                 _db_ctx_seen.add(ctx)
                 _save('descbrief_ctx', f'ctx{len(_db_ctx_seen)-1:03d}', _read_safe(ctx, 0x80))
-                # E090 reads ctx[+0x30] with stride 0x74 (=116, working-image width)
-                # so it's likely a pointer to the global gradient buffer
-                try:
-                    p30 = _u64(ctx + 0x30)
-                    if p30:
-                        _save('descbrief_buf30', f'ctx{len(_db_ctx_seen)-1:03d}',
-                              _read_safe(p30, 116 * 116 * 4))
-                except Exception:
-                    pass
+            # CORRECTED: E090's r8 (saved as r10) IS the gradient buffer (per
+            # disasm e5e7 [r10+rax*4] pixel sample, e0da imul·0x74 stride 116).
+            # Dump it once per unique r8 (constant per-tile).
+            if r8 and r8 not in _db_grad_seen:
+                _db_grad_seen.add(r8)
+                _save('descbrief_grad', f'grad{len(_db_grad_seen)-1:03d}',
+                      _read_safe(r8, 144 * 144 * 4))   # generous size, covers up to 144×144 i32
             DescBriefFinishBP(kp, i)
             _db_calls += 1
         except Exception as e:
@@ -771,6 +769,7 @@ class DescBriefEntryBP(gdb.Breakpoint):
 
 
 _db_ctx_seen = set()
+_db_grad_seen = set()
 
 
 # ─── Gradient input (sub_18000FDF0) — the enhanced image ────────────────
