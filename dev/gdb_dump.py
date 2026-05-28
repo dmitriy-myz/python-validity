@@ -258,17 +258,31 @@ _envelope_calls = 0
 
 class EnvelopeFinishBP(gdb.FinishBreakpoint):
     """At wrapper RETURN, the inner builder has finished writing to the
-    output struct. Read (size, ptr) from r8 (= AAB0 arg 3) and dump the
-    envelope bytes. This is the byte-exact oracle our native_template()
-    must reproduce."""
-    def __init__(self, r8, idx):
+    output struct. sub_180036840's prologue (`push rdi` + `sub rsp, 0x60`
+    = 0x68 shift) means its `[rsp+0x88]` reads back the R9 SHADOW (not
+    r8 as one might guess from naive arithmetic). So r9 = output struct,
+    *r9 = envelope size (i32), *(r9+8) = envelope pointer. The 0x47-cmd
+    sender downstream picks them up via the same struct."""
+    def __init__(self, r9, rcx, rdx, r8, idx):
         super().__init__(internal=True)
-        self.r8, self.idx = r8, idx
+        self.r9, self.rcx, self.rdx, self.r8 = r9, rcx, rdx, r8
+        self.idx = idx
 
     def stop(self):
         try:
-            size = _u32(self.r8)
-            ptr = _u64(self.r8 + 8)
+            # Try r9 first (correct per disasm); fall back to reading all
+            # 4 args' first dword to help debug if r9 is wrong on retry.
+            for label, p in [('r9', self.r9), ('r8', self.r8),
+                              ('rcx', self.rcx), ('rdx', self.rdx)]:
+                try:
+                    sz = _u32(p)
+                    pp = _u64(p + 8) if sz > 0 else 0
+                    print(f'    envelope #{self.idx} {label}=0x{p:x}: '
+                          f'size_lo=0x{sz:x} ptr=0x{pp:x}')
+                except Exception:
+                    pass
+            size = _u32(self.r9)
+            ptr = _u64(self.r9 + 8)
             if 0 < size <= 65536 and ptr:
                 _save('envelope', f'call{self.idx}_size{size}',
                       _read_safe(ptr, size))
@@ -283,9 +297,8 @@ class EnvelopeFinishBP(gdb.FinishBreakpoint):
 
 
 class EnvelopeEntryBP(gdb.Breakpoint):
-    """Entry on sub_180036590 (validator wrapper). r8 = output struct ptr;
-    after the inner sub_180036840 finishes, *r8 = size and *(r8+8) = env.
-    The wrapper's exit is when both are populated."""
+    """Entry on sub_180036590 (validator wrapper). r9 = output struct ptr;
+    after the inner sub_180036840 finishes, *r9 = size and *(r9+8) = env."""
     def stop(self):
         global _envelope_calls
         if _envelope_calls >= ENVELOPE_MAX:
@@ -297,7 +310,7 @@ class EnvelopeEntryBP(gdb.Breakpoint):
             r9 = _reg('r9')
             print(f'[*] envelope #{_envelope_calls}: rcx=0x{rcx:x} rdx=0x{rdx:x} '
                   f'r8=0x{r8:x} r9=0x{r9:x}')
-            EnvelopeFinishBP(r8, _envelope_calls)
+            EnvelopeFinishBP(r9, rcx, rdx, r8, _envelope_calls)
             _envelope_calls += 1
         except Exception as e:
             print(f'[!] envelope entry failed: {e}')
