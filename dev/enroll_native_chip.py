@@ -51,10 +51,11 @@ def main():
                     help='1-byte record-type marker appended to the wire '
                          'payload (default 0x11; per bisect_ws trailer-sweep '
                          'results, any value works)')
-    ap.add_argument('--frames', type=int, default=1,
-                    help='number of frames to capture and combine (default 1; '
-                         'try 4 to fill all v30 sections with distinct frame '
-                         'data — a real DLL enroll uses 8)')
+    ap.add_argument('--frames', type=int, default=4,
+                    help='number of finger placements to capture (default 4 = '
+                         'fills all 4 v30 sections with distinct frame data). '
+                         'For best multi-orientation recognition place finger '
+                         'differently each time — the prompts will guide you.')
     ap.add_argument('--match', action='store_true',
                     help='after enroll, capture again and try to identify')
     ap.add_argument('--dry-run', action='store_true',

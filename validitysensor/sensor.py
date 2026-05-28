@@ -875,10 +875,26 @@ class Sensor:
                 # fills the WS body's 4 v30 sections with different per-
                 # frame data — the DLL uses 8 frames during a real enroll).
                 logging.info(f'enroll_native: capturing {num_frames} frame(s)...')
+                # Each frame requires a fresh finger touch (capture() waits for
+                # the b[0]==2 interrupt = finger present). Prompts below
+                # suggest a different orientation per frame so the stored
+                # template covers placement variations — this is what gives
+                # the chip robust recognition at multiple angles.
+                ORIENTATION_HINTS = [
+                    'place finger FLAT',
+                    'place finger TILTED LEFT (~15°)',
+                    'place finger TILTED RIGHT (~15°)',
+                    'place finger ROLLED FORWARD (fingertip down)',
+                    'place finger ROLLED BACK (fingertip up)',
+                    'place finger SLIGHTLY OFF-CENTER LEFT',
+                    'place finger SLIGHTLY OFF-CENTER RIGHT',
+                    'place finger any position',
+                ]
                 per_frame_kps = []
                 for f in range(num_frames):
                     glow_start_scan()
-                    logging.info(f'  frame {f+1}/{num_frames}: place finger')
+                    hint = ORIENTATION_HINTS[f % len(ORIENTATION_HINTS)]
+                    logging.info(f'  frame {f+1}/{num_frames}: LIFT FINGER, then {hint}')
                     x, y, w1, w2, img_data = self.capture(CaptureMode.ENROLL)
                     glow_end_scan()
                     img = np.frombuffer(img_data, dtype=np.uint8).reshape(x, y)
