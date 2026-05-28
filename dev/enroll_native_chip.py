@@ -48,6 +48,14 @@ def main():
                     help='SID to enroll under (defaults to a fresh test SID)')
     ap.add_argument('--match', action='store_true',
                     help='after enroll, capture again and try to identify')
+    ap.add_argument('--dry-run', action='store_true',
+                    help='build the envelope but DO NOT store on chip; '
+                         'write it to /tmp/native_envelope.bin instead')
+    ap.add_argument('--store-ref', action='store_true',
+                    help='isolation test: store the reference template VERBATIM '
+                         '(no native processing) — should succeed if the chip '
+                         'is willing to accept the ref. If THIS fails, the '
+                         'problem is not our pipeline.')
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -72,6 +80,49 @@ def main():
     except RebootException:
         log.info('sensor rebooted — re-opening')
         open_device()
+
+    if args.dry_run:
+        # Capture + build envelope but don't talk to the chip.
+        from validitysensor.sensor import CaptureMode, glow_start_scan, glow_end_scan
+        from validitysensor.moh_native import native_template
+        import numpy as np
+        glow_start_scan()
+        log.info('place finger now (dry-run, will not store)')
+        x, y, w1, w2, img_data = Sensor.capture(CaptureMode.ENROLL)
+        glow_end_scan()
+        img = np.frombuffer(img_data, dtype=np.uint8).reshape(x, y)
+        img = np.transpose(img)
+        if img.shape != (112, 112):
+            try:
+                import cv2
+                img112 = cv2.resize(img, (112, 112), interpolation=cv2.INTER_LINEAR)
+            except ImportError:
+                ys = (np.arange(112) * img.shape[0] // 112)
+                xs = (np.arange(112) * img.shape[1] // 112)
+                img112 = img[ys[:, None], xs[None, :]]
+        else:
+            img112 = img
+        img_q16 = img112.astype(np.int32) << 16
+        envelope = native_template(img_q16, ref, subtype=subtype)
+        with open('/tmp/native_envelope.bin', 'wb') as f:
+            f.write(envelope)
+        log.info(f'✓ wrote /tmp/native_envelope.bin ({len(envelope)} bytes)')
+        log.info('  diff against ref:')
+        diff = sum(1 for a, b in zip(envelope, ref) if a != b)
+        log.info(f'    {diff}/{len(envelope)} bytes differ ({100*diff/len(envelope):.1f}%)')
+        return 0
+
+    if args.store_ref:
+        log.info(f'ISOLATION TEST: storing reference template verbatim...')
+        from validitysensor.db import db
+        usr = db.lookup_user(identity)
+        if usr is None:
+            usr = db.new_user(identity)
+        else:
+            usr = usr.dbid
+        recid = db.new_finger(usr, ref)
+        log.info(f'✓ stored ref verbatim, recid={recid}')
+        return 0
 
     log.info(f'enrolling subtype 0x{subtype:x} under SID {user_sid} ...')
     log.info('place finger now')
