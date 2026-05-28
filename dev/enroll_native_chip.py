@@ -89,8 +89,34 @@ def main():
         open_device()
 
     if args.list_users:
-        log.info('chip DB tree (find user dbids here):')
-        db.dump_raw()
+        log.info('chip user storage + enrolled users (find parent dbid here):')
+        try:
+            stg = db.get_user_storage(name='StgWindsor')
+            log.info(f'  StgWindsor: dbid={stg.dbid}, '
+                      f'{len(stg.users)} user(s)')
+            for u_meta in stg.users:
+                udbid = u_meta['dbid']
+                try:
+                    u = db.get_user(udbid)
+                    log.info(f'    user dbid={udbid} '
+                              f'identity={u.identity!r} '
+                              f'fingers={len(u.fingers)}')
+                    for f in u.fingers:
+                        log.info(f'      finger dbid={f["dbid"]} '
+                                  f'subtype=0x{f["subtype"]:02x}')
+                except Exception as e:
+                    log.info(f'    user dbid={udbid} (could not parse: {e})')
+        except Exception as e:
+            log.error(f'get_user_storage failed: {e}')
+            log.info('try dumping all roots 1..16:')
+            for r in range(1, 17):
+                try:
+                    rec = db.get_record_value(r)
+                    val = bytes(rec.value)
+                    log.info(f'  root {r}: type={rec.type} '
+                              f'val[:32]={val[:32].hex()}')
+                except Exception as ex:
+                    pass
         return 0
 
     if args.dry_run:
