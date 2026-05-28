@@ -924,7 +924,10 @@ class Sensor:
                 envelope = _build_envelope(subtype, ws_body_bytes, tid)
                 logging.info(f'  envelope: {len(envelope)} bytes')
 
-                # 3. Store via the proven replay protocol.
+                # 3. Store via the proven replay protocol.  No wait_int()
+                # — the typ=6-direct path doesn't emit an interrupt the
+                # way db.new_finger's typ=0xb-magic path does.  bisect_ws
+                # send_finger() doesn't wait either, and it works.
                 logging.info('enroll_native: storing on chip...')
                 db.db_info()
                 assert_status(tls.cmd(blobs.db_write_enable()))
@@ -940,7 +943,7 @@ class Sensor:
                 finally:
                     call_cleanups()
 
-                usb.wait_int()
+                logging.info(f'enroll_native: stored recid={recid}')
                 update_cb({'native': True, 'recid': recid}, None)
                 return recid
 
