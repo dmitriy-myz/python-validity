@@ -91,6 +91,25 @@ def _load_gradients():
     import re
     new_gs = glob.glob(os.path.join(DUMP, 'descbrief_gradstruct_*_t*_kp*.bin'))
     if new_gs:
+        # Restrict to the most-recent capture session. Each gradstruct file
+        # has its OWN epoch-ms timestamp (per-transition), so bracket the
+        # session by the kp_before kp0000..kp1023 range.
+        def _ts(p, kind='descbrief_gradstruct'):
+            m = re.search(rf'{kind}_(\d+)_', os.path.basename(p))
+            return int(m.group(1)) if m else 0
+        # Pin the session window to the MIN/MAX ts in kp_before *filenames*
+        # (mtime is unreliable — `_glob_one` would otherwise pick whatever
+        # gdb happened to flush last, not the chronologically last kp).
+        all_kpb = glob.glob(os.path.join(DUMP, 'descbrief_kp_before_*_kp*.bin'))
+        ts_lo = ts_hi = None
+        if all_kpb:
+            ts_vals = [_ts(p, 'descbrief_kp_before') for p in all_kpb]
+            ts_vals = [t for t in ts_vals if t]
+            if ts_vals:
+                ts_lo, ts_hi = min(ts_vals), max(ts_vals)
+        if ts_lo and ts_hi and ts_hi >= ts_lo:
+            ts_lo -= 1000          # gradstruct for tile 0 fires just before kp0
+            new_gs = [p for p in new_gs if ts_lo <= _ts(p) <= ts_hi + 1000]
         out = {}
         for gs_path in new_gs:
             m = re.search(r'_t(\d+)_kp(\d+)\.bin$', os.path.basename(gs_path))
@@ -104,8 +123,25 @@ def _load_gradients():
             if not (0 < stride <= 512 and 0 < height <= 512):
                 continue
             tag = re.search(r'(_t\d+_kp\d+)\.bin', os.path.basename(gs_path)).group(1)
-            gx_path = _glob_one(f'descbrief_gradX_*{tag}_{stride}x{height}.bin')
-            gy_path = _glob_one(f'descbrief_gradY_*{tag}_{stride}x{height}.bin')
+            # gradX/gradY are saved with the SAME ts as their gradstruct, so
+            # pin to gs_path's ts to keep sessions disjoint.
+            gs_ts = _ts(gs_path)
+            gx_path = _glob_one(f'descbrief_gradX_{gs_ts}{tag}_{stride}x{height}.bin')
+            gy_path = _glob_one(f'descbrief_gradY_{gs_ts}{tag}_{stride}x{height}.bin')
+            # gradX/gradY can drift 1-2 ms from gradstruct (separate _save
+            # calls). Fall back to fuzzy match: same tag, ts near gs_ts.
+            def _fuzzy(kind):
+                pat = os.path.join(DUMP, f'{kind}_*{tag}_{stride}x{height}.bin')
+                cands = [(_ts(p, kind), p) for p in glob.glob(pat)]
+                cands = [(t, p) for t, p in cands
+                         if t and ts_lo and ts_hi and ts_lo <= t <= ts_hi + 1000]
+                if not cands:
+                    return None
+                return min(cands, key=lambda c: abs(c[0] - gs_ts))[1]
+            if gx_path is None:
+                gx_path = _fuzzy('descbrief_gradX')
+            if gy_path is None:
+                gy_path = _fuzzy('descbrief_gradY')
             if gx_path is None or gy_path is None:
                 continue
             gx = np.frombuffer(open(gx_path, 'rb').read(),
