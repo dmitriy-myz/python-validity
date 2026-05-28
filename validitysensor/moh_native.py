@@ -7,6 +7,7 @@ Pipeline (all stages classical CV; no proprietary enhancement):
       → 3×3 grid of 57×57 tiles (mid-gray pad)          [tile_image]      DONE
       → per tile: Q12 Determinant-of-Hessian → Ixx/Iyy/Ixy/resp [doh]    BYTE-EXACT (interior)
       → 8-neighbour NMS → keypoints                      [nms]            BYTE-EXACT
+      → subpix refine (Hessian-Newton, cull failures)   [subpix_refine]  BYTE-EXACT (NEW)
       → BRIEF bit-pack (per-kp 128 binary tests)         [brief_pack]     BYTE-EXACT
       → orientation (Gaussian-weighted grad histogram)   [orientation]    decoded; impl WIP
       → oriented BRIEF descriptor                        [descriptor]     decoded; impl WIP
@@ -260,6 +261,85 @@ def nms(resp, t_lo=671, t_hi=168, dedup_q=72064, margin=10):
             elif s > kps[dup][0]:
                 kps[dup] = (s, x, y)
     return kps
+
+
+# ─── subpix refinement — sub_18000D5D0 + sub_18000D4C0 (byte-exact port) ─
+# After NMS, each (integer) keypoint goes through a Hessian-Newton subpixel
+# refinement on the response map. 9 resp values around (x,y) build a
+# symmetric Hessian + gradient (with specific SAR shifts), a 2×2 Cramer
+# solver finds the apex offset (Δx, Δy) in 1/128-pixel units, and the result
+# is written back as Q16 — OR the keypoint is REMOVED entirely if the system
+# is singular or |Δ| > 1 pixel (D5D0 calls sub_18000D570 memmove-down).
+#
+# Math (each shift mirrors a specific instruction in D5D0):
+#   dxx = (L + R - 2C) >> 2                                  [d6ee]
+#   dyy = (T + B - 2C) >> 2                                  [d6dd]
+#   dxy = (((BR+TL)>>2) - ((BL+TR)>>2)) >> 2                   [d6d7..d6f6, two-stage]
+#   dx_neg = -((R - L) >> 1) >> 2                              [d6b6,d6f9,d710]
+#   dy_neg = -((B - T) >> 1) >> 2                              [d6da,d6e4,d6f2]
+# D4C0 (Cramer): a,b,c,d,e,f are coeffs >>4'd, det = (a*d-b*c)>>7, then
+#   Δx = (d*e - f*c) // det ;  Δy = (b*e - f*a) // (-det)
+# All arithmetic is signed 32-bit truncating (idiv = trunc-toward-zero).
+def _solve_2x2_d4c0(coeffs):
+    """sub_18000D4C0 — Cramer 2×2 solver. Returns (Δx, Δy) or None on
+    singular Hessian. `coeffs` = [a, b, c, d, e, f] (i32 each)."""
+    a, b, c, d, e, f = [_sar32(v, 4) for v in coeffs]
+    det_pos = _sar32(_imul32(a, d) - _imul32(b, c), 7)
+    det_neg = _sar32(_imul32(b, c) - _imul32(a, d), 7)
+    if det_pos == 0 or det_neg == 0:
+        return None
+    num_x = _imul32(d, e) - _imul32(f, c)
+    num_y = _imul32(b, e) - _imul32(f, a)
+    return _idiv32(num_x, det_pos), _idiv32(num_y, det_neg)
+
+
+def subpix_refine_kp(resp, x_int, y_int, scale_shift=0):
+    """sub_18000D5D0 — subpixel refine a single integer keypoint.
+    Returns (x_q16, y_q16) or None if the kp should be removed.
+    `scale_shift` = ctx[+0x50]+0x60 (typically 0 on 06cb:00a2)."""
+    h, w = resp.shape
+    if not (1 <= x_int <= w - 2 and 1 <= y_int <= h - 2):
+        return None
+    cV = _s32(int(resp[y_int,     x_int]))
+    L  = _s32(int(resp[y_int,     x_int - 1]))
+    R  = _s32(int(resp[y_int,     x_int + 1]))
+    T  = _s32(int(resp[y_int - 1, x_int]))
+    B  = _s32(int(resp[y_int + 1, x_int]))
+    TL = _s32(int(resp[y_int - 1, x_int - 1]))
+    TR = _s32(int(resp[y_int - 1, x_int + 1]))
+    BL = _s32(int(resp[y_int + 1, x_int - 1]))
+    BR = _s32(int(resp[y_int + 1, x_int + 1]))
+    dxx = _sar32(_s32(L + R - 2 * cV), 2)
+    dyy = _sar32(_s32(T + B - 2 * cV), 2)
+    dxy = _sar32(
+        _s32(_sar32(_s32(BR + TL), 2) - _sar32(_s32(BL + TR), 2)),
+        2,
+    )
+    dx_neg = _sar32(_s32(-_sar32(_s32(R - L), 1)), 2)
+    dy_neg = _sar32(_s32(-_sar32(_s32(B - T), 1)), 2)
+    res = _solve_2x2_d4c0([dxx, dxy, dxy, dyy, dx_neg, dy_neg])
+    if res is None:
+        return None
+    dx, dy = res
+    if not (-0x80 <= dx <= 0x80 and -0x80 <= dy <= 0x80):
+        return None
+    scale_mul = 1 << scale_shift
+    x_q16 = (((x_int << 7) + dx) << 9) * scale_mul
+    y_q16 = (((y_int << 7) + dy) << 9) * scale_mul
+    return x_q16, y_q16
+
+
+def subpix_refine_kps(resp, kps, scale_shift=0):
+    """sub_18000D5D0 driver — refine all NMS keypoints, CULL failures.
+    `kps`: list of (score, x_int, y_int) from `nms()`.
+    Returns: list of (score, x_q16, y_q16). Length ≤ input (failed kps
+    are removed, exactly like the DLL's sub_18000D570 memmove-down)."""
+    out = []
+    for s, x, y in kps:
+        r = subpix_refine_kp(resp, x, y, scale_shift)
+        if r is not None:
+            out.append((s, r[0], r[1]))
+    return out
 
 
 # NEXT after NMS: orientation (sub_18000D920) + oriented BRIEF (sub_18000E090).
