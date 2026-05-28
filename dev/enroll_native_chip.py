@@ -184,8 +184,15 @@ def main():
     log.info(f'✓ native enrollment stored, recid={recid}')
 
     if args.match:
-        log.info('now place the SAME finger to verify the chip matches ...')
-        usrid, subtype_out, hsh = Sensor.match_finger()
+        log.info('LIFT FINGER, then place the SAME finger to verify the chip matches ...')
+        # Use Sensor.identify() not Sensor.match_finger(): identify() does a
+        # capture(IDENTIFY) first (which waits for the b[0]==2 finger-present
+        # interrupt) and then calls match_finger(). match_finger() alone just
+        # sends cmd 0x5e and waits for the result interrupt — the chip
+        # processes whatever the sensor state is RIGHT NOW (stale/empty),
+        # which is why the bare match always returned "Finger not recognized".
+        usrid, subtype_out, hsh = Sensor.identify(
+            lambda e: log.warning(f'identify capture retry: {e}'))
         log.info(f'✓ chip matched: usrid={usrid}, subtype=0x{subtype_out:x}')
         log.info(f'  → native pipeline produces chip-acceptable templates!')
 

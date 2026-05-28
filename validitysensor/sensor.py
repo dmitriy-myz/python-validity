@@ -877,9 +877,31 @@ class Sensor:
                 logging.info(f'enroll_native: capturing {num_frames} frame(s)...')
                 per_frame_kps = []
                 for f in range(num_frames):
-                    glow_start_scan()
-                    logging.info(f'  frame {f+1}/{num_frames}: place finger')
-                    x, y, w1, w2, img_data = self.capture(CaptureMode.ENROLL)
+                    # Per-frame retry: if the sensor errors mid-capture
+                    # (e.g. "Scanning problem: 8080000" — finger lifted too
+                    # early), retry JUST this frame instead of restarting
+                    # the whole enrollment.
+                    for frame_attempt in range(max_attempts):
+                        glow_start_scan()
+                        logging.info(f'  frame {f+1}/{num_frames}: place finger')
+                        try:
+                            x, y, w1, w2, img_data = self.capture(CaptureMode.ENROLL)
+                            break
+                        except usb_core.USBError:
+                            glow_end_scan()
+                            raise
+                        except CancelledException:
+                            glow_end_scan()
+                            raise
+                        except Exception as e:
+                            glow_end_scan()
+                            logging.warning(f'  frame {f+1} capture failed '
+                                              f'(attempt {frame_attempt+1}/'
+                                              f'{max_attempts}): {e}')
+                            if frame_attempt + 1 == max_attempts:
+                                raise
+                            from time import sleep as _sleep
+                            _sleep(0.1)
                     glow_end_scan()
                     img = np.frombuffer(img_data, dtype=np.uint8).reshape(x, y)
                     img = np.transpose(img)
