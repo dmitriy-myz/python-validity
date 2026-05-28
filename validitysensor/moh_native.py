@@ -423,6 +423,90 @@ def descriptor_gradient(tile_q16):
     return gradX, gradY
 
 
+# ─── tile→global merge + v30 assembly ──────────────────────────────────
+# sub_18000A910 — coordinate transform (called from sub_18000A960 per kp):
+#     gx_int = ((tile_offset_x_diff << 16) + subpix_x_q16) >> 16
+#     gy_int = ((tile_offset_y_diff << 16) + subpix_y_q16) >> 16
+# Equivalent to `gx_int = tile_offset_x + (subpix_x_q16 sar 16)`. The
+# (sar 16) matches Python's signed >> on int.
+#
+# sub_18000A960 — the per-tile→global merge:
+#  1. For each kp in the tile's list: run A910 to get (gx_int, gy_int).
+#  2. Bound check: 3 ≤ gx < W-3 AND 3 ≤ gy < H-3   (W=H=112 for 06cb:00a2).
+#  3. If in bounds: copy the FULL 32-byte kp record to the destination list
+#     verbatim (subpix stays in tile-local frame; only the bound check
+#     uses the global coord). r14d/r15d are tile-edge adjustment offsets
+#     computed from byte flags at A960's arg5 — likely for handling
+#     keypoints near a tile boundary; not yet ported (no observed effect
+#     in the captures we have).
+#
+# v30 record format (per memory + the captured 18-byte structure):
+#     [u8 x][u8 y][16 B descriptor]                                  18 bytes
+# x, y are the GLOBAL INTEGER coordinates (= the A910 output).
+# Body = 250 records × 18 = 4500 bytes + ~17 B lead-in + ~16 B trailer.
+# Header = [u16 tag=4][u16 len=4533][8 zeros].
+
+
+def tile_origin_yx(i, j, h, w):
+    """Top-left (row, col) of tile (i, j) in the 3×3 grid. Re-export of
+    tile_image's internal `tile_origin` formula so callers can use it
+    independently of the iteration."""
+    return tile_origin(i, j, h, w)
+
+
+def merge_tile_kps_to_global(per_tile_kps, h, w, margin=3):
+    """Merge per-tile keypoint lists into a single global list, applying
+    the DLL's bound check (margin ≤ global_xy < dim-margin).
+
+    `per_tile_kps`: iterable of (i, j, kp_list) where (i, j) is the tile
+        grid position (matches tile_image) and kp_list is iterable of
+        records whose first two fields are (subpix_x_q16, subpix_y_q16).
+        Any remaining fields are preserved unchanged.
+
+    Returns: list of (gx_int, gy_int, *rest) tuples, in tile-by-kp order
+        (matches sub_18000A960's iteration). Keypoints failing the bound
+        check are dropped."""
+    out = []
+    for i, j, kp_list in per_tile_kps:
+        oy, ox = tile_origin(i, j, h, w)
+        for kp in kp_list:
+            sx_q16, sy_q16 = kp[0], kp[1]
+            # signed >> 16 matches the DLL's A910 arithmetic.
+            gx = ox + (sx_q16 >> 16)
+            gy = oy + (sy_q16 >> 16)
+            if margin <= gx < w - margin and margin <= gy < h - margin:
+                out.append((gx, gy, *kp[2:]))
+    return out
+
+
+def build_v30(global_kps, max_records=250, tag=4, body_len=4533):
+    """Build the 18-byte-per-record v30 buffer that goes into a frame
+    section. Layout matches the captured v30: 12 B header + body_len
+    payload (~17 B lead-in zeros + N × 18 B records + trailer zeros).
+
+    `global_kps`: list of (gx_int, gy_int, ..., desc_16B) from
+        merge_tile_kps_to_global. Only x, y, and descriptor are used —
+        orient/quality stay in the per-kp records elsewhere.
+
+    Returns: bytes object of (12 + body_len) bytes."""
+    header = bytes([tag & 0xFF, (tag >> 8) & 0xFF,
+                    body_len & 0xFF, (body_len >> 8) & 0xFF]) + bytes(8)
+    body = bytearray(body_len)
+    # 17-byte zero lead-in (matches the captured records — empirical;
+    # disasm of the v30 packer is pending).
+    rec_offset = 17
+    for kp in global_kps[:max_records]:
+        gx, gy = kp[0], kp[1]
+        desc = kp[-1]                        # last field is the 16-byte descriptor
+        if not isinstance(desc, (bytes, bytearray)):
+            desc = bytes(desc)
+        body[rec_offset]     = gx & 0xFF
+        body[rec_offset + 1] = gy & 0xFF
+        body[rec_offset + 2:rec_offset + 18] = desc[:16]
+        rec_offset += 18
+    return header + bytes(body)
+
+
 # ─── E090 oriented-BRIEF descriptor — disasm-decoded; impl pending capture ─
 # E090 reads gradient buffers from *(ctx[+0x50]): a struct with i32 stride@+0,
 # i32 height@+4, qword gradX_ptr@+0x20, qword gradY_ptr@+0x28. (E090's r8
