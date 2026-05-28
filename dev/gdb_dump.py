@@ -721,14 +721,19 @@ _db_calls = 0
 
 
 class DescBriefFinishBP(gdb.FinishBreakpoint):
-    def __init__(self, kp, out, idx):
+    def __init__(self, kp, idx):
         super().__init__(internal=True)
-        self.kp, self.out, self.idx = kp, out, idx
+        self.kp, self.idx = kp, idx
 
     def stop(self):
         try:
-            _save('descbrief_kp_after', f'kp{self.idx:04d}', _read_safe(self.kp, 32))
-            _save('descbrief_out', f'kp{self.idx:04d}', _read_safe(self.out, 16))
+            # the descriptor buffer pointer is *(u64*)kp_ptr (per e665: `mov r8,[rbx]`
+            # then `[r9+r8] |= bit`); dereference to capture the 16B descriptor.
+            kp_after = _read_safe(self.kp, 64)    # also widen to 64B in case the
+            _save('descbrief_kp_after', f'kp{self.idx:04d}', kp_after)
+            if len(kp_after) >= 8:
+                desc_ptr = int.from_bytes(kp_after[:8], 'little')
+                _save('descbrief_desc', f'kp{self.idx:04d}', _read_safe(desc_ptr, 16))
         except Exception as e:
             print(f'[!] descbrief finish failed: {e}')
         return False
@@ -743,13 +748,22 @@ class DescBriefEntryBP(gdb.Breakpoint):
         if _db_calls >= DESC_BRIEF_MAX:
             return False
         try:
-            kp = _reg('rcx'); ctx = _reg('rdx'); out = _reg('r9')
+            kp = _reg('rcx'); ctx = _reg('rdx'); r8 = _reg('r8')
             i = _db_calls
-            _save('descbrief_kp_before', f'kp{i:04d}', _read_safe(kp, 32))
+            _save('descbrief_kp_before', f'kp{i:04d}', _read_safe(kp, 64))
             if ctx not in _db_ctx_seen:
                 _db_ctx_seen.add(ctx)
                 _save('descbrief_ctx', f'ctx{len(_db_ctx_seen)-1:03d}', _read_safe(ctx, 0x80))
-            DescBriefFinishBP(kp, out, i)
+                # E090 reads ctx[+0x30] with stride 0x74 (=116, working-image width)
+                # so it's likely a pointer to the global gradient buffer
+                try:
+                    p30 = _u64(ctx + 0x30)
+                    if p30:
+                        _save('descbrief_buf30', f'ctx{len(_db_ctx_seen)-1:03d}',
+                              _read_safe(p30, 116 * 116 * 4))
+                except Exception:
+                    pass
+            DescBriefFinishBP(kp, i)
             _db_calls += 1
         except Exception as e:
             print(f'[!] descbrief entry failed: {e}')
