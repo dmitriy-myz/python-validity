@@ -121,6 +121,10 @@ def _idiv32(a, b):
     a, b = _s32(a), _s32(b)
     q = abs(a) // abs(b)
     return -q if (a < 0) ^ (b < 0) else q
+def _imul32(a, b):
+    """x86 IMUL r32, r32: 32-bit signed multiply, result truncated to i32."""
+    p = (_s32(a) * _s32(b)) & (_M32 - 1)
+    return p - _M32 if p & 0x80000000 else p
 
 
 # ─── kernel builders (byte-exact vs the DLL; see dev/port_gradient.py) ────
@@ -259,6 +263,120 @@ def nms(resp, t_lo=671, t_hi=168, dedup_q=72064, margin=10):
 
 
 # NEXT after NMS: orientation (sub_18000D920) + oriented BRIEF (sub_18000E090).
+
+
+# ─── D920 orientation — BYTE-EXACT (per-keypoint dominant gradient angle) ─
+# sub_18000D920(rcx=kp_ptr, rdx=ctx, r8=scratch) writes kp[+0xa]=quality byte
+# and kp[+0xc]=orient_q16 (i32, [0, 2π·~) at 0x6487E ≈ 2π·65536 scale).
+#
+# Algorithm (per disasm 0x18000D920..DF13):
+#   1. Sample 13×13 patch centred on the ROUNDED subpix coord — `cx = (sx +
+#      0x8000) >> 16`. (Truncating cy=sy>>16 gives off-by-one for fractional
+#      subpix.) Apply a circular mask: keep pixels with dx²+dy² < 36.
+#      For each in-circle pixel:
+#        ggx = ((gradX[y,x] >> 10) * GAUSS_Q[|dy|,|dx|]) >> 4
+#        ggy = ((gradY[y,x] >> 10) * GAUSS_Q[|dy|,|dx|]) >> 4
+#        angle = fast_atan2(ggy, ggx)            (sub_1800030A0)
+#        bin   = trunc-toward-zero(angle / 9830) (signed-div magic constant
+#                                                 0x6AAAAABD, shift 56-12)
+#      Smear: each pixel votes its (ggx, ggy) into bins (bin-6, bin-5, ...,
+#      bin) — 7 bins to the LEFT of (and including) the primary bin.
+#   2. Accumulate two 42-bin histograms H_gx[bin] and H_gy[bin].
+#   3. Find max bin by (H_gx>>13)² + (H_gy>>13)².
+#   4. Refine: orient_q16 = precise_atan2(H_gx[max]>>10, H_gy[max]>>10)
+#      (sub_180003150, a thin 4-quadrant wrapper around fast_atan2).
+#
+# Validated 1000/1024 byte-exact against orient_after kp[+0xc] (the 24
+# unmatched are tiles past F250_MAX with no captured raw tile — algorithm
+# matches every keypoint that has a derived gradient).
+
+
+def _fast_atan2(gy_in, gx_in):
+    """sub_1800030A0: fixed-point atan2 returning angle in [0, ~408960]
+    (full-circle scale ~2π·65086). Args ordered as (y, x). Strict <0
+    sign branches — `jns` jumps if non-negative, NOT if ≤0."""
+    r10d = _s32(gx_in); r11d = _s32(gy_in)
+    r8d = r10d if r10d > 0 else _s32(-r10d)
+    r9d = r11d if r11d > 0 else _s32(-r11d)
+    if r8d < r9d: eax = r8d; ecx = r9d
+    else:         eax = r9d; ecx = r8d
+    ecx = _s32(ecx + 1)
+    eax = _s32(eax << 8)
+    if ecx == 0:
+        return 0
+    q = abs(eax) // abs(ecx); sgn = (eax < 0) ^ (ecx < 0)
+    eax = _s32(-q if sgn else q)
+    eax = _s32(eax << 8); ecx_tan = eax
+    eax = _sar32(eax, 4); ecx = _sar32(ecx_tan, 6)
+    ecx = _imul32(ecx, ecx); ecx = _sar32(ecx, 4); ecx = _sar32(ecx, 4)
+    edx = _imul32(ecx, 0xFFFFF5D7); edx = _sar32(edx, 12); edx = _s32(edx + 0x23A7)
+    edx = _imul32(edx, ecx);        edx = _sar32(edx, 12); edx = _s32(edx - 0x4AAC)
+    edx = _imul32(edx, ecx);        edx = _sar32(edx, 12); edx = _s32(edx + 0xE522)
+    edx = _imul32(edx, eax);        edx = _sar32(edx, 6)
+    if r8d < r9d: edx = _s32(0x5A0000 - edx)
+    if r10d < 0:  edx = _s32(0xB40000 - edx)
+    if r11d < 0:  edx = _s32(0x1680000 - edx)
+    edx = _sar32(edx, 8); edx = _imul32(edx, 0x47); edx = _sar32(edx, 4)
+    return _s32(edx)
+
+
+def _precise_atan2(gx, gy):
+    """sub_180003150(rcx=gx, rdx=gy): 4-quadrant atan2 in [0, 2π·65536).
+    Wraps _fast_atan2 with sign-aware combinators (0x3243F = π·65536,
+    0x6487E ≈ 2π·65536). Returns the orient_q16 stored at kp[+0xc]."""
+    gx = _s32(gx); gy = _s32(gy)
+    if gx >= 0:
+        if gy >= 0: return _fast_atan2(gy, gx)
+        else:       return _s32(0x6487E - _fast_atan2(-gy, gx))
+    else:
+        if gy >= 0: return _s32(0x3243F - _fast_atan2(gy, -gx))
+        else:       return _s32(0x3243F + _fast_atan2(-gy, -gx))
+
+
+def _angle_to_bin(ang):
+    """Signed-div magic-constant emulation: bin ≈ ang / 9830, trunc-toward-
+    zero (matches the DLL's `imul 0x6AAAAABD; sar edx,24; shr eax,31; add`)."""
+    ecx_shifted = _s32((_s32(ang) << 12) & 0xFFFFFFFF)
+    prod = _s32(ecx_shifted) * 0x6AAAAABD
+    edx_hi = (prod >> 32) & 0xFFFFFFFF
+    if edx_hi & 0x80000000: edx_hi -= 0x100000000
+    edx = _sar32(edx_hi, 24)
+    return _s32(edx + (1 if edx < 0 else 0))
+
+
+def orient_d920(gradX, gradY, subpix_x_q16, subpix_y_q16):
+    """Reproduce sub_18000D920's kp[+0xc] orient_q16 byte-exact.
+
+    `gradX, gradY` are the i32 first-derivative buffers at ctx[+0x50]+0x20/
+    +0x28 (same buffers E090 reads — see descriptor_gradient()). `subpix_*`
+    are kp[+0x14, +0x18] in Q16. Returns the i32 orient_q16."""
+    W = gradX.shape[1]; H = gradX.shape[0]
+    cx = (subpix_x_q16 + 0x8000) >> 16     # ROUNDED, not truncated
+    cy = (subpix_y_q16 + 0x8000) >> 16
+    H_gx = [0] * 42
+    H_gy = [0] * 42
+    for dy in range(-6, 7):
+        for dx in range(-6, 7):
+            if dy * dy + dx * dx >= 36:    # circular mask, radius 6
+                continue
+            y = cy + dy; x = cx + dx
+            if not (0 <= y < H and 0 <= x < W):
+                continue
+            w = int(GAUSS_Q[abs(dy), abs(dx)])
+            ggx = _imul32(_s32(int(gradX[y, x])) >> 10, w); ggx = _sar32(ggx, 4)
+            ggy = _imul32(_s32(int(gradY[y, x])) >> 10, w); ggy = _sar32(ggy, 4)
+            b = _angle_to_bin(_fast_atan2(ggy, ggx))
+            for k in range(7):             # 7-bin smear: bin-6 .. bin
+                sb = (b + 36 + k) % 42
+                H_gx[sb] = _s32(H_gx[sb] + ggx)
+                H_gy[sb] = _s32(H_gy[sb] + ggy)
+    maxbin = 0; maxmag = 0
+    for i in range(42):
+        a = _sar32(H_gx[i], 13); b = _sar32(H_gy[i], 13)
+        m = _s32(_imul32(a, a) + _imul32(b, b))
+        if m > maxmag:
+            maxmag = m; maxbin = i
+    return _precise_atan2(_sar32(H_gx[maxbin], 10), _sar32(H_gy[maxbin], 10))
 
 
 # ─── Descriptor gradient pair — BYTE-EXACT (interior, dist≥3 from edge) ───
