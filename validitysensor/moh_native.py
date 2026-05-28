@@ -673,3 +673,141 @@ def brief_pack(samples, table=None, count=128):
     b = samples[table[:count, 1]]
     bits = (a > b).astype(np.uint8)
     return np.packbits(bits, bitorder='little')   # → 16-byte descriptor
+
+
+# ─── End-to-end frame extraction (single image → kp list with descriptors) ─
+# Wires the byte-exact stages into one call.  Each per-tile pipeline runs:
+#   raw_tile_q16 → descriptor_gradient → DoH → NMS → per-kp (D920 + E090)
+# Then per-tile lists are merged into a global list with bound filtering.
+
+_AGGR_TABLE = None
+_WIN_SIZES = [7, 5, 3]      # the small local table at [rsp+0x78..] in E090
+
+
+def _load_aggr_table():
+    global _AGGR_TABLE
+    if _AGGR_TABLE is None:
+        import os
+        p = os.path.join(os.path.dirname(__file__), 'aggr_table.bin')
+        _AGGR_TABLE = np.frombuffer(open(p, 'rb').read()[:29 * 12],
+                                    dtype=np.int32).reshape(29, 3)
+    return _AGGR_TABLE
+
+
+def _descriptor_at(gradX, gradY, subpix_x_q16, subpix_y_q16, orient_q16):
+    """Compute the 16-byte BRIEF descriptor at a keypoint via the byte-exact
+    E090 pipeline. Internal helper for extract_frame_native."""
+    idx = orient_to_index(orient_q16) % 360
+    rgx, rgy = desc_sample_rotate(gradX, gradY, subpix_x_q16, subpix_y_q16,
+                                  idx, N=7)
+    samples = desc_aggregate(rgx, rgy, _load_aggr_table(), _WIN_SIZES, N=7)
+    return brief_pack(samples)
+
+
+def extract_frame_native(image_q16, h=112, w=112,
+                          t_lo=671, t_hi=168, dedup_q=72064, nms_margin=10):
+    """Single-frame native feature extractor.
+
+    Args:
+        image_q16: int32 array of shape (h, w), mid-gray = 0x800000. This is
+            the exact buffer F250 receives at rcx (Q16 image).
+
+    Returns:
+        list of (gx_int, gy_int, orient_q16, desc_16B) tuples — the global
+        keypoint list after the A960 bound filter. Use build_v30() to format
+        as a v30 record array."""
+    image_q16 = np.asarray(image_q16, dtype=np.int64)
+    assert image_q16.shape == (h, w), \
+        f"expected ({h}, {w}), got {image_q16.shape}"
+
+    per_tile_kps = []
+    for ti, tj, tile in tile_image(image_q16):
+        # Tile is Q16. Compute the descriptor gradient (CC20 first-pass on
+        # the F250 pre-smooth of the tile) — gradX, gradY are the buffers
+        # E090 and D920 read.
+        gradX, gradY = descriptor_gradient(tile)
+        # DoH front-end → response map → NMS keypoints (tile-local).
+        _, _, _, resp = doh(tile)
+        kps_local = nms(resp, t_lo=t_lo, t_hi=t_hi, dedup_q=dedup_q,
+                        margin=nms_margin)
+        records = []
+        for score, lx, ly in kps_local:
+            # Integer subpix (NMS gives pixel-centered coords; subpix
+            # refinement is a TODO — the DLL does parabolic fit somewhere
+            # we haven't fully ported).
+            sx_q16 = (lx * 65536) & 0xFFFFFFFF
+            sy_q16 = (ly * 65536) & 0xFFFFFFFF
+            orient = orient_d920(gradX, gradY, sx_q16, sy_q16)
+            desc = _descriptor_at(gradX, gradY, sx_q16, sy_q16, orient)
+            records.append((sx_q16, sy_q16, orient, bytes(desc)))
+        per_tile_kps.append((ti, tj, records))
+
+    return merge_tile_kps_to_global(per_tile_kps, h, w)
+
+
+def native_template_via_splice(image_q16, reference_template, subtype=None):
+    """End-to-end native template generator using a reference template as
+    the WS-body scaffold. Replaces every v30 record region in the reference
+    with descriptors computed by the native pipeline AT THE REFERENCE'S
+    KEYPOINT COORDINATES, then recomputes the TID.
+
+    This bypasses the multi-frame accumulation + WS body assembly we
+    haven't fully decoded — useful as a first end-to-end smoke test: if
+    the chip accepts the result, the byte-exact native descriptor matches
+    the DLL's at given coords.
+
+    Args:
+        image_q16: (h, w) int32 Q16 image (mid-gray = 0x800000).
+        reference_template: bytes of a previously-stored (chip-accepted)
+            23136-byte template envelope.
+        subtype: override subtype (default: take from reference at offset 0).
+
+    Returns:
+        bytes of a new 23136-byte envelope with our descriptors and
+        recomputed TID."""
+    from .moh_extract import compute_tid, _build_envelope
+    from .moh_opencv import (WS_SIZE, V30_RECORD_LEN, find_v30_regions,
+                              build_v30_record)
+    import struct
+
+    if subtype is None:
+        subtype = struct.unpack_from('<H', reference_template, 0)[0]
+
+    ws_body = bytearray(reference_template[12:12 + WS_SIZE])
+    assert len(ws_body) == WS_SIZE, f"WS body must be {WS_SIZE}B, got {len(ws_body)}"
+
+    h, w = image_q16.shape
+
+    # For each v30 record region in the reference WS, replace each record's
+    # descriptor with the byte-exact one computed from our image at that
+    # record's (x, y). Coords stay the same — only the descriptor changes.
+    for base in find_v30_regions(bytes(ws_body)):
+        i = base
+        while i + V30_RECORD_LEN <= len(ws_body) and \
+              0 < ws_body[i] <= 112 and ws_body[i + 1] <= 112:
+            gx, gy = ws_body[i], ws_body[i + 1]
+            # Determine which tile this kp belongs to (row-major 3×3).
+            # Use the first tile origin where (gx, gy) is in [origin, origin+57).
+            ti = (gy + 10) * 3 // h
+            tj = (gx + 10) * 3 // w
+            ti = max(0, min(2, ti)); tj = max(0, min(2, tj))
+            oy, ox = tile_origin(ti, tj, h, w)
+            # Tile-local subpix at integer (gx-ox, gy-oy).
+            lx = gx - ox; ly = gy - oy
+            tile = np.full((TILE, TILE), FILL, dtype=image_q16.dtype)
+            sy0, sx0 = max(0, oy), max(0, ox)
+            sy1, sx1 = min(h, oy + TILE), min(w, ox + TILE)
+            if sy1 > sy0 and sx1 > sx0:
+                tile[sy0 - oy:sy1 - oy, sx0 - ox:sx1 - ox] = \
+                    image_q16[sy0:sy1, sx0:sx1]
+            gradX, gradY = descriptor_gradient(tile)
+            sx_q16 = (lx * 65536) & 0xFFFFFFFF
+            sy_q16 = (ly * 65536) & 0xFFFFFFFF
+            orient = orient_d920(gradX, gradY, sx_q16, sy_q16)
+            desc = _descriptor_at(gradX, gradY, sx_q16, sy_q16, orient)
+            ws_body[i + 2:i + V30_RECORD_LEN] = bytes(desc)
+            i += V30_RECORD_LEN
+
+    ws_body_bytes = bytes(ws_body)
+    tid = compute_tid(ws_body_bytes)
+    return _build_envelope(subtype, ws_body_bytes, tid)
