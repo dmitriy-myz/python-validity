@@ -6,7 +6,7 @@ Pipeline (all stages classical CV; no proprietary enhancement):
     working image (112²)
       → 3×3 grid of 57×57 tiles (mid-gray pad)          [tile_image]      DONE
       → per tile: Q12 Determinant-of-Hessian → Ixx/Iyy/Ixy/resp [doh]    BYTE-EXACT (interior)
-      → 8-neighbour NMS → keypoints                      [TODO sub_18000CF90]
+      → 8-neighbour NMS → keypoints                      [nms]            BYTE-EXACT
       → orientation (Gaussian-weighted grad histogram)   [orientation]    decoded; impl WIP
       → oriented BRIEF descriptor                        [descriptor]     decoded; impl WIP
       → [x][y][128-bit desc] × 250 → v30                 [build_v30]       format known
@@ -195,17 +195,22 @@ def doh(tile, size=5, v9=1):
     return ixx, iyy, ixy, resp
 
 
-# ─── keypoints — NMS (sub_18000CF90) — PENDING per-tile validation ───────
-def nms(resp, t_lo, t_hi, dedup_q, margin=1):
-    """8-neighbour non-max suppression on the response map (sub_18000CF90).
-    A pixel is a keypoint iff resp>t_lo, resp>=t_hi, and strictly greater than
-    all 8 neighbours; score = |resp|; near duplicates within a radius derived
-    from dedup_q (= ((ctx[+0x48]>>6)²)>>20) are suppressed, keeping the stronger.
+# ─── keypoints — NMS (sub_18000CF90) — BYTE-EXACT ✅ ─────────────────────
+# Validated set-, count-, AND order-exact vs nms_* captures across all 12 tiles
+# (dev/port_gradient.py-style harness; t_lo=671, t_hi=168, dedup_q=72064,
+# margin=10 for this hardware). Captured 32-byte CF90 record layout (i32):
+#   [0, 0, 0, 0, abs(resp), x, y, 0]   — fields 0-3 + 7 are zero out of CF90;
+# upstream code fills active/tile/global-coords/quality fields later.
+def nms(resp, t_lo=671, t_hi=168, dedup_q=72064, margin=10):
+    """8-neighbour NMS on the response map (sub_18000CF90).  A pixel is a
+    keypoint iff `resp > t_lo`, `resp >= t_hi`, and strictly greater than all
+    8 neighbours; score = |resp|.  Dedup radius² = ((dedup_q>>6)²)>>20 — with
+    the captured dedup_q=72064 this is 1 (i.e. effectively a no-op given the
+    strict 8-nbr max already excludes adjacent equals).
 
-    t_lo=ctx[+0x20], t_hi=ctx[+0x24], dedup_q=ctx[+0x48] (capture via
-    GDB_DUMP_NMS=1). DECODED from disasm; NOT yet byte-validated — the exact
-    dedup/replace ordering and 32-byte record layout are confirmed against the
-    nms_* captures before this is trusted."""
+    Args from the ctx struct: t_lo=ctx[+0x20], t_hi=ctx[+0x24],
+    dedup_q=ctx[+0x48]; margin from CF90's r9d arg (=10 for this hardware).
+    Returns a list of `(score, x, y)` in raster-scan order (y outer)."""
     h, w = resp.shape
     r2 = ((dedup_q >> 6) ** 2) >> 20
     kps = []   # (score, x, y)
