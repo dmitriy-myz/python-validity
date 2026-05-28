@@ -59,6 +59,11 @@ RVA_CF90 = 0xCF90     # NMS / keypoint extractor (opt-in) — see NmsEntryBP
 RVA_D920 = 0xD920     # orientation per keypoint (opt-in) — see OrientEntryBP
 RVA_E090 = 0xE090     # oriented BRIEF descriptor (opt-in) — see DescBriefEntryBP
 RVA_E5D0 = 0xE5D0     # inside E090: right after `r10 = [rsp+0x58]` — see DescSamplesBP
+RVA_36590 = 0x36590   # envelope-builder VALIDATOR wrapper (opt-in) — see EnvelopeBP
+RVA_36840 = 0x36840   # envelope BUILDER — internally alloc'd buffer, writes
+                       #   size to *r8 (arg3) and ptr to *(r8+8). 23136B for
+                       #   06cb:00a2. Hooking the wrapper (36590) catches the
+                       #   same output AND validates the inputs are present.
 
 MASK = (1 << 64) - 1
 
@@ -140,6 +145,18 @@ GRADIN_MAX = int(os.environ.get('GDB_GRADIN_MAX', '8'))
 STAGE5_ON = os.environ.get('GDB_DUMP_STAGE5') == '1'
 STAGE5_MAX = int(os.environ.get('GDB_STAGE5_MAX', '6'))
 STAGE5_BUF = int(os.environ.get('GDB_STAGE5_BUF', '8192'))
+
+# Envelope hook is opt-in. sub_180036590 is the input-validator wrapper
+# around sub_180036840 (the real builder). 36840 allocates a buffer, writes
+# the final 23136-byte template into it, and stores (size, ptr) into the
+# struct at arg3 (r8). After 36840 returns:
+#   size = *(u32*)r8
+#   env  = *(void**)(r8+8)
+# We hook the wrapper (36590) so the size+ptr are already finalized at the
+# wrapper's FinishBreakpoint. The envelope is the oracle for diffing
+# against our native_template() output. Fires once per Wine enrollment.
+ENVELOPE_ON = os.environ.get('GDB_DUMP_ENVELOPE') == '1'
+ENVELOPE_MAX = int(os.environ.get('GDB_ENVELOPE_MAX', '8'))
 
 
 def _reg(name):
@@ -232,6 +249,58 @@ class MinutiaEntryBP(gdb.Breakpoint):
             MinutiaFinishBP(ctx)
         except Exception as e:
             print(f'[!] AAB0 entry failed: {e}')
+        return False
+
+
+# ─── Envelope builder (sub_180036590 wrapper) — final template oracle ──
+_envelope_calls = 0
+
+
+class EnvelopeFinishBP(gdb.FinishBreakpoint):
+    """At wrapper RETURN, the inner builder has finished writing to the
+    output struct. Read (size, ptr) from r8 (= AAB0 arg 3) and dump the
+    envelope bytes. This is the byte-exact oracle our native_template()
+    must reproduce."""
+    def __init__(self, r8, idx):
+        super().__init__(internal=True)
+        self.r8, self.idx = r8, idx
+
+    def stop(self):
+        try:
+            size = _u32(self.r8)
+            ptr = _u64(self.r8 + 8)
+            if 0 < size <= 65536 and ptr:
+                _save('envelope', f'call{self.idx}_size{size}',
+                      _read_safe(ptr, size))
+            else:
+                print(f'[!] envelope #{self.idx}: bad size={size} or ptr=0x{ptr:x}')
+        except Exception as e:
+            print(f'[!] envelope finish failed: {e}')
+        return False
+
+    def out_of_scope(self):
+        pass
+
+
+class EnvelopeEntryBP(gdb.Breakpoint):
+    """Entry on sub_180036590 (validator wrapper). r8 = output struct ptr;
+    after the inner sub_180036840 finishes, *r8 = size and *(r8+8) = env.
+    The wrapper's exit is when both are populated."""
+    def stop(self):
+        global _envelope_calls
+        if _envelope_calls >= ENVELOPE_MAX:
+            return False
+        try:
+            r8 = _reg('r8')
+            rcx = _reg('rcx')
+            rdx = _reg('rdx')
+            r9 = _reg('r9')
+            print(f'[*] envelope #{_envelope_calls}: rcx=0x{rcx:x} rdx=0x{rdx:x} '
+                  f'r8=0x{r8:x} r9=0x{r9:x}')
+            EnvelopeFinishBP(r8, _envelope_calls)
+            _envelope_calls += 1
+        except Exception as e:
+            print(f'[!] envelope entry failed: {e}')
         return False
 
 
@@ -1015,6 +1084,10 @@ def main():
     if DESC_SAMPLES_ON:
         DescSamplesBP('*' + hex(base + RVA_E5D0))
         print(f'[*] BRIEF samples hook ON at E5D0 (max {DESC_SAMPLES_MAX} calls)')
+    if ENVELOPE_ON:
+        EnvelopeEntryBP('*' + hex(base + RVA_36590))
+        print(f'[*] envelope hook ON (max {ENVELOPE_MAX} calls) — dumps the '
+              f'final 23136B template at wrapper exit')
     print(f'[*] breakpoints armed. dumps -> {OUTDIR}/')
     print('[*] run a full enrollment now, then Ctrl-C + detach.')
     gdb.execute('continue')
