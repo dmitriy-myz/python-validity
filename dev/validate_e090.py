@@ -35,6 +35,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from validitysensor.moh_native import (
     COS_Q16, SIN_Q16, orient_to_index, desc_sample_rotate, desc_aggregate,
+    descriptor_gradient,
 )
 
 DUMP = os.environ.get('FRIDA_DUMP_DIR', '/media/sf_vbox-rw/finger/frida_dumps')
@@ -78,6 +79,67 @@ def _load_samples(i):
     with open(p, 'rb') as f:
         buf = f.read()
     return np.frombuffer(buf[:58 * 4], dtype=np.int32)
+
+
+def _load_gradients_computed():
+    """Computed gradient mode: derive (gradX, gradY) from each F250 raw-tile
+    capture via descriptor_gradient(), and match each to its kp_start by
+    comparing INTERIOR (dist >= 3) byte-exact against the captured gradX.
+
+    Pairing by sequence is unreliable — F250 fires per tile but our
+    gradstruct hook only fires per unique gradient observed at E090 time,
+    so tiles with no keypoints leave a raw-tile dump but no gradstruct.
+    Content-matching is exact since interior is byte-exact (we verified
+    this on the first capture).
+    """
+    import re
+    raws = glob.glob(os.path.join(DUMP, 'f250_raw_tile_*_call*_*x*.bin'))
+    if not raws:
+        return None, 'no f250_raw_tile_*.bin found (re-capture with GDB_DUMP_F250=1)'
+    def _ts(p, kind):
+        m = re.search(rf'{kind}_(\d+)_', os.path.basename(p))
+        return int(m.group(1)) if m else 0
+    kpbs = glob.glob(os.path.join(DUMP, 'descbrief_kp_before_*_kp*.bin'))
+    if not kpbs:
+        return None, 'no descbrief_kp_before_*.bin'
+    ts_vals = [_ts(p, 'descbrief_kp_before') for p in kpbs]
+    ts_lo, ts_hi = min(ts_vals), max(ts_vals)
+    raw_in_session = [(p, _ts(p, 'f250_raw_tile')) for p in raws
+                      if ts_lo - 5000 <= _ts(p, 'f250_raw_tile') <= ts_hi + 1000]
+    # Pre-compute (gx, gy) for each raw tile.
+    raw_grads = []
+    for raw_path, ts in raw_in_session:
+        dim = re.search(r'_(\d+)x(\d+)\.bin$', os.path.basename(raw_path))
+        if not dim:
+            continue
+        w, h = int(dim.group(1)), int(dim.group(2))
+        raw = np.frombuffer(open(raw_path, 'rb').read(), dtype=np.int32).reshape(h, w)
+        gx, gy = descriptor_gradient(raw)
+        raw_grads.append((ts, gx, gy))
+    # Load each captured gradstruct + gradX, find the raw_tile whose computed
+    # gx INTERIOR matches the captured gradX interior, byte-exact.
+    captured, _ = _load_gradients()
+    out = {}
+    used = set()
+    border = 3
+    for kp_start, (cap_gx, cap_gy) in captured.items():
+        h, w = cap_gx.shape
+        # Best candidate by interior match (we expect exactly one).
+        best = None
+        for idx, (ts, gx, gy) in enumerate(raw_grads):
+            if idx in used or gx.shape != cap_gx.shape:
+                continue
+            if np.array_equal(gx[border:h-border, border:w-border],
+                              cap_gx[border:h-border, border:w-border]):
+                best = idx
+                break
+        if best is not None:
+            used.add(best)
+            ts, gx, gy = raw_grads[best]
+            out[kp_start] = (gx, gy)
+        else:
+            print(f'WARN: no raw tile interior-matches gradX for kp_start={kp_start}')
+    return out, None
 
 
 def _load_gradients():
@@ -232,11 +294,17 @@ def main():
     ap.add_argument('--all', action='store_true', help='scan all 1024 kps')
     ap.add_argument('--n', type=int, default=1, help='kps to run (default 1)')
     ap.add_argument('--start', type=int, default=0, help='first kp index')
+    ap.add_argument('--computed', action='store_true',
+                    help='derive gradX/gradY from f250_raw_tile_*.bin via '
+                         'descriptor_gradient() instead of loading the captured '
+                         'descbrief_gradX/Y. Tests the full image→descriptor port.')
     args = ap.parse_args()
 
     print(f'dump dir: {DUMP}')
+    print(f'gradient source: {"COMPUTED from raw tile" if args.computed else "captured descbrief_gradX/Y"}')
 
-    grads, reason = _load_gradients()
+    grads, reason = (_load_gradients_computed() if args.computed
+                     else _load_gradients())
     if grads is None:
         print()
         print('=== BLOCKED — gradient buffer not yet captured ===')

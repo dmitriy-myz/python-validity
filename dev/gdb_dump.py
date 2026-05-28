@@ -883,7 +883,7 @@ _gradin_calls = 0
 
 
 F250_ON = os.environ.get('GDB_DUMP_F250') == '1'
-F250_MAX = int(os.environ.get('GDB_F250_MAX', '64'))
+F250_MAX = int(os.environ.get('GDB_F250_MAX', '256'))   # ~9 tiles × ~24 frames
 _f250_calls = 0
 
 

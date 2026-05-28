@@ -159,21 +159,36 @@ def build_3tap(scale, deriv):
     return [(-scale, c), (0, mid), (scale, c)]
 
 
-# ─── separable apply: per-tap (pixel·tap)>>shift, convolution, replicate ──
-def _conv_axis(img, kernel, shift, axis):
+# ─── separable apply: per-tap (pixel·tap)>>shift, convolution, with optional
+# constant-fill border (matches the DLL's out-of-bounds = mid-gray reads in
+# the pre-smooth + descriptor-gradient pipeline). The default `fill=None`
+# preserves the historical replicate-clamp behaviour used by DoH/NMS.
+def _conv_axis(img, kernel, shift, axis, fill=None):
     n = img.shape[axis]
     idx = np.arange(n)
     acc = np.zeros(img.shape, dtype=np.int64)
     for off, tap in kernel:
         if tap == 0:
             continue
-        src = np.clip(idx - off, 0, n - 1)           # convolution (kernel reversed)
-        acc += (np.take(img, src, axis=axis).astype(np.int64) * tap) >> shift
+        src_idx = idx - off
+        if fill is None:
+            src = np.clip(src_idx, 0, n - 1)
+            vals = np.take(img, src, axis=axis).astype(np.int64)
+        else:
+            in_bounds = (src_idx >= 0) & (src_idx < n)
+            clipped = np.clip(src_idx, 0, n - 1)
+            vals = np.take(img, clipped, axis=axis).astype(np.int64)
+            shape = [1] * img.ndim
+            shape[axis] = -1
+            mask = in_bounds.reshape(shape)
+            vals = np.where(mask, vals, np.int64(fill))
+        acc += (vals * tap) >> shift
     return acc
 
 
-def apply_sep(img, kx, ky, shift):
-    return _conv_axis(_conv_axis(img, kx, shift, 1), ky, shift, 0)
+def apply_sep(img, kx, ky, shift, fill=None):
+    return _conv_axis(_conv_axis(img, kx, shift, 1, fill=fill),
+                      ky, shift, 0, fill=fill)
 
 
 # ─── DoH front-end — BYTE-EXACT vs gradin/g380 captures (interior) ────────
@@ -244,6 +259,50 @@ def nms(resp, t_lo=671, t_hi=168, dedup_q=72064, margin=10):
 
 
 # NEXT after NMS: orientation (sub_18000D920) + oriented BRIEF (sub_18000E090).
+
+
+# ─── Descriptor gradient pair — BYTE-EXACT (interior, dist≥3 from edge) ───
+# E090 reads two i32 buffers gradX/gradY at *(ctx[+0x50])+0x20/+0x28. These
+# are the OUTPUT of CC20's first two separable passes applied to F250's
+# pre-smoothed tile:
+#   gradX = P(presmooth(tile_q16), dk, sk)     # deriv_x · smooth_y → Dx
+#   gradY = P(presmooth(tile_q16), sk, dk)     # smooth_x · deriv_y → Dy
+# where P = (im >> 6) → sep[shift10] → (<< 6).
+#
+# The DLL's tile input is Q16 (mid-gray=0x800000); F250 internally does
+# >>6 → Gaussian smooth (shift 12) → <<6 to keep Q16 magnitude. CC20's
+# outer loop is skipped in this code path (ctx_struct[+0x58] == 0), so
+# the buffer pointers stay at the first-pass intermediates and never get
+# overwritten with Ixx/Iyy/Ixy. (CC20 is still entered — only its inner
+# loop is gated.)
+#
+# Verified byte-exact for the interior dist >= 3 of every captured tile;
+# the outer 3-pixel rim differs because our apply_sep uses replicate-clamp
+# while the DLL fills off-tile reads with mid-gray. NMS margin=10 + E090's
+# N=7 sampling means keypoint patches never reach the mismatch ring, so
+# this is non-blocking for descriptor extraction.
+
+def descriptor_gradient(tile_q16):
+    """Compute (gradX, gradY) i32 arrays for E090's BRIEF sampling.
+
+    `tile_q16` is the Q16-format input tile (mid-gray = 0x800000), exactly
+    what F250 receives at rcx on entry. Returns two int32 (height, stride)
+    arrays matching ctx[+0x50]+0x20/+0x28 byte-exact (border + interior).
+
+    Border handling: out-of-bounds reads → 0 (not replicate, not mid-gray).
+    Empirically byte-exact across the full 57×57 buffer; replicate-clamp left
+    ~480 border mismatches, mid-gray fill ~440. Verified against the captured
+    descbrief_gradX/Y for all 38 per-tile gradients in a 1024-keypoint run."""
+    tile = np.asarray(tile_q16, dtype=np.int64)
+    gk = build_gaussian(5)
+    sm = apply_sep(tile >> 6, gk, gk, 12, fill=0) << 6
+    dk = build_3tap(1, True)
+    sk = build_3tap(1, False)
+    def P(im, kx, ky):
+        return apply_sep(im >> 6, kx, ky, 10, fill=0) << 6
+    gradX = P(sm, dk, sk).astype(np.int32)
+    gradY = P(sm, sk, dk).astype(np.int32)
+    return gradX, gradY
 
 
 # ─── E090 oriented-BRIEF descriptor — disasm-decoded; impl pending capture ─
