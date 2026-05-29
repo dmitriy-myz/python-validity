@@ -38,6 +38,7 @@ truncation is why Ixy never recovered as one linear kernel). Validate the
 port bit-exact against captured harris_Ixx/Iyy/Ixy/resp planes (57x57) via
 dev/diff_v30.py compare_harris BEFORE chaining downstream.
 """
+import os
 import numpy as np
 
 # ─── geometry (decoded from orchestrator sub_18000AAB0) ─────────────────
@@ -810,15 +811,17 @@ FRAME_KP_CAP = 250
 follows the per-tile A960 edge cull."""
 
 
-RESP_CULL_THRESHOLD = 55500
-"""Empirical: DLL drops kps with abs(resp) <= ~55500 even after A960's edge
-filter. Where this threshold comes from isn't pinned down — it's likely a
-dynamic resp cull somewhere between F300's D5D0 (subpix) and A960's edge
-filter. Verified against 2026-05-28 frame 0 capture: 250/250 cap kps
-have resp > 55500 and all kps below 55331 are EXTRA. Match-quality test
-will confirm whether this empirical rule is sufficient or if there's a
-position-dependent component (tile 8 had a 166619-resp EXTRA suggesting
-edge-tile-specific tightening)."""
+RESP_CULL_THRESHOLD = int(os.environ.get('RESP_THRESHOLD', '55500'))
+"""Empirical: 55500 was tuned on the 2026-05-28 frame 0 capture (250/250
+cap kps have resp > 55500). The 2026-05-29 8-frame log-comparison showed
+this is a SINGLE-FRAME ARTIFACT — frames 1-7 have resp distributions
+below 55500 and get truncated to 154-208 kps with this threshold; with
+threshold=0 every frame reaches 250 kps and matches the DLL at 97-100%
+byte-exact (including one perfect 250/250 frame).
+
+Override via `RESP_THRESHOLD=0` to disable. Kept at 55500 by default
+only to avoid silently changing behavior for code that depends on it;
+new validation work should always run with RESP_THRESHOLD=0."""
 
 
 def _a960_passes_global_edge(sx_q16, sy_q16, oy, ox, h, w, ti=None, tj=None):
