@@ -146,6 +146,22 @@ STAGE5_ON = os.environ.get('GDB_DUMP_STAGE5') == '1'
 STAGE5_MAX = int(os.environ.get('GDB_STAGE5_MAX', '6'))
 STAGE5_BUF = int(os.environ.get('GDB_STAGE5_BUF', '8192'))
 
+# A5B0 KP-array boundary hook is opt-in. Dumps the FULL kp_array (count × 32B
+# records) at A5B0 entry and exit, plus the 4-byte local_flags struct A5B0
+# writes (caller's [rsp+0x1f8], passed as arg10). Purpose: discover whether
+# A5B0 culls/marks kps and how, since the residual ~6-10 edge-tile drifts in
+# my native port might be explained by A5B0 setting byte[+0x8]=0 on some kps
+# (later sorted to the back by A7E0) or by other per-kp side effects.
+# Args (callee rsp = caller rsp − 8):
+#   RDX = minutia_ctx {kp_array_ptr@+0, count@+8, byte_n_good@+0xc}
+#   [rsp+0x38] = tile_id (u32)
+#   [rsp+0x40] = start_kp_idx in this tile-group (u32)
+#   [rsp+0x48] = end_kp_idx in this tile-group   (u32)
+#   [rsp+0x50] = &local_flags struct (4 bytes; flags[0] and flags[2] are
+#                read by AAB0 right after the call — see disasm b070..b07e)
+A5B0_KP_ON = os.environ.get('GDB_DUMP_A5B0_KP') == '1'
+A5B0_KP_MAX = int(os.environ.get('GDB_A5B0_KP_MAX', '32'))   # 9 tiles × ~3 frames
+
 # Envelope hook is opt-in. sub_180036590 is the input-validator wrapper
 # around sub_180036840 (the real builder). 36840 allocates a buffer, writes
 # the final 23136-byte template into it, and stores (size, ptr) into the
@@ -372,6 +388,76 @@ class Stage5EntryBP(gdb.Breakpoint):
             _stage5_calls += 1
         except Exception as e:
             print(f'[!] stage5 entry failed: {e}')
+        return False
+
+
+# ─── A5B0 kp-array boundary hook (cull-discovery) ───────────────────────
+_a5b0kp_calls = 0
+
+
+class A5B0KpFinishBP(gdb.FinishBreakpoint):
+    def __init__(self, ctx, flags_ptr, tile_id, start, end, idx):
+        super().__init__(internal=True)
+        self.ctx = ctx
+        self.flags_ptr = flags_ptr
+        self.tile_id = tile_id
+        self.start = start
+        self.end = end
+        self.idx = idx
+
+    def stop(self):
+        try:
+            base = _u64(self.ctx)
+            count = _u32(self.ctx + 8)
+            n_good = _u32(self.ctx + 0xc)   # the byte!=0 count metadata
+            tag = (f'call{self.idx:02d}_tile{self.tile_id}'
+                   f'_s{self.start}_e{self.end}_n{count}_ng{n_good}')
+            if base and 0 < count <= 512:
+                _save('a5b0kp_after', tag, _read(base, count * 32))
+            flags = _read_safe(self.flags_ptr, 4) if self.flags_ptr else b''
+            _save('a5b0kp_flags_after', tag, flags)
+            print(f'    a5b0kp call{self.idx:02d} EXIT: count={count} n_good={n_good} '
+                  f'flags={flags.hex()}')
+        except Exception as e:
+            print(f'[!] a5b0kp finish failed: {e}')
+        return False
+
+    def out_of_scope(self):
+        pass
+
+
+class A5B0KpEntryBP(gdb.Breakpoint):
+    """Boundary hook on sub_18000A5B0 for cull discovery. Reads the minutia
+    ctx (RDX) at entry, dumps the full kp_array + the local_flags struct
+    that A5B0 writes (passed as arg10 in [rsp+0x50]). The FinishBP repeats
+    the dump at exit so we can diff what A5B0 changed."""
+    def stop(self):
+        global _a5b0kp_calls
+        if _a5b0kp_calls >= A5B0_KP_MAX:
+            return False
+        try:
+            ctx = _reg('rdx')
+            rsp = _reg('rsp')
+            tile_id = _u32(rsp + 0x38)
+            start = _u32(rsp + 0x40)
+            end = _u32(rsp + 0x48)
+            flags_ptr = _u64(rsp + 0x50)
+            base = _u64(ctx)
+            count = _u32(ctx + 8)
+            n_good = _u32(ctx + 0xc)
+            i = _a5b0kp_calls
+            tag = (f'call{i:02d}_tile{tile_id}_s{start}_e{end}_n{count}_ng{n_good}')
+            if base and 0 < count <= 512:
+                _save('a5b0kp_before', tag, _read(base, count * 32))
+            flags_before = _read_safe(flags_ptr, 4) if flags_ptr else b''
+            _save('a5b0kp_flags_before', tag, flags_before)
+            print(f'[*] a5b0kp #{i:02d}: ctx=0x{ctx:x} tile={tile_id} '
+                  f'kps[{start}..{end}) count={count} n_good={n_good} '
+                  f'flags_ptr=0x{flags_ptr:x}')
+            A5B0KpFinishBP(ctx, flags_ptr, tile_id, start, end, i)
+            _a5b0kp_calls += 1
+        except Exception as e:
+            print(f'[!] a5b0kp entry failed: {e}')
         return False
 
 
@@ -1057,6 +1143,11 @@ def main():
         Stage5EntryBP('*' + hex(base + RVA_A5B0))
         print(f'[*] stage-5 descriptor hook ON (max {STAGE5_MAX} calls, '
               f'{STAGE5_BUF}B buffer)')
+    if A5B0_KP_ON:
+        A5B0KpEntryBP('*' + hex(base + RVA_A5B0))
+        print(f'[*] A5B0 kp-array boundary hook ON (max {A5B0_KP_MAX} calls) '
+              f'— dumps kp_array+flags before/after each A5B0 to expose any '
+              f'per-kp side effect (cull or marking)')
     if PACKER_ON:
         PackerEntryBP('*' + hex(base + RVA_2240))
         print(f'[*] WS-body packer hook ON (max {PACKER_MAX} calls, '
