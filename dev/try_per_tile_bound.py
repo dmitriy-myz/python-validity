@@ -23,8 +23,6 @@ from collections import defaultdict
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
-import validitysensor.moh_native as mn
-mn.RESP_CULL_THRESHOLD = 0
 from validitysensor.moh_native import extract_frame_native, tile_origin
 
 DUMP = os.environ.get('FRIDA_DUMP_DIR', '/media/sf_vbox-rw/finger/frida_dumps')

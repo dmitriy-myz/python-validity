@@ -18,12 +18,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from validitysensor import moh_native
 from validitysensor.moh_native import extract_frame_native
-
-if 'RESP_THRESHOLD' in os.environ:
-    moh_native.RESP_CULL_THRESHOLD = int(os.environ['RESP_THRESHOLD'])
-    print(f'[*] RESP_CULL_THRESHOLD overridden to {moh_native.RESP_CULL_THRESHOLD}')
 
 DUMP_DIR = '/media/sf_vbox-rw/finger/frida_dumps'
 

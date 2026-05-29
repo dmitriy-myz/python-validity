@@ -18,11 +18,6 @@ import numpy as np
 from collections import defaultdict
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
-from validitysensor import moh_native
-# Allow overriding the resp threshold via env (e.g. RESP_THRESHOLD=0 to disable)
-if 'RESP_THRESHOLD' in os.environ:
-    moh_native.RESP_CULL_THRESHOLD = int(os.environ['RESP_THRESHOLD'])
-    print(f'[*] RESP_CULL_THRESHOLD overridden to {moh_native.RESP_CULL_THRESHOLD}')
 from validitysensor.moh_native import extract_frame_native, tile_origin, orient_to_index
 
 DUMP = os.environ.get('FRIDA_DUMP_DIR', '/media/sf_vbox-rw/finger/frida_dumps')
