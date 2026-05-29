@@ -854,7 +854,7 @@ class Sensor:
                 Image.fromarray(img).save("fingerprint.jpg")
                 # end debug save image
 
-                # key = self.enrollment_update_start(key)
+                key = self.enrollment_update_start(key)
                 rsp = self.append_new_image(img_data)
                 print(rsp)
                 header, template, tid = rsp
