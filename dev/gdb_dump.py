@@ -81,6 +81,44 @@ PACKER_MAX = int(os.environ.get('GDB_PACKER_MAX', '12'))
 PACKER_WS = int(os.environ.get('GDB_PACKER_WS', '23056'))    # WS body size
 PACKER_FEAT = int(os.environ.get('GDB_PACKER_FEAT', '32768'))  # v30 (size unknown; best-effort)
 
+# WS-body packer EMIT-block hook is opt-in. sub_180002240 builds the WS body
+# as a *concatenated TLV stream* via a 16-byte stream-cursor at [rsp+0x50]
+# (decoded 2026-05-29, see dev/PACKER-sub_180002240.md). The cursor is:
+#     node = *(u64*)(rsp+0x50)        # framing/header node
+#     data = *(u64*)(rsp+0x58)        # data base
+#     len  = *(u32*)(node+4)          # running byte count (proven @0x1800025d5)
+# Breakpoints at each codec call in the emit block (0x2540..0x25d0) snapshot the
+# stream; diffing consecutive snapshots gives the exact byte delta each codec
+# call appends -> resolves the WS offset->writer map in one capture run.
+# rsp is frame-stable between prologue and epilogue, so [rsp+0x50] is valid at
+# every site. Sites are the call instructions + the post-emit point (0x25d5).
+PACKER_EMIT_ON = os.environ.get('GDB_DUMP_PACKER_EMIT') == '1'
+PACKER_EMIT_MAX = int(os.environ.get('GDB_PACKER_EMIT_MAX', '8'))   # frames
+PACKER_EMIT_WIN = int(os.environ.get('GDB_PACKER_EMIT_WIN', '24576'))  # stream window cap
+# (RVA, label) — label names the codec ABOUT TO RUN at that site (post=after all)
+PACKER_EMIT_SITES = (
+    (0x2540, '0_pre_53e0'),    # before sub_1800053e0 (type-2 TLV sub-record)
+    (0x255a, '1_pre_1df0'),    # before sub_180001df0 (relationship matrix)
+    (0x2576, '2_pre_51f0'),    # before sub_1800051f0 (lead bytes + section table)
+    (0x2585, '3_pre_56c0'),    # before sub_1800056c0 (tag ebp+3 record)
+    (0x2591, '4_pre_5ba0'),    # before sub_180005ba0 (tag 0x68 setter)
+    (0x259d, '5_pre_5b70'),    # before sub_180005b70 (tag 0x03 setter)
+    (0x25b5, '6_pre_5bd0'),    # before sub_180005bd0 (tag 0x69: h,w)
+    (0x25c3, '7_pre_5ce0'),    # before sub_180005ce0 (tag 0x6b count)
+    (0x25d0, '8_pre_6080'),    # before sub_180006080 (tag 0x6c commit)
+    (0x25d5, '9_post'),        # after the whole emit/cleanup block
+)
+
+# POSE-lead argsort hook is opt-in. Inside sub_1800051f0, the section "lead
+# bytes" are produced by the argsort sub_18000bd10 (0x18000522c) operating on
+# obj=*(rcx) (preserved in R13). Capture *(obj+0) (lead byte array) + *(obj+8)
+# (u32 key array) + obj header [0:0x20] BEFORE and AFTER the argsort to learn
+# what the emitted leads actually are (verification 2026-05-29 found bd10 is an
+# ARGSORT producing an index/rank permutation, NOT sorted score bytes).
+POSE_ON = os.environ.get('GDB_DUMP_POSE') == '1'
+POSE_MAX = int(os.environ.get('GDB_POSE_MAX', '24'))   # bd10 calls (sections)
+POSE_WIN = int(os.environ.get('GDB_POSE_WIN', '512'))  # array window cap
+
 # Per-minutia descriptor builder hook is opt-in. sub_1800046E0 fills the
 # 180-byte working record for one minutia from the image patch. Win64 args
 # (5th+ on the stack, read at entry before the callee touches rsp):
@@ -500,6 +538,80 @@ class PackerEntryBP(gdb.Breakpoint):
             _packer_calls += 1
         except Exception as e:
             print(f'[!] packer entry failed: {e}')
+        return False
+
+
+# ─── WS-body packer EMIT-block stream snapshots (sub_180002240) ──────────
+_emit_frame = -1
+
+
+class PackerEmitFrameBP(gdb.Breakpoint):
+    """Entry of sub_180002240: bump the frame counter so emit-site snapshots
+    are tagged per frame."""
+    def stop(self):
+        global _emit_frame
+        _emit_frame += 1
+        return False
+
+
+class PackerEmitSiteBP(gdb.Breakpoint):
+    """A codec call site in the emit block. Snapshot the [rsp+0x50] stream
+    builder: node=*(rsp+0x50), data=*(rsp+0x58), len=*(node+4). Save the data
+    window so consecutive sites diff to the per-codec byte delta."""
+    def __init__(self, spec, label):
+        super().__init__(spec)
+        self.label = label
+
+    def stop(self):
+        if _emit_frame >= PACKER_EMIT_MAX:
+            return False
+        try:
+            rsp = _reg('rsp')
+            node = _u64(rsp + 0x50)
+            data = _u64(rsp + 0x58)
+            ln = _u32(node + 4) if node else 0
+            win = min(ln if ln else PACKER_EMIT_WIN, PACKER_EMIT_WIN)
+            tag = f'f{_emit_frame}_{self.label}'
+            print(f'[*] emit {tag}: node=0x{node:x} data=0x{data:x} len={ln}')
+            # node header (framing struct) + the accumulated stream window
+            _save('packer_emit_node', tag, _read_safe(node, 0x40) if node else b'')
+            _save('packer_emit_stream', tag, _read_safe(data, win) if data else b'')
+        except Exception as e:
+            print(f'[!] emit site {self.label} failed: {e}')
+        return False
+
+
+# ─── POSE-lead argsort capture (inside sub_1800051f0 @ sub_18000bd10 call) ─
+_pose_calls = 0
+
+
+class PoseArgsortBP(gdb.Breakpoint):
+    """Snapshot obj=*(R13) around the sub_18000bd10 argsort. when='before' or
+    'after'. Dumps obj header [0:0x20] + *(obj+0) (lead byte array) + *(obj+8)
+    (u32 key array). before vs after reveals what the argsort writes."""
+    def __init__(self, spec, when):
+        super().__init__(spec)
+        self.when = when
+
+    def stop(self):
+        global _pose_calls
+        if _pose_calls >= POSE_MAX:
+            return False
+        try:
+            obj = _reg('r13')          # obj (preserved; = rcx arg at 0x522c)
+            arr0 = _u64(obj)           # *(obj+0) -> lead byte array
+            arr8 = _u64(obj + 8)       # *(obj+8) -> u32 key array
+            n = obj and _read_safe(obj + 0x10, 1)
+            tag = f'call{_pose_calls}_{self.when}'
+            print(f'[*] pose {tag}: obj=0x{obj:x} arr0=0x{arr0:x} arr8=0x{arr8:x}'
+                  f' n={n[0] if n else "?"}')
+            _save('pose_objhdr', tag, _read_safe(obj, 0x20) if obj else b'')
+            _save('pose_arr0', tag, _read_safe(arr0, POSE_WIN) if arr0 else b'')
+            _save('pose_arr8', tag, _read_safe(arr8, POSE_WIN) if arr8 else b'')
+            if self.when == 'after':
+                _pose_calls += 1
+        except Exception as e:
+            print(f'[!] pose {self.when} failed: {e}')
         return False
 
 
@@ -1152,6 +1264,17 @@ def main():
         PackerEntryBP('*' + hex(base + RVA_2240))
         print(f'[*] WS-body packer hook ON (max {PACKER_MAX} calls, '
               f'ws={PACKER_WS}B feat<={PACKER_FEAT}B)')
+    if PACKER_EMIT_ON:
+        PackerEmitFrameBP('*' + hex(base + RVA_2240))
+        for rva, label in PACKER_EMIT_SITES:
+            PackerEmitSiteBP('*' + hex(base + rva), label)
+        print(f'[*] WS-body packer EMIT-block hook ON (max {PACKER_EMIT_MAX} '
+              f'frames, {len(PACKER_EMIT_SITES)} sites, win<={PACKER_EMIT_WIN}B)')
+    if POSE_ON:
+        PoseArgsortBP('*' + hex(base + 0x522C), 'before')
+        PoseArgsortBP('*' + hex(base + 0x5231), 'after')
+        print(f'[*] POSE-lead argsort hook ON (max {POSE_MAX} calls, '
+              f'win<={POSE_WIN}B)')
     if DESC_ON:
         DescEntryBP('*' + hex(base + RVA_46E0))
         print(f'[*] descriptor-builder hook ON (max {DESC_MAX} calls, '
