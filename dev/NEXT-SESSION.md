@@ -1,179 +1,225 @@
-# Next RE session — plan (06cb:00a2 native enrollment)
+# Next RE session — decompile the WS body builder
 
-Resume point for the one remaining blocker. Read `dev/MOH.md` and
-`dev/DLL-RE.md` first; this file is the action plan, not the findings.
+Resume point: native enrollment template construction. The feature
+pipeline (image → 250 kps + descriptors) is **byte-exact validated**.
+The remaining blocker is the WS body **container format**: ~260
+session-variant bytes whose derivation we don't understand. Black-box
+hypothesis testing (`dev/decode_variants.py`) hit a dead end — none of
+the simple per-frame minutia statistics fit. Time to disassemble the
+DLL functions that BUILD the WS body and trace where each byte zone
+comes from.
 
-## Where we are (TL;DR)
+## Where we are (verified)
 
-The MoH template format is **fully reverse-engineered and validated**:
+| stage | status | gate |
+|---|---|---|
+| Image → 250 kps | ✅ 244-250/250 byte-exact | `dev/diff_log_pipeline.py` |
+| Per-tile gradient | ✅ 9/9 byte-exact | `dev/diff_descriptors.py` Stage A |
+| 16-B BRIEF descriptor | ✅ 250/250 byte-exact | `dev/diff_descriptors.py` Stage B |
+| WS body container | ❌ ~260 unknown bytes | this session |
+| Chip identify() match | ❌ fails | end-to-end |
 
-```
-0x47 record → envelope → WS body (TLV container)
-  ├─ header (size@4, config@8, frame-id list@16, count table@24, geometry@44)
-  ├─ N per-frame sections (~4540 B): [pose-record table] + [v30 copied verbatim]
-  │     v30 = [~17B lead-in] + 250 × 18-byte records + [~16B trailer]
-  │     record = [x:u8][y:u8][128-bit binary descriptor:16B]
-  └─ TID (HMAC-SHA256 chain over WS body)
-```
+## What we KNOW about the WS body (from `dev/inspect_ws.py` + `extract_skeleton.py`)
 
-We can build chip-storable templates (`moh_opencv.extract_template(img,
-reference_template=...)`), and a rebuilt-from-real template **matches** a
-live finger (the `control` variant in `dev/splice_experiment.py`), proving
-every structural layer + the store/TID path is correct.
-
-## The single blocker (CORRECTED — no enhancement wall)
-
-The **descriptor is load-bearing** (proven: `zero_desc` and `our_desc`
-variants both fail to match; only real descriptors match). The earlier
-"ridge-enhancement wall" was **WRONG** — there is no enhancement. The
-detector input is just an **image tile**:
+Layout (23056 bytes, 5 v30 sections — NOT 4 as our stale reference template
+implied):
 
 ```
-working image (112²)
-  → 3×3 grid of 57×57 TILES (step h/3=37, overlap 20, mid-gray pad)   ← sub_18000A850 blit
-  → per tile: img×1024; DoH (Q12) on the tile                          ← sub_18000A1B0 / sub_18000CE80
-  → merge keypoints; quantize tile-local→global coords                 ← sub_18000A910 (DECODED)
-  → per-keypoint 128-bit descriptor                                    ← sub_18000A5B0 (stage 5) — UNKNOWN
-  → 250 minutiae → v30
+[0..4)        zeros                                CONST
+[4..8)        size_u32 = 23036 = 0x59fc            CONST (likely sizeof(payload))
+[8..16)       06 02 05 00 02 00 08 01              CONST (config code)
+[16..24)      04 03 02 01 00 00 00 00              CONST (sensor/algo identifier;
+                                                          NOT "accepted_frame_ids"
+                                                          as earlier memory claimed)
+[24..40)      per_section_counts u32 × 4           VARIANT (consolidated minutia counts
+                                                            for sections 0..3)
+[40..44)      byte 40 = 5th-section count (96?)    PARTIAL (byte 0 likely count,
+              + 3 bytes flags                              bytes 1-3 unknown)
+[44..64)      geometry_stats                       VARIANT 14/20 (unknown derivation)
+[64..309)     section 0 pre-v30 (245 B)            VARIANT 132/245 (global section
+                                                                    table + POSE)
+[309..4809)   section 0 v30 records (4500 B)       CONTENT (250 × [u8 x][u8 y][16B desc])
+[4809..4905)  section 1 pre-v30 (96 B)             VARIANT 24/96 (mostly constant
+                                                                  TLV skeleton)
+[4905..9405)  section 1 v30 records                CONTENT
+[9405..9453)  section 2 pre-v30 (48 B)             VARIANT 40/48
+[9453..13953) section 2 v30 records                CONTENT
+[13953..13993) section 3 pre-v30 (40 B)            VARIANT 35/40
+[13993..18493) section 3 v30 records               CONTENT
+[18493..18533) section 4 pre-v30 (40 B)            VARIANT 24/40
+[18533..23033) section 4 v30 records               CONTENT
+[23033..23056) tail (23 B)                         VARIANT 8/23
 ```
 
-Proven: each captured `gradin` == a 57×57 tile of `extract_image` at
-**corr 1.000**. So the whole detector input is reproducible (plain tiling).
-The only remaining unknown is the **descriptor algorithm** = stage 5
-`sub_18000A5B0` (plus making the DoH exact, now easy since the input is a
-known tile). This is ordinary decompilable RE, **not a wall**.
+Total: ~260 variant bytes to derive, ~22800 constant skeleton.
 
-## Goal & validation gate
+Cross-capture diff signal (`dev/extract_skeleton.py`, two captures A and B
+different fingers same sensor):
+- Constant zones can be COPIED verbatim from any Wine capture (proven
+  sensor-stable across enrollments).
+- Each section's pre-v30 starts with 8 ascending bytes (e.g., A's section 1:
+  `a4 a8 bf ce d9 db db e4`) — these vary per-session and per-section.
+  They are NOT simple quantiles of any minutia field we capture.
 
-**Goal:** reproduce, per 57×57 image tile, the DoH keypoints and their
-128-bit descriptors so `our_desc` matches. (Enhancement is NOT needed — the
-tile is the detector input, confirmed corr 1.000.)
+## Decompile target — call tree
 
-**Pass/fail gate (already built):** `dev/splice_experiment.py` `our_desc`
-variant (real coords + OUR descriptor computed via the reproduced pipeline)
-must **match** on `identify()`. That is the definition of done for the
-descriptor. Intermediate gate: `dev/diff_v30.py compare_gradin` corr → ~1.0.
+The WS body is built incrementally per frame. Entry is via the per-frame
+processor `sub_1800D89C0` (RVA 0xD89C0) which calls the packer:
 
-## IMPLEMENTATION ROADMAP (resume here — RE structure complete)
+```
+sub_1800D89C0  per-frame processor
+  ├─ sub_180001A50      feature extractor (image → 250 kps in v30 buf) [DONE — byte-exact]
+  └─ sub_180002240      WS-body PACKER (v30 features → WS body sections) [DECOMPILE THIS]
+       ├─ sub_180001FE0 180-B working record builder (per-kp)
+       │    └─ sub_180008F10  descriptor engine (writes section payload)
+       ├─ sub_180003320 struct-copy utility (NOT the accumulator, confirmed
+       │                this session — small generic copy fn)
+       └─ sub_18005xx → sub_180006A80 / B80 / 890   TLV codec
+```
 
-Native module started: `validitysensor/moh_native.py`. Stage status + the
-exact leaves left to port bit-exact (validate each vs the dumps in
-`$FRIDA_DUMP_DIR` via `dev/diff_v30.py`):
+The actual MULTI-FRAME ACCUMULATOR (= what merges 8 frames into 5
+consolidated sections) was NOT identified yet. It is likely:
+- Inside `sub_180002240`'s body (called per frame; accumulates state in
+  WS body @ session+152 across frames), OR
+- Inside the per-frame driver `sub_180031470` (RVA 0x31470), OR
+- Inside `sub_18001F070` (= `EnrollmentUpdate` per memory).
 
-| stage | status | remaining leaves (decompile + port) |
-|-------|--------|--------------------------------------|
-| tiling | ✅ byte-exact (`tile_image`) | — |
-| gradient/DoH | ✅ FULLY decoded (disasm) — see DLL-RE.md "Gradient kernel chain" | PORT: Gaussian smooth (shift 12) + 3-tap [1,0,-1]/[1,3.33,1] planes (shift 10) + `sub_18000CC20` buffer/scale wiring; validate vs captured `harris_*` planes |
-| DoH `Ixy` | ✅ explained: `[1,0,-1]_x ⊗ [1,0,-1]_y`, per-tap >>10 in both passes | (port, same as above) |
-| keypoints (NMS) | ✅ decoded — `sub_18000CF90`: 8-nbr NMS + thresh([+0x20],[+0x24]) + dist-dedup | port + validate kp coords |
-| orientation | algo decoded (`sub_18000D920`) | atan2 leaves `sub_1800030A0`, `sub_180003150`; peak `sub_18000D850`; weights `dword_180120C00` (dumped) |
-| descriptor | algo decoded (`sub_18000E090`) | bit-pack `sub_18000DF20`; DoH context `sub_18000C920`; BRIEF pairs from `sub_18000E6B0` (`BRIEF_SEED_TABLE`) |
-| assemble v30 | format known (`build_v30_record`) | wire stages → 250 records → splice/TID (have) |
+## Priority decode order
 
-Validation gates: `compare_harris` (DoH), `decode_records` (v30 layout),
-`splice_experiment.py` `our_desc` must `identify()`-match (final). Pull the
-`.rdata` tables with IDA (manual file-offset math proved unreliable). The
-work is bounded (~8 small leaves) but methodical; do it offline against the
-captured dumps, not as a live function-by-function chain.
+### Phase 1 — what writes which bytes (the easy half)
 
-## (older) STATUS: RE COMPLETE — now an implementation task
+For each variant zone, find the DLL function that writes the bytes. Use:
 
-Every stage from raw frame → `v30` is decoded as classical CV with known
-tables (see `dev/DLL-RE.md` "Descriptor algorithm — FULLY DECODED"). No
-unknowns remain to reverse; what's left is **porting + bit-exact validation**:
+```
+objdump -d /tmp/syna.dll | grep -B1 -A5 "imm value matching variant content"
+```
 
-1. **Tiling**: 3×3 grid of 57×57 tiles (step `h/3`=37, overlap 20, mid-gray
-   128 pad). `sub_18000A850` blit + `sub_180009F50` pad (both DECODED).
-2. **DoH per tile** (Q12): `(Ixx>>12)(Iyy>>12) − (Ixy>>12)²` on `tile<<10`,
-   gradients via Sobel-like `sub_18000FDF0`/`180010050` (need exact kernel),
-   NMS → keypoints. Validate vs captured `harris_resp`/`gradin`.
-3. **Orientation** (`sub_18000D920`): radius-6 Gaussian-weighted gradient
-   histogram (42 bins, table `dword_180120C00` dumped) → orientation+quality.
-4. **Oriented BRIEF** (`sub_18000E090`): rotate by orientation (cos/sin
-   `·65536`), block-aggregate gradients, apply BRIEF pairs (`sub_18000E6B0` /
-   `BRIEF_SEED_TABLE`) → 128-bit descriptor.
-5. **Assemble** `v30` ([x][y][16B desc] ×250), splice via the existing
-   `moh_opencv` path, recompute TID. **Validate**: `dev/splice_experiment.py`
-   `our_desc` variant must match on `identify()`.
+Or in IDA: look up cross-refs for the WS body pointer (= session+152, where
+session is arg1 to several functions). Track every `mov [session+152+OFFSET], ...`
+or memcpy into that range.
 
-Validate each stage against the captured dumps (`compare_harris`,
-`compare_gradin`, `decode_records`) before chaining. Tables to pull from the
-DLL: `dword_180120C00` (file 0x11f800); cos/sin are `round(cos/sin(deg)·65536)`;
-BRIEF pairs from `sub_18000E6B0`. Exact Sobel kernel: decompile
-`sub_18000FDF0`/`sub_180010050` if step-2 byte-match falls short.
+Targets ranked by simplicity:
 
-## (historical) Attack plan — superseded by the status above
+1. **`[4..8) size_u32`** — likely a hardcoded constant 23036 = 0x59fc the DLL
+   writes during template finalize. Look for `mov dword [...], 0x59fc` in the
+   disasm. Probably trivial to port.
 
-1. **DONE — there is no enhancement; the input is a tile.** `sub_18000AAB0`
-   (decompiled) tiles the working image 3×3 and runs the DoH detector
-   (`sub_18000A4B0`→`sub_18000A1B0`) per 57×57 tile (`sub_18000A850` blit +
-   mid-gray pad). `gradin` == an `extract_image` tile at corr 1.000.
+2. **`[16..24) sensor identifier`** — appears constant across captures. Find
+   where this 8-byte value `04 03 02 01 00 00 00 00` is written. May be a
+   constant in `.rdata` (search for it).
 
-2. **Decompile stage 5 `sub_18000A5B0`** — the per-keypoint descriptor (the
-   real remaining unknown). It's called in the orchestrator's second 9-tile
-   pass: `sub_18000A5B0(v85 tile, a2 ctx, w, h, …, a7 params)`. Read how it
-   turns a keypoint + its tile image into the 128-bit descriptor (binary
-   tests? sampling pattern? `sub_18000E6B0` BRIEF-select is partly decoded
-   but for 64 not 128 tests). Validate bit-exactly against captured `v30`
-   descriptors for the same image.
+3. **`[24..44) per_section_counts`** — written when each accumulated section
+   "completes" (each frame contributes some count, the SECTION count is the
+   consolidated final). Likely written near the end of accumulation, by some
+   function that finalizes the WS body. Search for stores of small (60-100
+   range) u32 values to offsets 24, 28, 32, 36, 40.
 
-3. **Make the DoH exact** (now easy — input is a known tile): port tiling +
-   `img×1024` + DoH (Q12, `Lxx·Lyy−Lxy²`) and match `harris_resp` byte-exact,
-   then keypoints byte-exact.
+4. **`[44..64) geometry_stats`** — 20 bytes. Per memory note says "geometry/
+   stats" but no specific function identified. Likely written by the same
+   finalize function as per_section_counts (right before the sections).
 
-2. **Bisect the transform with intermediate hooks.** We already capture the
-   final enhanced image (`GDB_DUMP_GRADIN`, `sub_18000FDF0`'s RCX). Add hooks
-   on the stage outputs *before* it — after padding, after downsample, after
-   each enhancement pass — to get (input → output) image pairs per stage.
-   Add these to `dev/gdb_dump.py` following the existing hook pattern.
+### Phase 2 — section pre-v30 metadata
 
-3. **Identify each stage from its pairs.** Likely components (fingerprint
-   enhancement canon): (a) downsample kernel (112→57; find exact filter),
-   (b) **orientation-field estimation**, (c) **oriented/Gabor bandpass
-   filtering** along the ridge orientation, possibly (d) frequency/contrast
-   normalization. For each, correlate candidate operators (cv2 / numpy)
-   against the captured stage output until corr ≈ 1.0.
+Each section's pre-v30 area (40-245 bytes) is written DURING that section's
+construction, between v30 records of frame N-1 ending and frame N's
+records starting. Some bytes:
 
-4. **Port + chain in `moh_opencv`.** Implement each stage; validate against
-   captured intermediates, then the full enhancement against `gradin`
-   (compare_gradin corr → ~1.0), then DoH against `harris_resp`.
+- **Section 0 pre-v30** (245 B) is the LARGEST — likely contains a "section
+  table" with offsets/sizes for all 5 sections. Look for stores during the
+  very first WS body build (initialize_packer / init_ws_body).
 
-5. **Descriptor binary tests.** With the enhanced image + DoH keypoints,
-   reproduce the **128-bit** descriptor: confirm the binary-test pattern
-   (`sub_18000E6B0` is partly decoded — `BRIEF_SEED_TABLE`, 162 candidates,
-   but for **128** tests not 64) and the sampling geometry/scale. Validate
-   bit-exactly against captured `v30` descriptors (same image).
+- **Section 1-4 pre-v30** (40-96 B) — each section's "section header" (TLV
+  framing + POSE records + per-section stats). The constant ~16-byte marker
+  `[id u32][TLV 00 b8 11 00][padding][cap 0xfa]` we identified is likely
+  written by a common section-init helper.
 
-6. **Validate end-to-end** via the `our_desc` then `our_both` splice variants.
+- **The 8 ascending bytes at each section's start** — primary mystery.
+  Hypothesis: these are POSE record bytes from `sub_1800046E0` (per-keypoint
+  MODEL FITTER, decoded earlier). Memory note: "First frame's reference pose
+  → WS header offset 49/53/57." So poses from frame 0 land at WS header
+  offsets 49/53/57. Similar pose data per section may explain these bytes.
 
-## Tools available (all in `dev/`, on branch `moh-opencv-poc`)
+### Phase 3 — the accumulator (= consolidation logic)
 
-- `gdb_dump.py` — 6 hooks: `GDB_DUMP_{PACKER,DESC,BLOB,EXTRACT,HARRIS,GRADIN}=1`.
-  Run on the Wine host: `gdb -p <WUDFHost PID> -x dev/gdb_dump.py`, then a full
-  enrollment. Dumps land in `$FRIDA_DUMP_DIR` (the captures used the VBox share
-  `/media/sf_vbox-rw/finger/frida_dumps`). Add the stage-output hooks here.
-- `diff_v30.py` — loads (image→v30) pairs, `decode_records()`, recall metrics,
-  `compare_harris`, `compare_gradin`. The grind dashboard.
-- `splice_experiment.py` — the isolation/validation harness.
-- DLL + IDA db at `/media/sf_vbox-rw/finger/` (`synaWudfBioUsb.{dll,i64}`),
-  image base 0x180000000, IDA demo at `~/idademo-7.5`. `objdump` works for raw
-  disasm.
+The 250 kps per frame become ~95 per section, after dedupe across frames.
+This logic LIVES SOMEWHERE in the WS body packer call tree. Find it by:
 
-## Key facts to carry in
+1. Hook `sub_180002240` entry/exit per frame (similar to the A5B0 hook we
+   built). Dump the WS body BEFORE and AFTER each frame. The DELTA shows
+   what that frame's processing wrote.
 
-- Working resolution **57×57** (not 112/116); DoH terms are **Q12** (`>>12`);
-  enhanced image is **Q10** (`×1024`, range [0,255·1024]).
-- 250 minutiae/frame; descriptor mean popcount ~64/128 (balanced binary).
-- Reference templates: `wine_finger_fresh.bin` (matches the live finger),
-  `wine_finger_data*.bin`. v30 regions in it: offsets 309/4913/9453/13993.
-- Hardware/Wine are intermittent; capture in batches. ptrace_scope may need
-  `sudo sysctl kernel.yama.ptrace_scope=0`.
+2. After 8 frames, each section should be filled. Compare the per-frame
+   delta to figure out: when does section[i] get populated? Is it
+   appended-to per frame, or filled-then-finalized at specific frame?
 
-## Honest effort note
+3. The 8-byte ascending lead may be intermediate state that gets
+   incrementally updated each frame.
 
-This is the proprietary fingerprint enhancement core — orientation estimation
-+ oriented filtering, bit-exact. It is a large, open-ended effort with no
-guarantee of a clean closed form, and small errors cascade through
-DoH→keypoints→descriptor where the matcher is unforgiving. The
-**Wine-enroll → replay** path (dev/MOH.md "Workflow") works today and is the
-pragmatic alternative if this stalls.
+## Tools at your disposal
+
+- `/tmp/syna_all.S` — 16 MB full objdump of `synaWudfBioUsb.dll`
+- `/tmp/syna.dll` — the binary (use for IDA / Ghidra if needed)
+- `dev/inspect_ws.py` — full byte-zone annotator of a captured ws_body
+- `dev/extract_skeleton.py` — diffs two captures, extracts constant skeleton
+- `dev/decode_variants.py` — hypothesis-testing framework (skeleton works,
+  needs new hypotheses informed by disasm)
+- `dev/gdb_dump.py` — capture hooks; add a `GDB_DUMP_PACKER_WS=1` hook on
+  `sub_180002240` entry/exit to capture per-frame WS body deltas
+- `dev/diff_template_structure.py` — diffs OUR native_template against
+  captured Wine ws_body to track progress
+- Existing captures in `/media/sf_vbox-rw/finger/frida_dumps/`:
+  - 2× Wine ws_body (different fingers)
+  - 1024× per-kp descriptors (byte-exact validated)
+  - 15× minutia_table dumps (8 + 7 per session — final AAB0 outputs)
+  - 144× F250 raw tiles, 37 gradstructs, etc.
+
+## Concrete next steps (recommended order)
+
+1. **Decompile `sub_180002240`** end-to-end. This is THE WS body packer
+   and probably writes the majority of variant bytes. Map every write to
+   the WS body offset it targets.
+
+2. **Find the multi-frame accumulator.** Inside or around 180002240.
+   Hook with gdb (add `GDB_DUMP_PACKER_WS` hook), capture per-frame WS body
+   delta, see how sections grow.
+
+3. **Decompile `sub_1800046E0`** (per-keypoint model fitter). Already partly
+   decoded (180-byte working record). The output may include the POSE
+   records that explain the 8-byte section leads.
+
+4. **Decompile the finalize/sealer** function. Look for the function that
+   writes `size_u32 = 23036` at WS body+4. Walk backwards from there to find
+   where `per_section_counts` and `geometry_stats` are written.
+
+5. **Build `validitysensor/moh_native_v2.py`** with `native_template_from_scratch(per_frame_kps)`
+   that uses an embedded constant skeleton + the newly-decoded derivations.
+   Test against `dev/diff_template_structure.py` (byte-by-byte vs captured
+   Wine ws_body — should converge as decode work progresses).
+
+6. **End-to-end gate:** `dev/enroll_native_chip.py --match` against a real
+   finger. Success = chip's matcher accepts our purely-from-scratch template.
+
+## What NOT to do
+
+- Don't try more pure black-box hypothesis testing. The space is too large;
+  the 8-byte ascending leads alone could be any of hundreds of possible
+  derivations. Without disasm we can't constrain the search.
+- Don't add more empirical thresholds or magic constants like the removed
+  `RESP_CULL_THRESHOLD`. Every constant must trace back to a specific DLL
+  instruction or be marked TODO with a reference to which function should
+  produce it.
+- Don't keep using `/tmp/wine_finger_fresh.bin` as a scaffold. It's from an
+  older Wine version with 4 sections, not 5. The constant skeleton should
+  come from a current capture (or be embedded in the repo once extracted
+  via `dev/extract_skeleton.py`).
+
+## Commit chain (current branch `moh-opencv-poc`)
+
+- `8986a16` ← HEAD  (dev/decode_variants.py — hypothesis tester)
+- `3168a1f`  (dev/extract_skeleton.py + 5-section finding)
+- `5cf3ea5`  (dev/inspect_ws.py annotator)
+- `601238d`  (dev/diff_template_structure.py)
+- `be0a4eb`  (RESP_CULL_THRESHOLD removed)
+- `81fe2bd`  (dev/extract_log_images, diff_log_pipeline, diff_a5b0kp)
+- `60f44ab`  (A5B0 boundary hook — ruled out A5B0 as cull)
+- `cccb426`  (FILL=0x800000 + corner-tile gy tightening)
