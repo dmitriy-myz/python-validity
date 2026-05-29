@@ -615,6 +615,44 @@ def build_v30(global_kps, max_records=250, tag=4, body_len=4533):
     return header + bytes(body)
 
 
+# ─── WS-body v30 SECTION serializer ──────────────────────────────────────
+# The v30 record area of ONE ws-body section. Distinct from build_v30()
+# above, which models the *standalone* per-frame v30 buffer (12-B header +
+# 17-B lead-in + body). A ws-body section is a PURE record area: exactly
+# n_slots × 18-byte records, no header/lead-in/trailer.
+#
+# GROUND-TRUTH CONFIRMED (gdb capture ws_body_1780084103036_23056.bin,
+# 2026-05-29): record = [x:u8][y:u8][16B descriptor], x/y FIRST (verified
+# 250/250 against minutia_tables; the [16B][x][y] order is the match-QUERY
+# serializer sub_1800057e0, NOT the stored template). Each section stores a
+# full 250 real records (no padding in a genuine enrollment); we zero-pad
+# only when our detector yields < 250.
+V30_SECTION_RECORDS = 250
+V30_SECTION_BYTES = V30_SECTION_RECORDS * 18  # 4500
+
+
+def serialize_v30_section(records, n_slots=V30_SECTION_RECORDS):
+    """Serialize one ws-body section's v30 record area.
+
+    `records`: iterable of (x:int, y:int, desc:16-bytes). Truncated to
+    n_slots; short tail zero-padded. Returns exactly n_slots*18 bytes
+    (4500 for the default 250-slot section).
+
+    Byte-exact-verified to reproduce a captured ws_body section when fed
+    that section's own (x, y, desc) — see dev/verify_v30_serializer.py."""
+    out = bytearray(n_slots * 18)
+    for i, rec in enumerate(records):
+        if i >= n_slots:
+            break
+        x, y, desc = rec[0], rec[1], rec[2]
+        o = i * 18
+        out[o] = x & 0xFF
+        out[o + 1] = (y & 0xFF) if y is not None else 0
+        d = bytes(desc[:16])
+        out[o + 2:o + 2 + len(d)] = d
+    return bytes(out)
+
+
 # ─── E090 oriented-BRIEF descriptor — disasm-decoded; impl pending capture ─
 # E090 reads gradient buffers from *(ctx[+0x50]): a struct with i32 stride@+0,
 # i32 height@+4, qword gradX_ptr@+0x20, qword gradY_ptr@+0x28. (E090's r8
@@ -971,24 +1009,21 @@ def native_template(image_q16, reference_template, subtype=None,
     # kps: list of (gx_int, gy_int, orient_q16, desc_16B), already
     # bound-filtered to [3, 109) by A960's check.
 
-    # 2. Build v30 records: [u8 x][u8 y][16B desc].
-    records = [bytes((gx & 0xFF, gy & 0xFF)) + (desc[:16] if len(desc) >= 16
-                                                 else desc + bytes(16 - len(desc)))
-               for (gx, gy, _orient, desc) in kps]
-
-    # 3. Replace v30 regions in the reference WS body. Each region holds up
-    # to 250 records; pad with zeros if we have fewer.
+    # 2-3. Serialize OUR keypoints into the ground-truth v30 section format
+    # ([x][y][16B desc] × 250, zero-padded) and overwrite every v30 region of
+    # the reference WS body. (Per the gdb capture, a genuine enrollment puts a
+    # DIFFERENT selected frame's table in each section; with a single native
+    # frame we write the same records into all regions — sufficient for the
+    # chip matcher, which scores per-section v30 records.)
+    section = serialize_v30_section(
+        [(gx, gy, desc) for (gx, gy, _orient, desc) in kps])
     regions = find_v30_regions(bytes(ws_body))
     if not regions:
         raise RuntimeError("no v30 regions found in reference template — "
                             "is it from a 06cb:00a2 sensor?")
     target_regions = regions if fill_all_sections else regions[:1]
     for base in target_regions:
-        section_records_bytes = (
-            b''.join(records[:250]) + bytes(V30_RECORD_LEN) *
-            max(0, 250 - len(records))
-        )[:250 * V30_RECORD_LEN]
-        ws_body[base:base + len(section_records_bytes)] = section_records_bytes
+        ws_body[base:base + len(section)] = section
 
     # 4. Recompute TID over the new WS body, wrap in the envelope.
     ws_body_bytes = bytes(ws_body)
