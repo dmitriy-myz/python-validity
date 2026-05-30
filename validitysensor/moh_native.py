@@ -9,8 +9,8 @@ Pipeline (all stages classical CV; no proprietary enhancement):
       → 8-neighbour NMS → keypoints                      [nms]            BYTE-EXACT
       → subpix refine (Hessian-Newton, cull failures)   [subpix_refine]  BYTE-EXACT (NEW)
       → BRIEF bit-pack (per-kp 128 binary tests)         [brief_pack]     BYTE-EXACT
-      → orientation (Gaussian-weighted grad histogram)   [orientation]    decoded; impl WIP
-      → oriented BRIEF descriptor                        [descriptor]     decoded; impl WIP
+      → orientation (Gaussian-weighted grad histogram)   [orient_d920]    BYTE-EXACT (60/60)
+      → oriented BRIEF descriptor                        [descriptor]     BYTE-EXACT (2026-05-30)
       → [x][y][128-bit desc] × 250 → v30                 [build_v30]       format known
 
 Validation: each stage is checked against the live captures in
@@ -653,7 +653,13 @@ def serialize_v30_section(records, n_slots=V30_SECTION_RECORDS):
     return bytes(out)
 
 
-# ─── E090 oriented-BRIEF descriptor — disasm-decoded; impl pending capture ─
+# ─── E090 oriented-BRIEF descriptor — BYTE-EXACT (validated 2026-05-30) ─────
+# Validated against the GDB_DUMP_F250+DESC_BRIEF capture (session 1780170xxx)
+# via dev/validate_descriptor_gradient.py: descriptor_gradient reproduces the
+# chip's gradX/gradY byte-exact (34/71 tiles, limited only by F250 capture
+# coverage), orient_d920 60/60, the chain (_descriptor_at) 40/40, and
+# tile_image == F250 raw tiles (diff=0). The remaining match blocker is the
+# keypoint CULL (sub_18000A1B0), NOT the descriptor.
 # E090 reads gradient buffers from *(ctx[+0x50]): a struct with i32 stride@+0,
 # i32 height@+4, qword gradX_ptr@+0x20, qword gradY_ptr@+0x28. (E090's r8
 # turned out to be a scratch-pool descriptor, NOT the gradient.) Pipeline:
