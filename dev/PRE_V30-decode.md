@@ -73,3 +73,41 @@ So the persistent TLV field state to reproduce: `0x03=0x6b=5` (section count),
   in `sec0_pre` and confirm `0x69=(112,112)` is fixed; (c) decode the sec0
   global-table writer. Most framing is now reproducible; only the pose/geometry/
   count derivations remain, and they're localized.
+
+## sec0_pre — investigated via the packer_emit + pose capture (1780086xxx)
+
+The 3rd gdb capture (`GDB_DUMP_PACKER_EMIT=1 GDB_DUMP_POSE=1`) produced per-codec
+stream deltas + the bd10 argsort dumps. Findings:
+
+- **Writer = `sub_1800051f0`** (the per-frame section-table emitter). Confirmed
+  by the f0 stream delta: of the 9 emit-block calls, only `51f0` writes the
+  section-table region (the `56c0` call writes the 4540-B v30 content; the
+  setters write the small TLV records). `51f0` **overwrites `sec0_pre` IN PLACE**
+  each selected frame (not append) — the TLV grow/shift path (`sub_180006a80`/
+  `sub_180006970`).
+- **Timing:** at f0 (1 section) `sec0_pre` is ~all-zero; the final head appears
+  at **f5** (3rd selected frame) and the table grows through f7. Selected frames
+  this capture: f0,f2,f5,f6,f7 (f1,f3,f4 rejected) — best-frame selection.
+- **Structure:** `sec0_pre` = ~8 × 20-byte records of large Q16 fixed-point
+  values (the **inter-section alignment transforms** the matcher `c6a0`/`bdf0`
+  computes pairwise between sections) + zero pad + the section-0 content marker
+  `04 00 b8 11` (`0x11b80004`) at +0xd8 + `00..00 fa` framing.
+- **`pose obj[0x10] = N = section count`** (call0..4 → N = 1..5). The bd10
+  argsort inside `51f0` sorts **section indices**: `arr0_after` = `[N-1..0]`
+  (call4 → `04 03 02 01 00`, descending-convention). So that argsort orders the
+  global table; it is NOT the source of the per-section 8-byte ascending leads.
+
+**Implication.** `sec0_pre` is **derived multi-frame geometry** — the pairwise
+section-alignment transforms. It only exists with ≥2 sections and its exact
+bytes depend on the finger's cross-frame poses (via the `bdf0` Q16 transform
+math). A single-frame native template has no inter-section poses, so this zone
+is naturally near-empty (the f0/N=1 case). Current `native_template` copies it
+from the ref scaffold — fine for STORAGE; for MATCHING the chip scores the
+per-section v30 records (which we build byte-exact), so `sec0_pre` matters only
+for cross-section consistency.
+
+**Still open:** (1) the per-section 8-byte ascending leads — NOT bd10 section
+indices, NOT minutia quantiles; source still unidentified (a different argsort
+or per-section signature). (2) Full byte-derivation of the `sec0_pre` Q16
+records needs the `bdf0` pairwise-transform math decoded. (3) the session
+accumulator counts (`0x6c`, per_section_counts).

@@ -403,3 +403,57 @@ bbox; `c270` is the per-hypothesis re-vote.) Only call is `sub_180006bc0`; no
 The one residual low-confidence item is the exact division of labour between
 `bfd0` (template seed) and `c270` (per-candidate re-vote) — both use the same
 lattice-warp idiom; a `GDB_DUMP` grid dump per candidate (`0xc510` entry) settles it.
+
+---
+
+## Addendum — `sub_18000bdf0` pairwise Q16 transform math (decoded)
+
+`sub_18000bdf0(obj /*rcx→r14*/, self_idx /*edx→r12*/, rec /*r8*/, r9, N /*[rsp+0xa0]*/, out_ts /*[rsp+0xa8]*/)`
+builds the **symmetric pairwise section-alignment table** at `*(r14+0x18)` (an array
+of per-section row pointers). For each other-section `j = 0..N`:
+
+- **forward** (`0x18000be96`): copy the matcher's transform record (`rec`, 20-byte
+  `[x:u8][y:u8][2][a:u32][b:u32][tx:u32][ty:u32]`) into `table[j][self*20]` —
+  `a@+4, b@+8, tx@+0xc, ty@+0x10, y@+1=rec[0], x@+0=rec[-1]`. Guarded by
+  `sub_18000b420(rec)!=0` (skip if identity).
+- **inverse** (`0x18000beeb`): `sub_180006da0(&inv, rec)` → store `inv` into
+  `table[self][j*20]`.
+
+Slots are pre-initialized by `sub_180007a70`/`a80` to `[x=0][y=0xff][identity]`
+(`0xff` y = unmatched sentinel). Afterwards `sub_18000bd10` argsorts the rows
+(section indices). `51f0` later serializes this table into `sec0_pre`.
+
+### The transform (rigid 2D similarity, Q16)
+
+Forward (matches `sub_180006bc0` used by the voter `c270`):
+```
+p' = ( (a·px − b·py + tx + 0x8000) >> 16 ,
+       (b·px + a·py + ty + 0x8000) >> 16 )      R = [[a,−b],[b,a]] , t=(tx,ty)
+```
+**Identity = (a=0x10000, b=0, tx=0, ty=0)** (a = cos·65536; unit scale, so
+a²+b² = 0x10000²). `sub_18000b420` tests exactly this 4-field identity.
+
+### The inverse (`sub_180006da0`, integer, byte-exact)
+
+```
+inv_a  = a
+inv_b  = −b
+inv_tx = −( (a·tx + b·ty) >> 16 )     ; impl: −(((a>>1)(tx>>9) + (b>>1)(ty>>9)) >> 6)
+inv_ty = −( (a·ty − b·tx) >> 16 )     ; impl: −(((a>>1)(ty>>9) − (b>>1)(tx>>9)) >> 6)
+```
+= inverse of a unit-scale similarity: inverse rotation = transpose `[[a,b],[−b,a]]`
+(stored as `inv_a=a, inv_b=−b` so re-applying the forward formula gives Rᵀ),
+inverse translation = `−Rᵀ·t`. No `/det` — assumes pure rotation (a²+b²=1), i.e.
+the matcher emits rigid (rotation+translation) alignments, no scale.
+
+### Verification status
+
+The MATH is confirmed from the disasm (identity sentinel `0x10000,0,0,0` from
+`b420` pins a,b,tx,ty as Q16). NOT yet byte-verified against `sec0_pre` because
+`sec0_pre` is `51f0`'s *serialization* of this in-memory table (leads + blob +
+matrix), not the raw 20-byte records — a naive 20-byte read of `sec0_pre` gives
+non-unit a,b (layout differs). To byte-verify: decode `51f0`'s serialization of
+`*(r14+0x18)`, or hook `*(r14+0x18)` directly (`GDB_DUMP` at `0x18000c8ee`). The
+forward transforms themselves originate in the matcher `c6a0` (the per-pair
+best-voting alignment hypothesis), so deriving the *values* from scratch needs
+the cross-frame keypoint correspondences, not just this function.
