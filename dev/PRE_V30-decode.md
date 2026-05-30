@@ -111,3 +111,32 @@ indices, NOT minutia quantiles; source still unidentified (a different argsort
 or per-section signature). (2) Full byte-derivation of the `sec0_pre` Q16
 records needs the `bdf0` pairwise-transform math decoded. (3) the session
 accumulator counts (`0x6c`, per_section_counts).
+
+## sec0_pre serialization (`sub_1800051f0`) — DECODED + byte-verified
+
+`sub_1800051f0` serializes the bdf0 pairwise table (`*(obj+0x18)`) into sec0_pre:
+```
+[open-record TLV header]
+[leads:  edi bytes from *(obj+0)]           edi = the count arg (r8d)
+[blob:   edi*4 bytes from *(obj+8)]
+[u8 obj[0x10]=N (section count)] [u8 obj[0x11]]
+[UPPER-TRIANGLE matrix: for i<j, table[i][j] as an 18-byte record
+   [x:u8][y:u8][a:i32][b:i32][tx:i32][ty:i32]]   (drops bdf0's +2 pad → 18 not 20)
+[ zero pad ][ section-0 content marker 04 00 b8 11 ... fa ]
+```
+The matrix loop (`0x1800052d0`–`0x18000536d`) emits `table[i][j]` for `j=i+1..N-1`
+(upper triangle, diagonal skipped). Records are 18 bytes (x@+0,y@+1, then a/b/tx/ty
+as 4 consecutive u32 — the in-memory +2 pad is dropped).
+
+**Byte-verified** (`dev/decode_sec0_pre.py`, 3 captures): the sec0_pre transform
+records all decode as **unit-scale rigid 2D similarity** (`a²+b² ≈ 0x10000²`, scale
+1.0000), with small inter-section rotations (≤±5°) and translations (≤~±70 px) —
+physically exactly right for frame-to-frame fingerprint alignment. So sec0_pre =
+the pairwise rigid alignments between the selected frames' sections.
+
+**Resolved.** sec0_pre is fully understood: structure (TLV header + leads + blob +
+N markers + upper-triangle 18-B rigid-Q16 transform records + section marker) and
+semantics (inter-section alignment poses from the matcher). The transform *values*
+are multi-frame matcher output (rigid rotations+translations between frames), so a
+single-frame native template has none (N=1 → empty matrix) — confirming sec0_pre
+cannot be synthesized from one frame, only copied or left empty.
