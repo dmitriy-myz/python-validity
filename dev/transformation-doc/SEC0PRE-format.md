@@ -30,6 +30,42 @@ Full **N×N symmetric pairwise** table, 20-byte records `[x:u8][y:u8][2 pad][a:i
 - **leads** = a descending index permutation of length N: `[3,2,1,0]` at the final call. Per [[ws-pose-leads]] it's an argsort permutation (sub_18000bd10), NOT scores. It orders the sections by the blob scores.
 - **blob** = per-section u32 values (the argsort keys / quality scores): final call `[0x54000000, 0x5C000000, 0x5C000000, 0x5A000000, 0x57000000]` (look like floats/fixed-point quality; source = sub_180008980 pose quality, `[rec+0x38]`).
 
+## DEFINITIVE SERIALIZATION — BYTE-EXACT VERIFIED (2026-05-31)
+Decoded `sub_1800051f0` (disasm `/tmp/func_1800051f0.S`) + helpers and verified the
+full byte layout against the stored template in `1780253459.log` (5 sections). The
+framed `sec0_pre` region (`template[24:292]`, 268 B) is:
+
+```
+[u16 type=2][u16 size]            # stream header (sub_1800069e0); size patched at the very end
+leads:  N  bytes                  # obj+0  — reverse-index [N-1..0]
+blob:   N  u32 (LE)               # obj+8  — per-section quality (q<<24)
+N:      1 byte                    # obj[0x10] (= #sections / matrix dim; written from dl AT ENTRY,
+                                  #   so the gdb hook's hdr[0x10] is the STALE pre-write value)
+flag:   1 byte                    # obj[0x11]  (observed = 1)
+matrix: upper-triangle table[i][j] for j>i, row-major, 18 bytes each:
+          [x:u8][y:u8][a:i32][b:i32][tx:i32][ty:i32]   (drops the in-mem +2/+3 pad)
+<zero pad to `size` bytes, counted from AFTER the 4-byte header>
+```
+
+- **`size` = reservation formula** `(((N//2)*5)*4 + 4)*N + ((N+3)&~3) + 0x24` (= 264 for N=5),
+  NOT the content length (207). Appends increment a running size; the tail patch overwrites it
+  with the formula. Measured from after the header → lands the next-section marker exactly at +292.
+- **leads = reverse-index `[N-1..0]`, independent of blob.** `sub_18000bd10` identity-inits
+  `leads[i]=i`, builds N `(key=0, idx=i)` pairs, `qsort`s with comparator `sub_18000b1f0`
+  (`return b-a`, descending; tie-break descending by idx). All keys 0 → deterministic reverse order.
+  (The captured leads dump `[3,2,1,0]` was the STALE pre-`bd10` buffer; bd10 regenerates at serialize.)
+- **only the strict UPPER triangle is emitted** (loop skips `j==i`; inner `j` runs `i+1..N-1`).
+  The in-memory table is full N×N (forward `table[i][j]`, inverse `table[j][i]`) but the lower
+  triangle + diagonal are NOT serialized.
+- Append helpers: `sub_1800064d0`=u32 LE, `sub_180006510`=u8, `sub_180006550`=N bytes — all LE,
+  confirmed by the byte-exact decode.
+
+**Serializer + parser: `dev/sec0pre_serialize.py`** — `serialize_sec0pre(N, transforms, blob, flag)`
+round-trips the stored template byte-for-byte (`__main__` asserts `template[24:292] == output`).
+The lone approximate field for SYNTHESIS is `blob` (per-section quality, source `sub_180008980`
+`[rec+0x38]`); leads ignores it and the matcher uses the matrix transforms, so it is likely
+non-load-bearing.
+
 ## What this unblocks + what remains
 We now have the EXACT in-memory structure. To build a byte-faithful sec0_pre:
 1. **Nail the serialization** (in-memory N×N table → the `sec0_pre` byte stream): map the captured `call04` table to the stored template's sec0_pre bytes (extract template from `1780253459.log`'s `0x47 typ=6` record; the naive 18-byte scan in `decode_sec0_pre.py` is unreliable across the leads/blob boundary — use the capture as the oracle). Determine exact record order (upper+lower triangle? row-major?), leads/blob placement, TLV framing.
