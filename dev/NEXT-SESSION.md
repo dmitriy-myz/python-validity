@@ -109,18 +109,30 @@ Repeated raw `0x47` writes degraded the chip; it now rejects writes with
 **Wine re-enroll** — which also re-creates a matchable finger and a fresh
 capturable DLL template for field-by-field diffing.
 
-### STEP 2-NEXT (after recovery) ← YOU ARE HERE
-1. **Recover:** Wine re-enroll the finger (capture the log to grab the new
-   matchable DLL template). Confirm with `--list-users`.
-2. **Cheap test:** `sudo .../enroll_native_chip.py --frames 4 --match
-   --parent <user> --subtype 0xXX` — 4 distinct frames into the 4 sections
-   (scaffold pre-v30). If it MATCHES, multi-frame was the gap and the matcher
-   re-derives transforms from descriptors (pre-v30 not load-bearing).
-3. **If still no match:** compute `sec0_pre` for OUR 4 frames (matcher math is
-   decoded — [[moh-matcher]], dev/decode_sec0_pre.py, dev/SCORER-sub_18000c6a0.md)
-   so pre-v30 is consistent with our sections; verify against the fresh Wine
-   capture, then re-test. Manage chip state: delete stale native records
-   between attempts to avoid re-triggering `0x04b5`.
+### STEP 2-NEXT ← YOU ARE HERE  (chip recovered via Wine log 1780232416)
+**`sec0_pre` is LOAD-BEARING** (SCORER §1: the matcher votes the stored 20-byte
+`[x][y][a,b,tx,ty]` geometry records as candidate alignments) → multi-frame
+alone won't fix it; we must compute correct `sec0_pre` for our frames.
+
+Full OFFLINE ground truth now in hand from Wine log `1780232416.log`:
+- matchable DLL template `/tmp/ft/wine_1780232416_0.bin` — **mode-B, 5 sections**,
+  8 `sec0_pre` transforms, TID OK (our scaffold is mode-A/4-section = wrong
+  shape+geometry).
+- the **8 source frame images** (`0x0278`, 13776 B each) are in the log too.
+
+Plan:
+1. **Cheap de-risk (optional, low odds):** `--frames 4 --match --subtype 0xf7`
+   on the healthy chip. If it matches, the descriptor-correspondence shortcut
+   suffices; if not (expected), `sec0_pre` synthesis is required.
+2. **Build `sec0_pre` synthesis** (the real fix), verifiable OFFLINE: extract
+   the 8 images + the 5 DLL sections; run our pipeline on the images; compute
+   pairwise rigid transforms and check they reproduce the DLL's stored
+   `sec0_pre`. CAVEAT: SCORER decoded transform SCORING, not GENERATION —
+   confirm where enrollment first computes the transforms (correspondence →
+   hypothesis) before committing; may need more RE/capture.
+3. Assemble a self-consistent **mode-B/5-section** template (our v30 + our
+   `sec0_pre`) and re-test. Chip hygiene: delete stale native records between
+   attempts; Wine-recover if `0x04b5` recurs.
 
 ## DATA / TOOLS
 
