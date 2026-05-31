@@ -59,6 +59,10 @@ RVA_CF90 = 0xCF90     # NMS / keypoint extractor (opt-in) — see NmsEntryBP
 RVA_D920 = 0xD920     # orientation per keypoint (opt-in) — see OrientEntryBP
 RVA_E090 = 0xE090     # oriented BRIEF descriptor (opt-in) — see DescBriefEntryBP
 RVA_E5D0 = 0xE5D0     # inside E090: right after `r10 = [rsp+0x58]` — see DescSamplesBP
+RVA_51F0 = 0x51F0     # sec0_pre SERIALIZER (sub_1800051f0): rcx=obj holding the
+                       #   pairwise transform table. Captures the leads/blob/N +
+                       #   inter-frame rigid transforms the DLL computed (opt-in,
+                       #   GDB_DUMP_SEC0PRE) — see Sec0PreEntryBP.
 RVA_36590 = 0x36590   # envelope-builder VALIDATOR wrapper (opt-in) — see EnvelopeBP
 RVA_36840 = 0x36840   # envelope BUILDER — internally alloc'd buffer, writes
                        #   size to *r8 (arg3) and ptr to *(r8+8). 23136B for
@@ -211,6 +215,48 @@ A5B0_KP_MAX = int(os.environ.get('GDB_A5B0_KP_MAX', '32'))   # 9 tiles × ~3 fra
 # against our native_template() output. Fires once per Wine enrollment.
 ENVELOPE_ON = os.environ.get('GDB_DUMP_ENVELOPE') == '1'
 ENVELOPE_MAX = int(os.environ.get('GDB_ENVELOPE_MAX', '8'))
+
+SEC0PRE_ON = os.environ.get('GDB_DUMP_SEC0PRE') == '1'
+_sec0_calls = 0
+
+
+class Sec0PreEntryBP(gdb.Breakpoint):
+    """sub_1800051f0 (sec0_pre serializer): rcx=obj, edx=section index, r8d=N,
+    r9=ctx. Per dev/decode_sec0_pre.py the obj holds: leads at *(obj+0) (N bytes),
+    blob at *(obj+8) (N*4 bytes), N at obj[0x10], obj[0x11], and the pairwise
+    rigid-transform table at *(obj+0x18) (array of N row pointers, each N×20-byte
+    records [x][y][pad][a,b,tx,ty Q16]). Dumps all of it so we can see the exact
+    inter-frame transforms + leads/blob the DLL generated for known input frames."""
+    def stop(self):
+        global _sec0_calls
+        if _sec0_calls >= 16:
+            return False
+        try:
+            obj = _reg('rcx')
+            sec_idx = _reg('edx') & 0xff
+            N_arg = _reg('r8') & 0xffffffff
+            i = _sec0_calls
+            hdr = _read_safe(obj, 0x40)
+            _save('sec0pre_obj', f'call{i:02d}_idx{sec_idx}_N{N_arg}', hdr)
+            N = hdr[0x10] if len(hdr) > 0x10 else N_arg
+            N = N if 0 < N <= 32 else (N_arg if 0 < N_arg <= 32 else 8)
+            leads_ptr = int.from_bytes(hdr[0:8], 'little') if len(hdr) >= 8 else 0
+            blob_ptr = int.from_bytes(hdr[8:16], 'little') if len(hdr) >= 16 else 0
+            tbl_ptr = int.from_bytes(hdr[0x18:0x20], 'little') if len(hdr) >= 0x20 else 0
+            if leads_ptr:
+                _save('sec0pre_leads', f'call{i:02d}_N{N}', _read_safe(leads_ptr, max(N, 16)))
+            if blob_ptr:
+                _save('sec0pre_blob', f'call{i:02d}_N{N}', _read_safe(blob_ptr, max(N * 4, 32)))
+            if tbl_ptr:
+                rows = bytearray()
+                for r in range(N):
+                    rowp = _u64(tbl_ptr + r * 8)
+                    rows += (_read_safe(rowp, N * 20) if rowp else b'')
+                _save('sec0pre_table', f'call{i:02d}_N{N}', bytes(rows))
+            _sec0_calls += 1
+        except Exception as e:
+            print(f'[!] sec0pre dump failed: {e}')
+        return False
 
 
 def _reg(name):
@@ -1315,6 +1361,11 @@ def main():
         EnvelopeEntryBP('*' + hex(base + RVA_36590))
         print(f'[*] envelope hook ON (max {ENVELOPE_MAX} calls) — dumps the '
               f'final 23136B template at wrapper exit')
+
+    if SEC0PRE_ON:
+        Sec0PreEntryBP('*' + hex(base + RVA_51F0))
+        print('[*] sec0_pre hook ON — dumps the leads/blob/N + pairwise rigid '
+              'transform table (sub_1800051f0) per section build')
     print(f'[*] breakpoints armed. dumps -> {OUTDIR}/')
     print('[*] run a full enrollment now, then Ctrl-C + detach.')
     gdb.execute('continue')
