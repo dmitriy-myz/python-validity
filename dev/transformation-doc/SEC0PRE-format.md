@@ -74,3 +74,33 @@ We now have the EXACT in-memory structure. To build a byte-faithful sec0_pre:
 4. Assemble mode-B 5-section template, test `--match`.
 
 Note: orientation bug already fixed (feature frame must NOT be transposed; identity gives 242-250/250 keypoint overlap — commit 53c762e). Chip matching is geometric (positional Hough sub_18000c6a0), so close transforms + correct positions should suffice.
+
+## TRANSFORM GENERATION — geometric methods CANNOT reproduce the DLL (2026-05-31)
+Validated `geom_register` (and identity-seeded ICP) against the captured ground truth
+for enroll 1780253459 (5 sections, source frames mapped {0,4,5,6,7}→sec{0..4}, our
+pipeline reproduces their keypoints 238-248/250 exact-xy):
+
+- **The captured transforms are GLOBALLY SELF-CONSISTENT**: `table[i][j] ==
+  compose(table[0][j], inv(table[0][i]))` to within **1.1px / 0.6°** (triangle
+  1→2→3 vs 1→3 to 0.3px). ⇒ the DLL registers everything to a reference frame and
+  composes (the `sub_180008160` path); we'd only need `table[0][j]` (4 transforms),
+  the rest derive by composition.
+- **But we cannot find `table[0][j]` geometrically.** `geom_register` overlap-max
+  reproduces only 1/10 (it locks onto a DIFFERENT high-overlap alignment); ICP from
+  identity collapses to t≈0. Cause: the quasi-periodic ridge pattern admits MANY
+  high-overlap rigid alignments (the clouds overlap both at identity AND at the DLL's
+  real ±20-36px motion). Only the DLL's descriptor correspondences (the decoded
+  model-fitter `sub_1800046e0`) disambiguate which ridge maps to which.
+- Our v30 **positions are byte-exact** but **descriptors are near-random vs the DLL's**
+  (median Hamming ~49) — the E090 descriptor path needs F250-enhanced input which
+  `extract_frame_native` does not reproduce from a raw log frame. The matcher is
+  positional (sub_18000c6a0: "a cell holds a count, not a descriptor"), so this is
+  likely irrelevant — the diagnostic template tests exactly that.
+
+**Diagnostic templates** (`dev/build_diagnostic_template.py`): T0 = exact DLL template
+(positive control); T1 = OUR v30 for the mapped frames + the DLL's BYTE-EXACT sec0_pre/
+leads/blob/framing (TID recomputed). If the chip matches T1, then sec0_pre transform
+GENERATION is the SOLE remaining from-scratch blocker. PATHS to generate transforms:
+(a) gdb-capture the registration during a Wine enroll (README 6-bp plan) for byte-exact
+ground truth; (b) port the descriptor-correspondence model-fitter (needs F250-correct
+descriptors too); (c) test whether a self-consistent geometric set suffices on chip.
