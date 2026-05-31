@@ -66,19 +66,39 @@ was never the requirement (matching is geometric Hough voting, `moh-matcher`).
 - The earlier "subpix differs" hypothesis in `native-pipeline-readiness` memory
   is now REFUTED and the memory is updated.
 
+## REFERENCE-FREE enrollment — DONE 2026-05-31
+
+`native_template` no longer needs a captured reference template. The WS-body
+framing now comes from a baked-in scaffold `validitysensor/native_ws_scaffold.bin`
+(genuine chip-accepted fresh.bin framing with the v30 record areas ZEROED — no
+real descriptors shipped). At runtime we overlay OUR v30 records into the 4
+pinned regions `(309, 4913, 9453, 13993)` and recompute the TID, so the entire
+template — keypoints AND framing — is ours, with no reference file. Verified
+byte-faithful: `dev/verify_reference_free.py` (22/22 checks) confirms the
+framing is byte-identical to fresh.bin outside the v30 areas, the TID validates,
+the explicit-`--ref` path still works (regression), and the real pipeline runs
+end-to-end. `native_template(img)`, `Sensor.enroll_native(...)`, and
+`enroll_native_chip.py` all default to reference-free (`--ref` is now optional).
+
+Caveat (the honest gap): the scaffold's pre-v30 metadata (sec0_pre pose table,
+per-section counts/leads) still describes fresh.bin's frames, not ours — full
+first-principles pre-v30 synthesis is blocked by NEEDS-HOOK rows in
+`dev/PACKER-sub_180002240.md`. Whether the matcher needs pre-v30 to describe OUR
+geometry is exactly what the match gate (below) settles.
+
 ## STEP 2 — run the match gate (byte-identity is NOT required) ← YOU ARE HERE
 
-Step 1 confirms the pipeline is byte-exact on the same image, so build a
-template from OUR frames (`native_template`, v30 records byte-exact for our kps)
-and run the real gate on hardware:
+Step 1 confirms the pipeline is byte-exact on the same image, and enrollment is
+now reference-free, so just run the real gate on hardware (no `--ref`):
 
 ```
-dev/enroll_native_chip.py --match    # needs the physical chip + finger (you-run-it)
+sudo ./.venv-poc/bin/python dev/enroll_native_chip.py --subtype 0xf5 --match
 ```
 
 Success = the chip's matcher accepts our purely-from-scratch template. This is
 the last remaining step and it is hardware-in-the-loop (not reproducible from
-captures). `git pull` on the Wine box first.
+captures). `git pull` on the Wine/sensor box first. If a single frame doesn't
+match, try `--frames 4` (distinct frames per v30 section).
 
 ## DATA / TOOLS
 

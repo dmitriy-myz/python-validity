@@ -819,7 +819,7 @@ class Sensor:
         return tinfo
 
     def enroll_native(self, parent_dbid: int, subtype: int,
-                       reference_template: bytes,
+                       reference_template: bytes = None,
                        trailer: bytes = b'\x11',
                        update_cb: typing.Callable[[typing.Any, typing.Optional[Exception]], None] = lambda *a, **k: None,
                        max_attempts: int = 6,
@@ -841,9 +841,11 @@ class Sensor:
                 a non-existent dbid succeeds at the storage layer BUT the
                 chip's matcher will silently fail to find the enrollment.
             subtype: the WinBio subtype (= finger position) for the record.
-            reference_template: bytes of a 23136-byte chip-acceptable
+            reference_template: optional 23136-byte chip-acceptable
                 template from this sensor — its descriptors get replaced
-                with ours; its WS framing bytes are reused.
+                with ours; its WS framing bytes are reused. If None
+                (default), a baked-in framing scaffold is used so NO
+                reference template is required.
             trailer: 1-byte record-type marker appended to the wire payload.
                 Default 0x11 (matches enroll.log captures). Per bisect_ws
                 trailer-sweep results: any value works.
@@ -857,13 +859,14 @@ class Sensor:
         from .flash import call_cleanups
         from . import blobs
 
-        if len(reference_template) != 23136:
+        if reference_template is not None and len(reference_template) != 23136:
             raise ValueError(
                 f'reference_template must be 23136 bytes, got {len(reference_template)}')
         if len(trailer) != 1:
             raise ValueError(f'trailer must be 1 byte, got {len(trailer)}')
 
-        from .moh_native import extract_frame_native
+        from .moh_native import (extract_frame_native, _load_ws_scaffold,
+                                 NATIVE_WS_V30_REGIONS)
         from .moh_extract import compute_tid, _build_envelope
         from .moh_opencv import WS_SIZE, V30_RECORD_LEN, find_v30_regions
         import struct
@@ -928,8 +931,12 @@ class Sensor:
                 # (round-robin if num_frames != 4). The reference's WS framing
                 # bytes stay (header, anchors, section counts).
                 logging.info('enroll_native: building envelope...')
-                ws_body = bytearray(reference_template[12:12 + WS_SIZE])
-                regions = find_v30_regions(bytes(ws_body))
+                if reference_template is None:
+                    ws_body = bytearray(_load_ws_scaffold())
+                    regions = list(NATIVE_WS_V30_REGIONS)
+                else:
+                    ws_body = bytearray(reference_template[12:12 + WS_SIZE])
+                    regions = find_v30_regions(bytes(ws_body))
                 for idx, base in enumerate(regions):
                     src_frame = per_frame_kps[idx % len(per_frame_kps)]
                     records_bytes = (

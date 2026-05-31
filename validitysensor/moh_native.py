@@ -969,44 +969,85 @@ def extract_frame_native(image_q16, h=112, w=112,
     return merge_tile_kps_to_global(per_tile_kps, h, w)
 
 
-def native_template(image_q16, reference_template, subtype=None,
+# ─── Baked WS-body scaffold — makes native enrollment REFERENCE-FREE ───────
+# A genuine chip-accepted Wine template (wine_finger_fresh.bin, mode-A, 4
+# v30 sections) with its v30 RECORD areas zeroed — i.e. the TLV framing only:
+# the 24-byte header, per-section counts, the sec0_pre inter-section pose
+# table, the section-content markers, and the tail. This is finger-INDEPENDENT
+# RE-derived constant data (same role as brief_table.bin / aggr_table.bin):
+# we overlay OUR v30 records onto it at runtime and recompute the TID, so no
+# captured reference template needs to be supplied. The real descriptors of
+# the source template are NOT shipped (zeroed for privacy + clarity).
+#
+# The v30 record areas live at these fixed offsets in the scaffold (from
+# find_v30_regions on fresh.bin); each is 250×18 = 4500 bytes. They're pinned
+# rather than re-detected because the scaffold's record areas are zeroed (so
+# the coordinate-run heuristic can't find them).
+NATIVE_WS_V30_REGIONS = (309, 4913, 9453, 13993)
+_NATIVE_WS_SCAFFOLD = None
+
+
+def _load_ws_scaffold():
+    """Return the 23056-byte baked WS-body framing scaffold (v30 zeroed)."""
+    global _NATIVE_WS_SCAFFOLD
+    if _NATIVE_WS_SCAFFOLD is None:
+        import os
+        p = os.path.join(os.path.dirname(__file__), 'native_ws_scaffold.bin')
+        with open(p, 'rb') as f:
+            _NATIVE_WS_SCAFFOLD = f.read()
+    return _NATIVE_WS_SCAFFOLD
+
+
+def native_template(image_q16, reference_template=None, subtype=None,
                      fill_all_sections=True):
-    """End-to-end native enrollment template.
+    """End-to-end native enrollment template — REFERENCE-FREE by default.
 
     Detects keypoints in `image_q16` with the byte-exact native pipeline
     (DoH → NMS → orient → descriptor — same code paths the DLL runs),
     formats them into 18-byte v30 records `[u8 x][u8 y][16B desc]`,
-    overwrites every v30 region of the reference template's WS body with
-    those records, recomputes the TID, and returns the new envelope.
+    overwrites every v30 region of the WS body with those records,
+    recomputes the TID, and returns the new envelope.
 
-    The reference template is used PURELY for WS body framing bytes (the
-    24-byte header, section counts, anchors between v30 regions, trailing
-    pad). The chip doesn't validate framing — it just runs the matcher
-    over the v30 record data — so any chip-accepted template from the
-    same sensor works as a structural scaffold. The (x, y) coordinates
-    in the reference are NOT reused; ours come from our keypoint detector.
+    By default (reference_template=None) the WS-body framing comes from a
+    baked-in scaffold (`native_ws_scaffold.bin`) — so NO captured reference
+    template is required. The scaffold provides only finger-independent
+    framing bytes (header, section counts, sec0_pre pose table, section
+    markers, tail); the (x, y, descriptor) content is entirely ours.
+
+    Optionally pass `reference_template` (a 23136-byte chip-accepted envelope
+    from this sensor) to use ITS framing instead — the v30 regions are then
+    located via find_v30_regions. The chip doesn't validate framing for
+    storage; it runs the matcher over the v30 record data.
 
     Args:
         image_q16: (h, w) int32 Q16 image (mid-gray = 0x800000). The
             sensor returns uint8; convert via `img.astype(np.int32) << 16`.
-        reference_template: bytes of a 23136-byte chip-accepted template
-            envelope from this sensor (e.g. one previously enrolled via
-            Wine). Provides the WS body framing only.
-        subtype: override subtype (default: read from reference[0:2]).
+        reference_template: optional 23136-byte chip-accepted template
+            envelope. If None (default), use the baked scaffold.
+        subtype: override subtype. Default: read from reference[0:2] when a
+            reference is given, else moh_opencv.DEFAULT_SUBTYPE.
         fill_all_sections: if True (default), write our records into every
-            v30 region of the WS body (4 regions for typical 4-frame
-            enrollment). If False, only fill the first region.
+            v30 region. If False, only fill the first region.
 
     Returns:
         23136-byte envelope ready for db.new_finger() (= chip cmd 0x47)."""
     from .moh_extract import compute_tid, _build_envelope
-    from .moh_opencv import WS_SIZE, V30_RECORD_LEN, find_v30_regions
+    from .moh_opencv import WS_SIZE, find_v30_regions, DEFAULT_SUBTYPE
     import struct
 
-    if subtype is None:
-        subtype = struct.unpack_from('<H', reference_template, 0)[0]
-
-    ws_body = bytearray(reference_template[12:12 + WS_SIZE])
+    if reference_template is None:
+        ws_body = bytearray(_load_ws_scaffold())
+        regions = list(NATIVE_WS_V30_REGIONS)
+        if subtype is None:
+            subtype = DEFAULT_SUBTYPE
+    else:
+        if subtype is None:
+            subtype = struct.unpack_from('<H', reference_template, 0)[0]
+        ws_body = bytearray(reference_template[12:12 + WS_SIZE])
+        regions = find_v30_regions(bytes(ws_body))
+        if not regions:
+            raise RuntimeError("no v30 regions found in reference template — "
+                                "is it from a 06cb:00a2 sensor?")
     assert len(ws_body) == WS_SIZE, f"WS body must be {WS_SIZE}B, got {len(ws_body)}"
 
     # 1. Detect OUR keypoints + descriptors from OUR image.
@@ -1016,17 +1057,13 @@ def native_template(image_q16, reference_template, subtype=None,
     # bound-filtered to [3, 109) by A960's check.
 
     # 2-3. Serialize OUR keypoints into the ground-truth v30 section format
-    # ([x][y][16B desc] × 250, zero-padded) and overwrite every v30 region of
-    # the reference WS body. (Per the gdb capture, a genuine enrollment puts a
-    # DIFFERENT selected frame's table in each section; with a single native
-    # frame we write the same records into all regions — sufficient for the
-    # chip matcher, which scores per-section v30 records.)
+    # ([x][y][16B desc] × 250, zero-padded) and overwrite every v30 region.
+    # (Per the gdb capture, a genuine enrollment puts a DIFFERENT selected
+    # frame's table in each section; with a single native frame we write the
+    # same records into all regions — sufficient for the chip matcher, which
+    # scores per-section v30 records.)
     section = serialize_v30_section(
         [(gx, gy, desc) for (gx, gy, _orient, desc) in kps])
-    regions = find_v30_regions(bytes(ws_body))
-    if not regions:
-        raise RuntimeError("no v30 regions found in reference template — "
-                            "is it from a 06cb:00a2 sensor?")
     target_regions = regions if fill_all_sections else regions[:1]
     for base in target_regions:
         ws_body[base:base + len(section)] = section

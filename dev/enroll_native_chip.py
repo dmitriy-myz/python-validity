@@ -10,17 +10,17 @@ initialised (i.e., the usual `validity-sensors-firmware` & TLS handshake
 have already been done — same prerequisites as the existing `enroll`
 script in this repo).
 
-Usage:
+Usage (fully reference-free — no template needed):
   sudo ./.venv-poc/bin/python dev/enroll_native_chip.py \\
-      --ref REF.bin \\
       --subtype 0xf5 \\
-      [--user 'S-1-5-21-...-1001'] \\
       [--match]                          # try to identify after enroll
 
-  --ref REF.bin   a 23136-byte template captured from THIS sensor; its
-                  v30 (x, y) coords are reused; its descriptors are
-                  replaced with ours. Generate one via the normal
-                  Wine-based enroll, or copy from a prior capture.
+  --ref REF.bin   OPTIONAL. A 23136-byte template captured from THIS sensor,
+                  used ONLY for its WS-body framing. If omitted (the default),
+                  a baked-in framing scaffold (validitysensor/native_ws_scaffold.bin)
+                  is used instead, so the whole template — keypoints AND framing —
+                  comes from us with no captured reference. Pass --ref only to
+                  override the framing with a specific captured template.
 
   --subtype N     WinBio subtype (= finger position). Defaults to 0xf5
                   (right index, common test). Look at validitysensor/
@@ -41,7 +41,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--ref', required=True, help='reference template (23136B)')
+    ap.add_argument('--ref', default=None,
+                    help='OPTIONAL reference template (23136B). If omitted, a '
+                         'baked-in framing scaffold is used (fully reference-free).')
     ap.add_argument('--subtype', default='0xf5',
                     help='WinBio subtype, hex or decimal (default 0xf5)')
     ap.add_argument('--parent', type=int, default=5,
@@ -82,9 +84,13 @@ def main():
     parent = args.parent
     trailer = bytes([int(args.trailer, 0) & 0xFF])
 
-    with open(args.ref, 'rb') as f:
-        ref = f.read()
-    log.info(f'reference template: {args.ref} ({len(ref)} bytes)')
+    if args.ref:
+        with open(args.ref, 'rb') as f:
+            ref = f.read()
+        log.info(f'reference template: {args.ref} ({len(ref)} bytes)')
+    else:
+        ref = None
+        log.info('reference-free: using baked-in WS-body framing scaffold')
 
     try:
         open_device()
@@ -149,12 +155,17 @@ def main():
         with open('/tmp/native_envelope.bin', 'wb') as f:
             f.write(envelope)
         log.info(f'✓ wrote /tmp/native_envelope.bin ({len(envelope)} bytes)')
-        diff = sum(1 for a, b in zip(envelope, ref) if a != b)
-        log.info(f'  diff against ref: {diff}/{len(envelope)} bytes '
-                  f'({100*diff/len(envelope):.1f}%)')
+        if ref is not None:
+            diff = sum(1 for a, b in zip(envelope, ref) if a != b)
+            log.info(f'  diff against ref: {diff}/{len(envelope)} bytes '
+                      f'({100*diff/len(envelope):.1f}%)')
         return 0
 
     if args.store_ref:
+        if ref is None:
+            log.error('--store-ref requires --ref (it stores the reference '
+                      'template verbatim as an isolation test)')
+            return 2
         from struct import pack, unpack
         from validitysensor.tls import tls
         from validitysensor.flash import call_cleanups

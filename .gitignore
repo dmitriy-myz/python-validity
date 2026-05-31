@@ -7,6 +7,9 @@ debian/python3-validity/
 debian/tmp/
 
 *.bin
+# …but the package's RE-derived data tables ARE tracked (loaded at runtime
+# relative to __file__): BRIEF/aggregation tables + the native WS-body scaffold.
+!validitysensor/*.bin
 *.log
 .idea/*
 .pybuild/
