@@ -39,6 +39,21 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 
+def _try_match(log):
+    """Capture a fresh frame and ask the chip to identify. Returns True on a
+    match, False on 'not recognized' (logged cleanly, no traceback)."""
+    from validitysensor.sensor import sensor as Sensor
+    log.info('LIFT FINGER, then place the SAME finger to verify the chip matches ...')
+    try:
+        usrid, subtype_out, hsh = Sensor.identify(
+            lambda e: log.warning(f'identify capture retry: {e}'))
+        log.info(f'✓ CHIP MATCHED: usrid={usrid}, subtype=0x{subtype_out:x}')
+        return True
+    except Exception as e:
+        log.warning(f'✗ NO MATCH ({e})')
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--ref', default=None,
@@ -186,6 +201,20 @@ def main():
             log.info(f'✓ ref stored verbatim, recid={recid}')
         finally:
             call_cleanups()
+        if args.match:
+            # CONTROL: does a KNOWN chip-accepted template (stored via the
+            # SAME raw 0x47 path) match the live finger? If YES, the raw path
+            # is matchable and our template CONTENT is the issue; if NO, the
+            # raw-write path itself isn't matchable (needs an enrollment
+            # session / commit) — independent of our descriptors.
+            ok = _try_match(log)
+            log.info('CONTROL RESULT: known-good template via raw 0x47 path '
+                     + ('MATCHED → raw path is matchable; investigate our '
+                        'template content.'
+                        if ok else
+                        'did NOT match → raw-write path is not matchable; '
+                        'native enroll must go through the session/commit path.'))
+            return 0 if ok else 3
         return 0
 
     log.info(f'enrolling subtype 0x{subtype:x} under parent dbid {parent} '
@@ -195,17 +224,11 @@ def main():
     log.info(f'✓ native enrollment stored, recid={recid}')
 
     if args.match:
-        log.info('LIFT FINGER, then place the SAME finger to verify the chip matches ...')
-        # Use Sensor.identify() not Sensor.match_finger(): identify() does a
-        # capture(IDENTIFY) first (which waits for the b[0]==2 finger-present
-        # interrupt) and then calls match_finger(). match_finger() alone just
-        # sends cmd 0x5e and waits for the result interrupt — the chip
-        # processes whatever the sensor state is RIGHT NOW (stale/empty),
-        # which is why the bare match always returned "Finger not recognized".
-        usrid, subtype_out, hsh = Sensor.identify(
-            lambda e: log.warning(f'identify capture retry: {e}'))
-        log.info(f'✓ chip matched: usrid={usrid}, subtype=0x{subtype_out:x}')
-        log.info(f'  → native pipeline produces chip-acceptable templates!')
+        # identify() = capture(IDENTIFY) (waits for finger-present) + match.
+        if _try_match(log):
+            log.info('  → native pipeline produces chip-acceptable templates!')
+            return 0
+        return 3
 
     return 0
 
