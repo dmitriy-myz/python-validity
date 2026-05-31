@@ -86,19 +86,41 @@ first-principles pre-v30 synthesis is blocked by NEEDS-HOOK rows in
 `dev/PACKER-sub_180002240.md`. Whether the matcher needs pre-v30 to describe OUR
 geometry is exactly what the match gate (below) settles.
 
-## STEP 2 — run the match gate (byte-identity is NOT required) ← YOU ARE HERE
+## STEP 2 — match gate RESULT (2026-05-31): NO MATCH → cause is CONTENT
 
-Step 1 confirms the pipeline is byte-exact on the same image, and enrollment is
-now reference-free, so just run the real gate on hardware (no `--ref`):
+Ran on hardware: enroll stored fine (finger dbid=8 subtype 0xf6 under real
+StgWindsor user dbid=6, 250 kp) but the chip `0x5e` matcher returned no-match.
+Root-caused WITHOUT more hardware:
 
-```
-sudo ./.venv-poc/bin/python dev/enroll_native_chip.py --subtype 0xf5 --match
-```
+- **Plumbing RULED OUT.** `dev/extract_finger_templates.py` over the captured
+  `enroll*.log`s shows the DLL stores the finger with parameters BYTE-IDENTICAL
+  to ours: `0x47 parent=<user> typ=6 storage=3 len=23136` + 1 random trailer.
+  (And `0x68`/`0x6b` session enrollment is MoC-only → `0x0401` here, so raw
+  `0x47` is the only path — ours is correct.)
+- **Real cause = template CONTENT.** The DLL template is **4 DISTINCT frames**
+  (sections differ 96–97%) with **non-identity `sec0_pre` transforms** (rot
+  −3.6°/+1.3°/+0.7°, t ±19px). Our reference-free template wrote ONE frame
+  replicated into all 4 sections → inconsistent with the baked (fresh.bin)
+  pre-v30 → the geometric matcher can't align it.
 
-Success = the chip's matcher accepts our purely-from-scratch template. This is
-the last remaining step and it is hardware-in-the-loop (not reproducible from
-captures). `git pull` on the Wine/sensor box first. If a single frame doesn't
-match, try `--frames 4` (distinct frames per v30 section).
+### BLOCKER: chip in `0x04b5` "bad state"
+Repeated raw `0x47` writes degraded the chip; it now rejects writes with
+`0x04b5`. Only documented recovery (dev/MOH.md "Chip-state recovery") is a
+**Wine re-enroll** — which also re-creates a matchable finger and a fresh
+capturable DLL template for field-by-field diffing.
+
+### STEP 2-NEXT (after recovery) ← YOU ARE HERE
+1. **Recover:** Wine re-enroll the finger (capture the log to grab the new
+   matchable DLL template). Confirm with `--list-users`.
+2. **Cheap test:** `sudo .../enroll_native_chip.py --frames 4 --match
+   --parent <user> --subtype 0xXX` — 4 distinct frames into the 4 sections
+   (scaffold pre-v30). If it MATCHES, multi-frame was the gap and the matcher
+   re-derives transforms from descriptors (pre-v30 not load-bearing).
+3. **If still no match:** compute `sec0_pre` for OUR 4 frames (matcher math is
+   decoded — [[moh-matcher]], dev/decode_sec0_pre.py, dev/SCORER-sub_18000c6a0.md)
+   so pre-v30 is consistent with our sections; verify against the fresh Wine
+   capture, then re-test. Manage chip state: delete stale native records
+   between attempts to avoid re-triggering `0x04b5`.
 
 ## DATA / TOOLS
 
