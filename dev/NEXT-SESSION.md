@@ -1,111 +1,115 @@
-# Next RE session — capture the TLV stream & decode the v30 content writer
+# Next session — close the native-enrollment match gate
 
-Resume point: native enrollment template construction. The feature pipeline
-(image → 250 kps + descriptors) is **byte-exact validated**. The WS-body
-**packer `sub_180002240` is now fully decompiled + adversarially verified**
-(2026-05-29) — see `dev/PACKER-sub_180002240.md` (read it in full first).
-The container turned out to be a **concatenated TLV stream**, not fixed-offset
-writes, so the remaining work is (a) a runtime capture that attributes each
-TLV record to its byte range, and (b) decoding the writer of the bulk v30
-content.
+Resume point: the **from-scratch native enrollment template**. The entire WS-body
+format is reverse-engineered + byte-verified and the feature/descriptor pipeline
+is byte-exact on ground-truth inputs. One well-defined validation stands between
+here and `enroll_native_chip.py --match`. **Read `~/.claude` memory
+`native-pipeline-readiness`, `ws-packer-decode`, `ws-pre-v30-decode`,
+`moh-matcher`, `moh-enrollment-ops` first** (or the dev/ reports they point to).
 
-## Where we are (verified)
+## DONE (this session, all committed + pushed on `moh-opencv-poc`)
 
-| stage | status | gate |
-|---|---|---|
-| Image → 250 kps | ✅ byte-exact | `dev/diff_log_pipeline.py` |
-| Per-tile gradient + 16-B descriptor | ✅ byte-exact | `dev/diff_descriptors.py` |
-| WS packer `sub_180002240` decode | ✅ decompiled+verified | `dev/PACKER-sub_180002240.md` |
-| WS body TLV offset→writer map | ⚠️ static partial; NEEDS-HOOK | this session |
-| WS body v30 content (5×4500 B) writer | ❌ unresolved | this session |
-| Chip identify() match | ❌ fails | end-to-end |
+- **WS-body packer `sub_180002240`** fully decompiled + adversarially verified —
+  it's a per-frame TLV-stream section appender; accumulator lives in
+  `*(algo+8)`. `dev/PACKER-sub_180002240.md`.
+- **Section/descriptor builder `sub_180008f10`** + serializer `sub_1800057e0`
+  decoded. `dev/decode_sub_180008f10.md`.
+- **Matcher `sub_18000c6a0`** = Hough geometric-voting inlier counter (120×120
+  grid, rigid Q16 transforms). `bdf0`/`180006da0` inverse-transform math
+  byte-verified. `dev/SCORER-sub_18000c6a0.md`.
+- **EnrollmentCheckForDuplicate chain** (`sub_18001e5f0`→vtable[0x78]→
+  `CeivMode::IdentifyUser`) resolved. `dev/find_vtable.py`,
+  `dev/ENROLLMENT-checkforduplicate.md`.
+- **WS-body layout**: v30 record = `[x:u8][y:u8][16B desc]` (ground-truth
+  confirmed 250/250). `sec0_pre` = inter-section rigid-Q16 alignment transforms
+  (`dev/parse_ws_tlv.py`, `dev/decode_sec0_pre.py`, `dev/PRE_V30-decode.md`).
+  `serialize_v30_section()` byte-exact (`dev/verify_v30_serializer.py`).
+- **Cull confirmed DONE**: `sub_18000A1B0` is the per-frame FEATURE BUILDER, the
+  cull is `sub_18000CF90` (= our `nms()`, byte-exact: t_lo=671,t_hi=168,
+  dedup_q=72064,margin=10). `dev/CULL-sub_18000CF90.md`.
+- **Descriptor pipeline byte-exact on ground truth**: `descriptor_gradient`
+  reproduces the chip's gradX/gradY byte-exact; `tile_image`==F250 (diff 0);
+  `orient_d920` 60/60; chain (`_descriptor_at`) 40/40. Harness
+  `dev/validate_descriptor_gradient.py`.
 
-## What the decode established (don't re-derive)
+## THE ONE OPEN QUESTION
 
-- `sub_180002240(algo=RCX, ws_dest=RDX, stats=R8, features=R9, w, h)` — **one
-  section per call**, straight-line, no internal frame loop. Caller
-  `sub_1800D89C0` loops the frames.
-- **Accumulator is the persistent object** `rbx = sub_180001000(*(algo+8))`:
-  `[rbx+0x144]` first-frame guard, `[rbx+0x130]++` reject counter,
-  `[rbx+0x138]` section buffer; plus the `sub_180003320` 180B-record stream.
-- **WS body = TLV stream** built via a 16-byte cursor at `[rsp+0x50]`
-  (node=`*(rsp+0x50)`, data=`*(rsp+0x58)`, running len=`*(u32*)(node+4)`).
-  TLV = `{u16 tag, u16 len, payload}`; container counter u32 at hdr+4.
-- **`size_u32`=23036 is a formula** (`sub_180001750` id-6, CONFIRMED):
-  `(20*(n/2)+4544)*n+((n+3)&~3)+0x80`, n=5 → 23056 total / 23036 payload.
-- **TLV tag map** (u32 scalars via `sub_180006b80`/`sub_180006930`):
-  0x03/0x68/0x6a/0x6b scalars; 0x6c = 4-u32 container (algo `+0x154/+0x150/+0x144/+0x130`,
-  per_section_counts family); 0x69 = container with (h,w).
-- **POSE leads are an argsort index permutation** (`sub_18000bd10`), NOT sorted
-  scores. `sub_1800051f0` emits a per-section TABLE (≤5×5 matrix), NOT the
-  4500-B content.
+Full-pipeline template vs chip `ws_body`: **233/250 (x,y) match but 0/250 exact
+18-byte records** — descriptors differ for every keypoint, even though every
+descriptor component is byte-exact *given the chip's subpix*. Two unresolved
+candidate causes:
 
-## Concrete next steps (recommended order)
+- **(A)** our `subpix_refine_kp` (or the `doh()` response it refines on) differs
+  from the chip's in the full pipeline → shifts every descriptor.
+- **(B)** frame-selection mismatch — the chip's `ws_body` sections store its
+  *selected best frames* (`sub_180008980` 0x699 gate), so "our frameN vs chip
+  sectionN" compares **different images** (233/250 overlap = same finger, not
+  necessarily the same frame). The per-tile test (subpix 13/14 byte-exact on a
+  gradient-matched tile) leans toward (B).
 
-1. **Run the two new gdb captures** (need a Wine enroll with a physical finger;
-   hooks already wired in `dev/gdb_dump.py`, opt-in):
-   - `GDB_DUMP_PACKER_EMIT=1` — snapshots the `[rsp+0x50]` TLV stream before
-     each of the 9 emit-block codec calls + post (per frame). Diffing
-     consecutive `packer_emit_stream_*` dumps gives the **exact byte delta each
-     codec call appends** → resolves every PARTIAL/NEEDS-HOOK row in the
-     offset→writer map (incl. where `size_u32`/per_section_counts/geometry land,
-     and which call emits the 4500-B content).
-   - `GDB_DUMP_POSE=1` — dumps `*(obj+0)`/`*(obj+8)`/obj header before & after
-     the `sub_18000bd10` argsort, to link the index permutation to real pose
-     scores (`obj+0x8`/`obj+0x11`).
-   - Write an analyzer (extend `dev/inspect_ws.py` / `dev/diff_template_structure.py`)
-     that consumes `packer_emit_*` dumps and labels each WS range with its
-     emitting callee.
+## STEP 1 — the clean same-image test (resolves A vs B)
 
-2. **Decode `sub_180008f10`** (descriptor engine driven by the worker
-   `sub_180001fe0`). It owns the 5×4500-B v30 content. Trace how the worker
-   writes the per-section records into the persistent `[rbx+0x138]` buffer and
-   how that buffer reaches the WS stream (memcpy vs put-N).
+Run our full per-tile pipeline on a **specific F250 tile** (the chip's exact
+input) and compare ALL outputs to the chip's ground truth for THAT tile:
 
-3. **Decode the first-frame header init** `sub_1800068f0` → `sub_1800067e0`
-   (13-B thunk). Candidate writer of `[0..16)` (zeros + config `06 02 05 00…`)
-   and possibly the `size_u32` store site. Confirm with the EMIT capture
-   (frame-0 stream snapshot at `0x180002540`).
+1. Find an F250 tile X with `descriptor_gradient(F250_X) == descbrief_gradX_tY`
+   byte-exact (34/71 are reproducible — see `validate_descriptor_gradient.py`).
+2. On `F250_X`: `doh(tile>>6)` → `nms()` → `subpix_refine_kp` → `orient_d920` →
+   `_descriptor_at`.
+3. Match our kps to the chip's `descbrief_kp` for tile Y (by rounded tile-local
+   subpix) and compare **subpix (x_q16@+0x14, y_q16@+0x18), orient (@+0xc), and
+   the 16-B descriptor** byte-for-byte.
+   - WRINKLE: descbrief gradients are **content-deduped across frames**, so the
+     `t##_kp####` → kp-range mapping is messy (this confounded an earlier 25/111
+     attempt). Match by subpix WITHIN the gradient-matched tile rather than
+     trusting kp ranges.
+- **subpix byte-exact ⇒ (B):** pipeline is byte-exact; 0/250 was frame pairing.
+  Go to Step 2.
+- **subpix differs ⇒ (A):** fix `subpix_refine_kp` (moh_native.py) / the `doh()`
+  response feeding it; re-validate.
 
-4. **Build `validitysensor/moh_native_v2.py`** with a TLV-stream emitter that
-   mirrors the codec cluster (open record / put-u32 / put-N / close-flush with
-   4-byte alignment) keyed by the decoded tag map, fed by our byte-exact
-   features. Test against `dev/diff_template_structure.py` (vs a captured Wine
-   ws_body) — should converge record-by-record.
+## STEP 2 — just run the match gate (byte-identity is NOT required)
 
-5. **End-to-end gate:** `dev/enroll_native_chip.py --match` against a real
-   finger. Success = chip's matcher accepts our from-scratch template.
+Matching is geometric (the matcher votes spatial consensus of rigid-aligned
+keypoints + descriptor correspondences); the chip stored DIFFERENT frames, so a
+byte-identical template was never the requirement. If Step 1 confirms the
+pipeline is byte-exact on the same image, build a template from OUR frames
+(`native_template`, v30 records byte-exact for our kps) and run the real gate:
 
-## Tools at your disposal
+```
+dev/enroll_native_chip.py --match    # needs the physical chip + finger (you-run-it)
+```
 
-- `/tmp/syna_all.S` — 16 MB objdump; `dev/extract_funcs.py` splits it into
-  per-function files (`extract_funcs.py index` lists all 2571 funcs;
-  `extract_funcs.py dump <addr>…` writes `/tmp/func_<addr>.S`). NOTE: jump-table
-  data fools the int3 splitter (e.g. `0x180001750`, `0x180001750`'s `call
-  0x1730018a4` is a misparse) — verify boundaries near `(bad)` lines.
-- `dev/PACKER-sub_180002240.md` — the authoritative packer decode + §9
-  verification addendum + §10 corrections.
-- `dev/wf_decompile_packer.js` / `dev/wf_verify_packer.js` — the workflow
-  scripts that produced the decode (re-runnable for other functions).
-- `dev/gdb_dump.py` — capture hooks incl. the new `GDB_DUMP_PACKER_EMIT` /
-  `GDB_DUMP_POSE`.
-- `dev/inspect_ws.py`, `extract_skeleton.py`, `diff_template_structure.py`,
-  `decode_variants.py` — WS body annotators / diffs.
+Success = the chip's matcher accepts our purely-from-scratch template.
 
-## What NOT to do
+## DATA / TOOLS
 
-- Don't treat WS offsets as fixed — it's a TLV stream; absolute positions are
-  emission-order dependent. Always reason in terms of records + the running
-  `node+4` counter.
-- Don't add empirical thresholds/constants. Every constant must trace to a DLL
-  instruction (e.g. `size_u32` ← `sub_180001750` id-6 formula) or be marked
-  TODO with the function that should produce it.
-- Don't pursue more pure black-box hypothesis testing on variant bytes — the
-  EMIT capture gives ground truth per record.
+- Captures in `/media/sf_vbox-rw/finger/frida_dumps/` (session 1780170xxx has it
+  ALL: F250 raw tiles, descbrief gradX/gradY/desc/kp, ws_body, minutia_tables;
+  log `1780170395.log`). Extract images: `dev/extract_log_images.py <log> -o DIR`.
+- `/tmp/syna_all.S` (objdump), `dev/extract_funcs.py` (per-function splitter →
+  `/tmp/func_<addr>.S`), `dev/find_vtable.py` (virtual-call resolver).
+- Pipeline: `validitysensor/moh_native.py` (extract_frame_native, nms,
+  descriptor_gradient, subpix_refine_kp, orient_d920, _descriptor_at,
+  serialize_v30_section, native_template). venv: `./.venv-poc/bin/python`.
+
+## WORKFLOW RULES (do not repeat past mistakes)
+
+- **Frida does NOT work under Wine — gdb only** (`dev/gdb_dump.py` via
+  `GDB_DUMP_<HOOK>=1 gdb -p <PID> -x dev/gdb_dump.py`).
+- **ALWAYS `git push` immediately after every commit** — the Wine capture box
+  pulls from origin; local-only commits run stale code (cost: wasted sessions).
+- **The capture box must `git pull` before a capture run.**
 
 ## Commit chain (branch `moh-opencv-poc`)
-
-- HEAD ← this session: `dev/extract_funcs.py`, `dev/wf_decompile_packer.js`,
-  `dev/wf_verify_packer.js`, `dev/PACKER-sub_180002240.md`, gdb_dump.py hooks,
-  NEXT-SESSION.md.
-- prior: `6c2dbaf` (old NEXT-SESSION), `8986a16` (decode_variants), … (see git log)
+```
+106a15e cull decode (A1B0=feature builder, cull=CF90 already ported)
+2acfffe E090 descriptor pipeline confirmed BYTE-EXACT
+f07a86d validate_descriptor_gradient.py
+450032c 51f0 sec0_pre serialization byte-verified
+0690b92 sec0_pre = inter-section pose table; bdf0 Q16 math
+878de65 v30 serializer + pre_v30 TLV decode
+8c0d84a sub_18000c6a0 matcher
+bfb7185 sub_180008f10 builder + CheckForDuplicate chain
+9b448f6 sub_180002240 packer
+```
