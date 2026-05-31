@@ -32,55 +32,53 @@ here and `enroll_native_chip.py --match`. **Read `~/.claude` memory
   `orient_d920` 60/60; chain (`_descriptor_at`) 40/40. Harness
   `dev/validate_descriptor_gradient.py`.
 
-## THE ONE OPEN QUESTION
+## STEP 1 — RESOLVED 2026-05-31 → cause (B), pipeline is byte-exact
 
-Full-pipeline template vs chip `ws_body`: **233/250 (x,y) match but 0/250 exact
-18-byte records** — descriptors differ for every keypoint, even though every
-descriptor component is byte-exact *given the chip's subpix*. Two unresolved
-candidate causes:
+Was: full-pipeline template vs chip `ws_body` matched 233/250 (x,y) but 0/250
+exact 18-byte records, with two candidate causes — (A) our `subpix_refine_kp` /
+`doh()` differs from the chip's, or (B) frame-selection mismatch (the chip's
+`ws_body` sections store its own *selected best frames*, so "our frameN vs chip
+sectionN" compares different images).
 
-- **(A)** our `subpix_refine_kp` (or the `doh()` response it refines on) differs
-  from the chip's in the full pipeline → shifts every descriptor.
-- **(B)** frame-selection mismatch — the chip's `ws_body` sections store its
-  *selected best frames* (`sub_180008980` 0x699 gate), so "our frameN vs chip
-  sectionN" compares **different images** (233/250 overlap = same finger, not
-  necessarily the same frame). The per-tile test (subpix 13/14 byte-exact on a
-  gradient-matched tile) leans toward (B).
+**The clean same-image test settled it decisively: cause (B).**
+`dev/validate_same_image.py` runs our full per-tile detection on the chip's
+EXACT F250 input tile (session 1780170; 34 chip gradient tiles paired to F250
+raw tiles by interior byte-exact `descriptor_gradient` match) and compares
+against the chip's `descbrief_kp_before` (subpix @+0x14/+0x18, orient @+0xc) +
+`descbrief_desc`:
 
-## STEP 1 — the clean same-image test (resolves A vs B)
+```
+SUBPIX byte-exact:     1024/1024
+  orient byte-exact:   1024/1024
+  descriptor byte-exact (Hamming 0): 1024/1024
+  chip kps with NO matching NMS peak in our detection: 0
+```
 
-Run our full per-tile pipeline on a **specific F250 tile** (the chip's exact
-input) and compare ALL outputs to the chip's ground truth for THAT tile:
+So `doh → nms → subpix_refine_kp → orient_d920 → _descriptor_at` reproduces the
+chip **bit-for-bit on the same image, every keypoint.** The 0/250 was purely
+that each chip section is a DIFFERENT selected frame — a byte-identical template
+was never the requirement (matching is geometric Hough voting, `moh-matcher`).
 
-1. Find an F250 tile X with `descriptor_gradient(F250_X) == descbrief_gradX_tY`
-   byte-exact (34/71 are reproducible — see `validate_descriptor_gradient.py`).
-2. On `F250_X`: `doh(tile>>6)` → `nms()` → `subpix_refine_kp` → `orient_d920` →
-   `_descriptor_at`.
-3. Match our kps to the chip's `descbrief_kp` for tile Y (by rounded tile-local
-   subpix) and compare **subpix (x_q16@+0x14, y_q16@+0x18), orient (@+0xc), and
-   the 16-B descriptor** byte-for-byte.
-   - WRINKLE: descbrief gradients are **content-deduped across frames**, so the
-     `t##_kp####` → kp-range mapping is messy (this confounded an earlier 25/111
-     attempt). Match by subpix WITHIN the gradient-matched tile rather than
-     trusting kp ranges.
-- **subpix byte-exact ⇒ (B):** pipeline is byte-exact; 0/250 was frame pairing.
-  Go to Step 2.
-- **subpix differs ⇒ (A):** fix `subpix_refine_kp` (moh_native.py) / the `doh()`
-  response feeding it; re-validate.
+- Gotcha (cost an early 89.5% false-negative): the chip's gradX/gradY `_save`
+  timestamps drift ~1 ms, so resolve the gradY file by its `_t##_kp####_<dims>`
+  TAG — do NOT string-replace the gradX filename. The 34 gradient tags (not the
+  content-dedup kp ranges) define the kp→tile grouping cleanly here.
+- The earlier "subpix differs" hypothesis in `native-pipeline-readiness` memory
+  is now REFUTED and the memory is updated.
 
-## STEP 2 — just run the match gate (byte-identity is NOT required)
+## STEP 2 — run the match gate (byte-identity is NOT required) ← YOU ARE HERE
 
-Matching is geometric (the matcher votes spatial consensus of rigid-aligned
-keypoints + descriptor correspondences); the chip stored DIFFERENT frames, so a
-byte-identical template was never the requirement. If Step 1 confirms the
-pipeline is byte-exact on the same image, build a template from OUR frames
-(`native_template`, v30 records byte-exact for our kps) and run the real gate:
+Step 1 confirms the pipeline is byte-exact on the same image, so build a
+template from OUR frames (`native_template`, v30 records byte-exact for our kps)
+and run the real gate on hardware:
 
 ```
 dev/enroll_native_chip.py --match    # needs the physical chip + finger (you-run-it)
 ```
 
-Success = the chip's matcher accepts our purely-from-scratch template.
+Success = the chip's matcher accepts our purely-from-scratch template. This is
+the last remaining step and it is hardware-in-the-loop (not reproducible from
+captures). `git pull` on the Wine box first.
 
 ## DATA / TOOLS
 
