@@ -85,6 +85,11 @@ def main():
                     help='isolation test: store the reference template VERBATIM '
                          '(via the proven typ=6/storage=3+trailer path). If '
                          'this fails, the problem is not our envelope.')
+    ap.add_argument('--match-only', action='store_true',
+                    help='do NOT enroll; just run the chip 0x5e identify against '
+                         'whatever is already stored. Control: if even a known-'
+                         'good Wine-enrolled finger does not match, the 0x5e '
+                         '(match-on-chip) path is dead on this MoH chip.')
     ap.add_argument('--list-users', action='store_true',
                     help='dump the chip DB tree (db.dump_raw) and exit; '
                          'use to find a real parent dbid to pass via --parent')
@@ -116,6 +121,16 @@ def main():
     except RebootException:
         log.info('sensor rebooted — re-opening')
         open_device()
+
+    if args.match_only:
+        ok = _try_match(log)
+        log.info('MATCH-ONLY (chip 0x5e identify against stored fingers): '
+                 + ('MATCHED → 0x5e works on this chip.'
+                    if ok else
+                    'NO MATCH. If a known-good Wine finger is enrolled and this '
+                    'still fails, 0x5e (match-on-chip) is dead here → matching '
+                    'must be done host-side (port sub_18000c6a0).'))
+        return 0 if ok else 3
 
     if args.list_users:
         log.info('chip user storage + enrolled users (find parent dbid here):')
