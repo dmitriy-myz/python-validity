@@ -91,9 +91,17 @@ def main():
                          'good Wine-enrolled finger does not match, the 0x5e '
                          '(match-on-chip) path is dead on this MoH chip.')
     ap.add_argument('--delete-dbid', type=int, default=None,
-                    help='delete the finger/record with this dbid (see '
+                    help='delete the FINGER record with this dbid (see '
                          '--list-users), then exit. Use to remove the Wine '
-                         'finger so a --match-only cleanly tests OUR template.')
+                         'finger so a --match-only cleanly tests OUR template. '
+                         'Refuses to delete a USER record (would orphan fingers) '
+                         'unless --force.')
+    ap.add_argument('--force', action='store_true',
+                    help='allow --delete-dbid to delete a non-finger record')
+    ap.add_argument('--user-sid', default=None,
+                    help='enroll under this user SID, creating the user if it '
+                         'does not exist (self-contained: no Wine-made user '
+                         'needed). Overrides --parent.')
     ap.add_argument('--list-users', action='store_true',
                     help='dump the chip DB tree (db.dump_raw) and exit; '
                          'use to find a real parent dbid to pass via --parent')
@@ -127,7 +135,18 @@ def main():
         open_device()
 
     if args.delete_dbid is not None:
-        log.info(f'deleting record dbid={args.delete_dbid} ...')
+        try:
+            rec = db.get_record_value(args.delete_dbid)
+            rtype = rec.type
+        except Exception:
+            rtype = None
+        if rtype is not None and rtype != 6 and not args.force:
+            log.error(f'dbid={args.delete_dbid} is type {rtype} '
+                      f'({"USER" if rtype == 5 else "non-finger"}), not a FINGER '
+                      f'(type 6). Deleting it would orphan its children. Pick a '
+                      f'FINGER dbid from --list-users, or pass --force.')
+            return 2
+        log.info(f'deleting record dbid={args.delete_dbid} (type {rtype}) ...')
         try:
             db.del_record(args.delete_dbid)
             log.info(f'✓ deleted dbid={args.delete_dbid}')
@@ -250,6 +269,15 @@ def main():
                         'native enroll must go through the session/commit path.'))
             return 0 if ok else 3
         return 0
+
+    if args.user_sid:
+        usr = db.lookup_user(args.user_sid)
+        if usr is None:
+            parent = db.new_user(args.user_sid)
+            log.info(f'created user {args.user_sid!r} → dbid {parent}')
+        else:
+            parent = usr.dbid
+            log.info(f'using existing user {args.user_sid!r} → dbid {parent}')
 
     log.info(f'enrolling subtype 0x{subtype:x} under parent dbid {parent} '
               f'with {args.frames} frame(s)...')
