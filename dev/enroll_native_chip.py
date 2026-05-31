@@ -90,6 +90,10 @@ def main():
                          'whatever is already stored. Control: if even a known-'
                          'good Wine-enrolled finger does not match, the 0x5e '
                          '(match-on-chip) path is dead on this MoH chip.')
+    ap.add_argument('--delete-dbid', type=int, default=None,
+                    help='delete the finger/record with this dbid (see '
+                         '--list-users), then exit. Use to remove the Wine '
+                         'finger so a --match-only cleanly tests OUR template.')
     ap.add_argument('--list-users', action='store_true',
                     help='dump the chip DB tree (db.dump_raw) and exit; '
                          'use to find a real parent dbid to pass via --parent')
@@ -121,6 +125,16 @@ def main():
     except RebootException:
         log.info('sensor rebooted — re-opening')
         open_device()
+
+    if args.delete_dbid is not None:
+        log.info(f'deleting record dbid={args.delete_dbid} ...')
+        try:
+            db.del_record(args.delete_dbid)
+            log.info(f'✓ deleted dbid={args.delete_dbid}')
+        except Exception as e:
+            log.error(f'delete failed: {e}')
+            return 2
+        return 0
 
     if args.match_only:
         ok = _try_match(log)
