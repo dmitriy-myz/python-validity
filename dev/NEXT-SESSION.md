@@ -109,7 +109,36 @@ Repeated raw `0x47` writes degraded the chip; it now rejects writes with
 **Wine re-enroll** — which also re-creates a matchable finger and a fresh
 capturable DLL template for field-by-field diffing.
 
-### STEP 2-NEXT ← YOU ARE HERE  (chip recovered via Wine log 1780232416)
+### STEP 3 — multi-frame template with computed sec0_pre (BUILT 2026-05-31)
+
+The full registration algorithm is decompiled (`dev/transformation-doc/`, 55 funcs)
+and ported. Key finding: **sec0_pre is GEOMETRIC** — stored v30 descriptors are
+useless across frames (median Hamming ~52/128), so registration = geometric
+overlap, not descriptor matching (matches `sub_18000c6a0` being a positional Hough
+grid). `dev/sec0pre_register.py:geom_register` (correspondence-free overlap-max +
+ICP) computes valid inter-frame transforms; reproduces the dominant stored
+transform exactly (T7) but not all (DLL's are descriptor/reference-composed).
+
+`dev/build_multiframe_template.py` assembles a complete mode-A (4-section) template
+= our 4 frames' v30 + our geom sec0_pre (4 slots @ ws+79/97/115/133 → pairs
+(0,3)(1,2)(3,0)(2,3)) + TID. Offline self-test passes (structure valid, TID OK).
+Wired as `enroll_native_chip.py --multiframe` (no `--ref` needed; uses the baked
+scaffold).
+
+HARDWARE TEST (the arbiter — does geometric sec0_pre match?):
+```
+# clean stale native fingers first (delete the FINGER dbid, not the user!):
+sudo python dev/enroll_native_chip.py --list-users
+sudo python dev/enroll_native_chip.py --delete-dbid <stale-finger-dbid>
+# capture 4 frames (move finger slightly between each), build, store, match:
+sudo python dev/enroll_native_chip.py --multiframe --match --parent 6 --subtype 0xf8
+```
+MATCH (subtype=0xf8) ⇒ from-scratch multi-frame template WORKS. NO MATCH ⇒ the
+geom sec0_pre / stale leads-blob aren't accepted → do the gdb capture
+(`dev/transformation-doc/README.md` 6-breakpoint plan) for byte-exact DLL
+transforms + the exact sec0_pre serialization (leads/blob/slot count), then rebuild.
+
+### STEP 2-NEXT (superseded by STEP 3)  (chip recovered via Wine log 1780232416)
 **`sec0_pre` is LOAD-BEARING** (SCORER §1: the matcher votes the stored 20-byte
 `[x][y][a,b,tx,ty]` geometry records as candidate alignments) → multi-frame
 alone won't fix it; we must compute correct `sec0_pre` for our frames.
