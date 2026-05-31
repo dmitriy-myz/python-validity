@@ -998,8 +998,62 @@ def _load_ws_scaffold():
     return _NATIVE_WS_SCAFFOLD
 
 
+def patch_pre_v30_near_identity(ws_body, regions):
+    """Set the WS body's inter-section rigid transforms to NEAR-identity so a
+    single-frame template (same records in every section) is self-consistent.
+
+    Each pre-v30 zone (between v30 record regions) carries a run of 18-byte
+    rigid-transform records `[x:u8][y:u8][a:i32][b:i32][tx:i32][ty:i32]`
+    (sec0_pre's pairwise section-alignment table). For a template whose
+    sections are identical, the correct inter-section transform is the
+    identity — but the matcher's candidate-validity filter `sub_18000bfb0`
+    keeps a record only if `tx != 0 || ty != 0` (pure identity `{0x10000,0,0,0}`
+    is the DLL's 'unmatched' sentinel, `sub_18000b420`, and is skipped). So we
+    write NEAR-identity `a=0x10000, b=0, tx=1, ty=1`: geometrically identity
+    (`1/65536 px ≈ 0`) yet `tx != 0`, so the matcher still treats it as a valid
+    candidate alignment.
+
+    `regions`: the v30 record-region start offsets (each V30_SECTION_BYTES long).
+    Returns (patched_ws_body_bytes, n_records_patched)."""
+    import struct as _struct
+    ONE = 0x10000
+    ws = bytearray(ws_body)
+    span = V30_SECTION_BYTES
+    zones, prev = [], 0
+    for b in sorted(regions):
+        zones.append((prev, b))
+        prev = b + span
+    zones.append((prev, len(ws)))
+
+    def rigid(a, b):
+        return abs(a * a + b * b - ONE * ONE) < ONE * ONE * 0.05
+
+    ident = _struct.pack('<4i', ONE, 0, 1, 1)   # a, b, tx, ty (near-identity)
+    patched = 0
+    for z0, z1 in zones:
+        best = (0, 0)
+        for start in range(z0, z1):
+            o, n = start, 0
+            while o + 18 <= z1:
+                a, b, tx, ty = _struct.unpack_from('<4i', ws, o + 2)
+                if not rigid(a, b):
+                    break
+                n += 1
+                o += 18
+            if n > best[0]:
+                best = (n, start)
+        n, start = best
+        if n >= 2:
+            o = start
+            for _ in range(n):
+                ws[o + 2:o + 18] = ident          # keep [x][y] at o, o+1
+                o += 18
+                patched += 1
+    return bytes(ws), patched
+
+
 def native_template(image_q16, reference_template=None, subtype=None,
-                     fill_all_sections=True):
+                     fill_all_sections=True, near_identity_sec0pre=False):
     """End-to-end native enrollment template — REFERENCE-FREE by default.
 
     Detects keypoints in `image_q16` with the byte-exact native pipeline
@@ -1049,6 +1103,12 @@ def native_template(image_q16, reference_template=None, subtype=None,
             raise RuntimeError("no v30 regions found in reference template — "
                                 "is it from a 06cb:00a2 sensor?")
     assert len(ws_body) == WS_SIZE, f"WS body must be {WS_SIZE}B, got {len(ws_body)}"
+
+    # Optional: make the inter-section transforms near-identity so a
+    # single-frame (record-replicated) template is self-consistent.
+    if near_identity_sec0pre:
+        patched, _n = patch_pre_v30_near_identity(bytes(ws_body), regions)
+        ws_body = bytearray(patched)
 
     # 1. Detect OUR keypoints + descriptors from OUR image.
     kps = extract_frame_native(image_q16, h=image_q16.shape[0],

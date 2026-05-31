@@ -823,7 +823,8 @@ class Sensor:
                        trailer: bytes = b'\x11',
                        update_cb: typing.Callable[[typing.Any, typing.Optional[Exception]], None] = lambda *a, **k: None,
                        max_attempts: int = 6,
-                       num_frames: int = 1):
+                       num_frames: int = 1,
+                       near_identity_sec0pre: bool = False):
         """Enroll a finger using the byte-exact native pipeline (no DLL).
 
         Captures one frame, builds a 23136-byte template via the native
@@ -866,7 +867,8 @@ class Sensor:
             raise ValueError(f'trailer must be 1 byte, got {len(trailer)}')
 
         from .moh_native import (extract_frame_native, _load_ws_scaffold,
-                                 NATIVE_WS_V30_REGIONS)
+                                 NATIVE_WS_V30_REGIONS,
+                                 patch_pre_v30_near_identity)
         from .moh_extract import compute_tid, _build_envelope
         from .moh_opencv import WS_SIZE, V30_RECORD_LEN, find_v30_regions
         import struct
@@ -937,6 +939,11 @@ class Sensor:
                 else:
                     ws_body = bytearray(reference_template[12:12 + WS_SIZE])
                     regions = find_v30_regions(bytes(ws_body))
+                if near_identity_sec0pre:
+                    patched, npatch = patch_pre_v30_near_identity(bytes(ws_body), regions)
+                    ws_body = bytearray(patched)
+                    logging.info(f'  patched {npatch} sec0_pre transforms to '
+                                 f'near-identity (self-consistent single frame)')
                 for idx, base in enumerate(regions):
                     src_frame = per_frame_kps[idx % len(per_frame_kps)]
                     records_bytes = (

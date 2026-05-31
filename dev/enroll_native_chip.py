@@ -74,6 +74,10 @@ def main():
                          'data — a real DLL enroll uses 8)')
     ap.add_argument('--match', action='store_true',
                     help='after enroll, capture again and try to identify')
+    ap.add_argument('--identity-sec0pre', action='store_true',
+                    help='patch the template inter-section transforms to '
+                         'near-identity so a single replicated frame is '
+                         'self-consistent (test whether one frame can match)')
     ap.add_argument('--dry-run', action='store_true',
                     help='build the envelope but DO NOT store on chip; '
                          'write it to /tmp/native_envelope.bin instead')
@@ -166,7 +170,8 @@ def main():
         else:
             img112 = img
         img_q16 = img112.astype(np.int32) << 16
-        envelope = native_template(img_q16, ref, subtype=subtype)
+        envelope = native_template(img_q16, ref, subtype=subtype,
+                                   near_identity_sec0pre=args.identity_sec0pre)
         with open('/tmp/native_envelope.bin', 'wb') as f:
             f.write(envelope)
         log.info(f'✓ wrote /tmp/native_envelope.bin ({len(envelope)} bytes)')
@@ -220,7 +225,8 @@ def main():
     log.info(f'enrolling subtype 0x{subtype:x} under parent dbid {parent} '
               f'with {args.frames} frame(s)...')
     recid = Sensor.enroll_native(parent, subtype, ref, trailer=trailer,
-                                   num_frames=args.frames)
+                                   num_frames=args.frames,
+                                   near_identity_sec0pre=args.identity_sec0pre)
     log.info(f'✓ native enrollment stored, recid={recid}')
 
     if args.match:
