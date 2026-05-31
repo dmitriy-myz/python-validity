@@ -908,8 +908,13 @@ class Sensor:
                             from time import sleep as _sleep
                             _sleep(0.1)
                     glow_end_scan()
+                    # NO transpose: the DoH/F250 feature frame is the raw
+                    # row-major image. (The transpose used by enroll() is only
+                    # for the human-viewable JPEG; transposing here put keypoints
+                    # in a transposed frame so they never aligned with the chip's
+                    # verify capture — identity gives 242-250/250 keypoint overlap
+                    # with the DLL's stored sections vs ~11/250 transposed.)
                     img = np.frombuffer(img_data, dtype=np.uint8).reshape(x, y)
-                    img = np.transpose(img)
                     if img.shape != (112, 112):
                         try:
                             import cv2

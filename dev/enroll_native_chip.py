@@ -49,8 +49,12 @@ def _capture_frame_q16(Sensor, log):
         x, y, w1, w2, img_data = Sensor.capture(CaptureMode.ENROLL)
     finally:
         glow_end_scan()
+    # NO transpose: the DoH/F250 feature frame is the raw row-major image.
+    # (enroll()'s np.transpose was for human-viewable JPEGs; it put keypoints in
+    # a transposed frame so they never aligned with the chip's verify capture —
+    # verified: identity orientation gives 242-250/250 keypoint overlap with the
+    # DLL's stored sections, transpose gives ~11/250.)
     img = np.frombuffer(img_data, dtype=np.uint8).reshape(x, y)
-    img = np.transpose(img)
     if img.shape != (112, 112):
         try:
             import cv2
@@ -233,8 +237,7 @@ def main():
         log.info('place finger now (dry-run, will not store)')
         x, y, w1, w2, img_data = Sensor.capture(CaptureMode.ENROLL)
         glow_end_scan()
-        img = np.frombuffer(img_data, dtype=np.uint8).reshape(x, y)
-        img = np.transpose(img)
+        img = np.frombuffer(img_data, dtype=np.uint8).reshape(x, y)  # NO transpose (feature frame)
         if img.shape != (112, 112):
             try:
                 import cv2
