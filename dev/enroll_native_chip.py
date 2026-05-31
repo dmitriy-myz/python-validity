@@ -39,6 +39,29 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 
+def _capture_frame_q16(Sensor, log):
+    """Capture one ENROLL frame → (112,112) int32 Q16 image."""
+    from validitysensor.sensor import CaptureMode, glow_start_scan, glow_end_scan
+    import numpy as np
+    glow_start_scan()
+    log.info('    place finger ...')
+    try:
+        x, y, w1, w2, img_data = Sensor.capture(CaptureMode.ENROLL)
+    finally:
+        glow_end_scan()
+    img = np.frombuffer(img_data, dtype=np.uint8).reshape(x, y)
+    img = np.transpose(img)
+    if img.shape != (112, 112):
+        try:
+            import cv2
+            img = cv2.resize(img, (112, 112), interpolation=cv2.INTER_LINEAR)
+        except ImportError:
+            ys = (np.arange(112) * img.shape[0] // 112)
+            xs = (np.arange(112) * img.shape[1] // 112)
+            img = img[ys[:, None], xs[None, :]]
+    return img.astype(np.int32) << 16
+
+
 def _try_match(log):
     """Capture a fresh frame and ask the chip to identify. Returns True on a
     match, False on 'not recognized' (logged cleanly, no traceback)."""
@@ -78,6 +101,11 @@ def main():
                     help='patch the template inter-section transforms to '
                          'near-identity so a single replicated frame is '
                          'self-consistent (test whether one frame can match)')
+    ap.add_argument('--multiframe', action='store_true',
+                    help='capture 4 DISTINCT frames, build a real multi-frame '
+                         'template with OUR geometrically-computed sec0_pre '
+                         '(dev/build_multiframe_template.py), then store. '
+                         'Combine with --match to verify.')
     ap.add_argument('--dry-run', action='store_true',
                     help='build the envelope but DO NOT store on chip; '
                          'write it to /tmp/native_envelope.bin instead')
@@ -278,6 +306,47 @@ def main():
         else:
             parent = usr.dbid
             log.info(f'using existing user {args.user_sid!r} → dbid {parent}')
+
+    if args.multiframe:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from build_multiframe_template import build_multiframe
+        from validitysensor.moh_native import extract_frame_native, _load_ws_scaffold
+        from validitysensor.moh_opencv import WS_SIZE
+        from validitysensor.tls import tls
+        from validitysensor.flash import call_cleanups
+        from validitysensor import blobs
+        from validitysensor.util import assert_status
+        from struct import pack, unpack
+        scaffold_ws = ref[12:12 + WS_SIZE] if ref else _load_ws_scaffold()
+        log.info('MULTIFRAME: capturing 4 distinct frames (move finger slightly '
+                 'between each) ...')
+        frames = []
+        for f in range(4):
+            log.info(f'  frame {f + 1}/4:')
+            img = _capture_frame_q16(Sensor, log)
+            kps = extract_frame_native(img)
+            frames.append([(gx, gy, desc) for (gx, gy, _o, desc) in kps])
+            log.info(f'    {len(kps)} keypoints')
+        envelope, report = build_multiframe(frames, scaffold_ws, subtype)
+        log.info('  sec0_pre geom transforms: ' + '  '.join(
+            f'{i}->{j}:rot{t[0]:+.1f},ov{t[3]}' for off, i, j, t in report if t))
+        log.info(f'  envelope {len(envelope)} bytes; storing under parent {parent} ...')
+        db.db_info()
+        assert_status(tls.cmd(blobs.db_write_enable()))
+        try:
+            msg = pack('<BHHHH', 0x47, parent, 6, 3, len(envelope)) + envelope + trailer
+            rsp = tls.cmd(msg)
+            status, = unpack('<H', rsp[:2])
+            if status != 0:
+                log.error(f'chip rejected multiframe template: status=0x{status:04x}')
+                return 2
+            recid, = unpack('<H', rsp[2:4])
+            log.info(f'✓ multiframe native enrollment stored, recid={recid}')
+        finally:
+            call_cleanups()
+        if args.match:
+            return 0 if _try_match(log) else 3
+        return 0
 
     log.info(f'enrolling subtype 0x{subtype:x} under parent dbid {parent} '
               f'with {args.frames} frame(s)...')
