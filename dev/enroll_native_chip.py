@@ -249,6 +249,19 @@ def main():
         else:
             img112 = img
         img_q16 = img112.astype(np.int32) << 16
+        # DIAGNOSTIC: save the live capture so it can be compared to the DLL's
+        # working-image (0x0278) frames offline (live-enroll no-match debug).
+        import os as _os
+        _cap = f'/media/sf_vbox-rw/finger/native_capture_{x}x{y}.bin'
+        try:
+            open(_cap, 'wb').write(img112.astype(np.uint8).tobytes())
+            log.info(f'  CAPTURE: raw dims {x}x{y} ({len(img_data)}B); 112x112 '
+                     f'min={int(img112.min())} max={int(img112.max())} '
+                     f'mean={float(img112.mean()):.1f} -> saved {_cap}')
+        except Exception as _e:
+            log.warning(f'  could not save capture frame: {_e}')
+        from validitysensor.moh_native import extract_frame_native as _ext
+        log.info(f'  pipeline on live frame: {len(_ext(img_q16))} keypoints')
         envelope = native_template(img_q16, ref, subtype=subtype,
                                    near_identity_sec0pre=args.identity_sec0pre)
         with open('/tmp/native_envelope.bin', 'wb') as f:
