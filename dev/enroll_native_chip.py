@@ -105,6 +105,11 @@ def main():
                     help='patch the template inter-section transforms to '
                          'near-identity so a single replicated frame is '
                          'self-consistent (test whether one frame can match)')
+    ap.add_argument('--no-regen-trailer', action='store_true',
+                    help='do NOT regenerate the per-section 24-byte orientation-CDF '
+                         'trailer for our keypoints — copy the scaffold/ref bytes '
+                         'verbatim (stale). For the A/B test of whether the trailer '
+                         'is load-bearing at match.')
     ap.add_argument('--multiframe', action='store_true',
                     help='capture 4 DISTINCT frames, build a real multi-frame '
                          'template with OUR geometrically-computed sec0_pre '
@@ -264,7 +269,8 @@ def main():
         from validitysensor.moh_native import extract_frame_native as _ext
         log.info(f'  pipeline on live frame: {len(_ext(img_q16))} keypoints')
         envelope = native_template(img_q16, ref, subtype=subtype,
-                                   near_identity_sec0pre=args.identity_sec0pre)
+                                   near_identity_sec0pre=args.identity_sec0pre,
+                                   regen_section_trailer=not args.no_regen_trailer)
         with open('/tmp/native_envelope.bin', 'wb') as f:
             f.write(envelope)
         log.info(f'✓ wrote /tmp/native_envelope.bin ({len(envelope)} bytes)')
@@ -369,7 +375,8 @@ def main():
               f'with {args.frames} frame(s)...')
     recid = Sensor.enroll_native(parent, subtype, ref, trailer=trailer,
                                    num_frames=args.frames,
-                                   near_identity_sec0pre=args.identity_sec0pre)
+                                   near_identity_sec0pre=args.identity_sec0pre,
+                                   regen_section_trailer=not args.no_regen_trailer)
     log.info(f'✓ native enrollment stored, recid={recid}')
 
     if args.match:

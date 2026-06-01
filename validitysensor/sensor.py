@@ -824,7 +824,8 @@ class Sensor:
                        update_cb: typing.Callable[[typing.Any, typing.Optional[Exception]], None] = lambda *a, **k: None,
                        max_attempts: int = 6,
                        num_frames: int = 1,
-                       near_identity_sec0pre: bool = False):
+                       near_identity_sec0pre: bool = False,
+                       regen_section_trailer: bool = True):
         """Enroll a finger using the byte-exact native pipeline (no DLL).
 
         Captures one frame, builds a 23136-byte template via the native
@@ -949,17 +950,26 @@ class Sensor:
                     ws_body = bytearray(patched)
                     logging.info(f'  patched {npatch} sec0_pre transforms to '
                                  f'near-identity (self-consistent single frame)')
+                from .moh_native import (serialize_v30_section,
+                                         build_section_trailer24,
+                                         orient_to_index, V30_DESC_LEN)
                 for idx, base in enumerate(regions):
                     src_frame = per_frame_kps[idx % len(per_frame_kps)]
-                    records_bytes = (
-                        b''.join(
-                            bytes((gx & 0xFF, gy & 0xFF)) + (desc[:16] if len(desc) >= 16
-                                                              else desc + bytes(16 - len(desc)))
-                            for (gx, gy, _o, desc) in src_frame[:250]
-                        )
-                        + bytes(V30_RECORD_LEN) * max(0, 250 - len(src_frame))
-                    )[:250 * V30_RECORD_LEN]
-                    ws_body[base:base + len(records_bytes)] = records_bytes
+                    # sort by ridge orientation so the regenerated trailer CDF is
+                    # a valid monotone orientation-CDF consistent with the records.
+                    sf = sorted(src_frame[:250],
+                                key=lambda k: orient_to_index(k[2]) % 180)
+                    # v30 records are [16B desc][x][y]; the record area starts
+                    # V30_DESC_LEN before the (x,y) anchor find_v30_regions returns.
+                    section = serialize_v30_section(
+                        [(gx, gy, desc) for (gx, gy, _o, desc) in sf])
+                    start = base - V30_DESC_LEN
+                    ws_body[start:start + len(section)] = section
+                    if regen_section_trailer:
+                        tr = start + len(section)
+                        orient_idx = [orient_to_index(k[2]) % 180 for k in sf]
+                        ws_body[tr:tr + 24] = build_section_trailer24(
+                            orient_idx, ws_body[tr], ws_body[tr + 1])
                 ws_body_bytes = bytes(ws_body)
                 tid = compute_tid(ws_body_bytes)
                 envelope = _build_envelope(subtype, ws_body_bytes, tid)

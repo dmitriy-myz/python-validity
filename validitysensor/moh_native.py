@@ -658,6 +658,51 @@ def serialize_v30_section(records, n_slots=V30_SECTION_RECORDS):
     return bytes(out)
 
 
+# ─── per-section v30 trailer (sub_180005720) ────────────────────────────────
+# Each v30 section is followed by a 24-byte block = [u8 split][u8 secobj][22B
+# orientation-CDF]. The CDF (decoded byte-exact, dev/bucket_table_180005720.py)
+# is two 11-bucket halves: for each kp i (in record order, ascending orient
+# within each half), bucket = orient_index // 15; buf[fill_base+prev .. bucket)
+# = i; unused high buckets padded with the half's limit. The two scalar bytes
+# (split = BYTE[H+0xc], secobj = BYTE[secobj+0xc]) are independent per-section
+# fields produced upstream — we keep the scaffold's. We regenerate the CDF for
+# OUR keypoints so the trailer is not stale (per dev/PER-SECTION-METADATA.md the
+# trailer is most likely enroll-only bookkeeping, not read by the matcher; this
+# removes that variable). Bucket is clamped to [0,10] to match the DLL's observed
+# range and guard the 22-byte buffer.
+TRAILER_BUCKETS = 11
+
+
+def build_section_trailer24(orient_indices, split, secobj_byte):
+    """orient_indices: per-kp orientation index (0..180) in the SAME order as
+    the section's v30 records (callers sort by orient so each half is monotone).
+    split/secobj_byte: the two scalar bytes (kept from the scaffold). Returns 24
+    bytes = [split][secobj][22B CDF]."""
+    n = len(orient_indices)
+    split = max(0, min(int(split), n))
+
+    def bucket(o):
+        return min((int(o) & 0xFFFFFFFF) // 15, TRAILER_BUCKETS - 1)
+
+    buf = bytearray(22)
+
+    def fill(fill_base, i0, lim):
+        prev = b = 0
+        for i in range(i0, lim):
+            b = bucket(orient_indices[i])
+            if b > prev:
+                for c in range(fill_base + prev, fill_base + b):
+                    buf[c] = i & 0xFF
+            prev = b
+        if b < TRAILER_BUCKETS:
+            for c in range(fill_base + b, fill_base + TRAILER_BUCKETS):
+                buf[c] = lim & 0xFF
+
+    fill(0, 0, split)
+    fill(TRAILER_BUCKETS, split, n)
+    return bytes((split & 0xFF, secobj_byte & 0xFF)) + bytes(buf)
+
+
 # ─── E090 oriented-BRIEF descriptor — BYTE-EXACT (validated 2026-05-30) ─────
 # Validated against the GDB_DUMP_F250+DESC_BRIEF capture (session 1780170xxx)
 # via dev/validate_descriptor_gradient.py: descriptor_gradient reproduces the
@@ -1058,7 +1103,8 @@ def patch_pre_v30_near_identity(ws_body, regions):
 
 
 def native_template(image_q16, reference_template=None, subtype=None,
-                     fill_all_sections=True, near_identity_sec0pre=False):
+                     fill_all_sections=True, near_identity_sec0pre=False,
+                     regen_section_trailer=True):
     """End-to-end native enrollment template — REFERENCE-FREE by default.
 
     Detects keypoints in `image_q16` with the byte-exact native pipeline
@@ -1121,6 +1167,19 @@ def native_template(image_q16, reference_template=None, subtype=None,
     # kps: list of (gx_int, gy_int, orient_q16, desc_16B), already
     # bound-filtered to [3, 109) by A960's check.
 
+    # When regenerating the per-section trailer (sub_180005720's orientation
+    # CDF), the v30 records and the CDF must agree on absolute kp indices, and
+    # the CDF requires ascending orient within each half — so sort kps by
+    # orientation index. (Match is set/grid-based, so record order is free; T2
+    # matched on detection order.) orient_idx is the field the CDF buckets —
+    # fold to ridge orientation [0,180) (mod pi; orient_to_index spans [0,360))
+    # so bucket = idx//15 stays in the DLL's 11-bucket range.
+    orient_idx = [orient_to_index(k[2]) % 180 for k in kps]
+    if regen_section_trailer:
+        order = sorted(range(len(kps)), key=lambda i: orient_idx[i])
+        kps = [kps[i] for i in order]
+        orient_idx = [orient_idx[i] for i in order]
+
     # 2-3. Serialize OUR keypoints into the ground-truth v30 section format
     # ([x][y][16B desc] × 250, zero-padded) and overwrite every v30 region.
     # (Per the gdb capture, a genuine enrollment puts a DIFFERENT selected
@@ -1135,6 +1194,14 @@ def native_template(image_q16, reference_template=None, subtype=None,
     for base in target_regions:
         start = base - V30_DESC_LEN
         ws_body[start:start + len(section)] = section
+        if regen_section_trailer:
+            # regenerate the 24-byte orientation-CDF trailer for OUR keypoints
+            # (right after the N×18 records); keep the scaffold's 2 scalar bytes.
+            tr_off = start + len(section)
+            split = ws_body[tr_off]            # BYTE[H+0xc]  (independent field)
+            secobj = ws_body[tr_off + 1]       # BYTE[secobj+0xc]
+            ws_body[tr_off:tr_off + 24] = build_section_trailer24(
+                orient_idx, split, secobj)
 
     # 4. Recompute TID over the new WS body, wrap in the envelope.
     ws_body_bytes = bytes(ws_body)
