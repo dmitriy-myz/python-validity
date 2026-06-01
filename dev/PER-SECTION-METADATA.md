@@ -1,5 +1,13 @@
 # Per-section metadata synthesis — the 24-byte v30 trailer + header geometry_stats/blob
 
+> **HARDWARE VERDICT (2026-06-01): the per-section trailer is NOT load-bearing.**
+> A/B on a live from-scratch enroll: matched with the trailer REGENERATED *and*
+> with it COPIED STALE (`--no-regen-trailer`). So `sub_18000c6a0` verify scores
+> only `[x][y]` grid occupancy + `sec0_pre`; this metadata is enroll-only
+> bookkeeping. Regeneration (`build_section_trailer24`, wired into
+> `native_template`/`enroll_native`) is correct/honest but OPTIONAL. Load-bearing
+> content = v30 `[desc][x][y]` records + `sec0_pre` (identity suffices).
+
 Scope: the finger-DEPENDENT per-section metadata that currently gets **copied
 from a stale scaffold** (`validitysensor/native_ws_scaffold.bin`) instead of
 generated for OUR keypoints. Two artefacts:
