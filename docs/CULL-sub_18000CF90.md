@@ -32,7 +32,7 @@ This is **(b) adaptive threshold + (c) min-distance dedup + strict NMS, bounded 
 Python equivalent is exactly `nms(resp, t_lo=671, t_hi=168, dedup_q=72064, margin=10)` at `moh_native.py:254`, which the file documents as validated set/count/order-exact across all 12 tiles.
 
 ## (3) Why the counts are 29,27,17,33,36,33,30,26,19
-These are **not** a quota. Each tile independently yields whatever survives `q>671 && q>=168 && strict-8nb-max` (dedup ~no-op at r2=1). The variation tracks ridge content per tile. The **global** 250-cap (`shr >>2`) only truncates the *frame* total — for frame-0 the sum (250) sits at the cap, after which the ported pipeline does a global qsort by `|resp|` desc, caps to 250, then **re-sorts by (tile_id ASC, |resp| DESC)**; the per-tile group sizes of that capped+regrouped pool reproduce `[29,27,17,33,36,33,30,26,19]` exactly. Confirmed by `dev/validate_cull.py` (uses `nms_kp`/`nms_resp` captures, asserts against `EXPECTED = [29,27,17,33,36,33,30,26,19]`).
+These are **not** a quota. Each tile independently yields whatever survives `q>671 && q>=168 && strict-8nb-max` (dedup ~no-op at r2=1). The variation tracks ridge content per tile. The **global** 250-cap (`shr >>2`) only truncates the *frame* total — for frame-0 the sum (250) sits at the cap, after which the ported pipeline does a global qsort by `|resp|` desc, caps to 250, then **re-sorts by (tile_id ASC, |resp| DESC)**; the per-tile group sizes of that capped+regrouped pool reproduce `[29,27,17,33,36,33,30,26,19]` exactly. Confirmed by `scripts/validate_cull.py` (uses `nms_kp`/`nms_resp` captures, asserts against `EXPECTED = [29,27,17,33,36,33,30,26,19]`).
 
 Note the subtlety: in the DLL the global cap lives one level up (the 250-cap + tile_id re-sort are post-CF90, already ported); CF90 itself only enforces the cap as a hard scan-stop. The validated Python models the post-CF90 stages explicitly (Phases 2–4 of `extract_frame_native`), which is the faithful net result.
 
@@ -43,8 +43,8 @@ Already present and validated in `/home/dev/projects/own/python-validity/validit
 - `_a960_passes_global_edge()`, `FRAME_KP_CAP=250` (line 850), global qsort + tile_id re-sort = Phases 1–4 of `extract_frame_native()` (line 891).
 
 Validate against the `minutia_table` / `nms_*` dumps:
-- Producer: `dev/gdb_dump.py` — `NmsEntryBP` (RVA `0xCF90`) saves `nms_kp_*_call{idx}_n{count}.bin` (0x20-stride records), `nms_resp_*_call{idx}_{w}x{h}.bin` (i32 response map), `nms_thr_*_call{idx}` (the `<3i` = t_lo,t_hi,distp triple), and `minutia_table` (count × 32) at `sub_18000A5B0`.
-- Harness: `./.venv-poc/bin/python dev/validate_cull.py` reloads per-tile `nms_kp`+`nms_resp`, replays Phases 1–3, and asserts per-tile survivor counts == `[29,27,17,33,36,33,30,26,19]`.
+- Producer: `scripts/gdb_dump.py` — `NmsEntryBP` (RVA `0xCF90`) saves `nms_kp_*_call{idx}_n{count}.bin` (0x20-stride records), `nms_resp_*_call{idx}_{w}x{h}.bin` (i32 response map), `nms_thr_*_call{idx}` (the `<3i` = t_lo,t_hi,distp triple), and `minutia_table` (count × 32) at `sub_18000A5B0`.
+- Harness: `./.venv-poc/bin/python scripts/validate_cull.py` reloads per-tile `nms_kp`+`nms_resp`, replays Phases 1–3, and asserts per-tile survivor counts == `[29,27,17,33,36,33,30,26,19]`.
 - To re-confirm the constants whenever the dump dir (`/media/sf_vbox-rw/finger/frida_dumps`) is remounted: parse any `nms_thr_*call0*` with `struct.unpack('<3i', …)` and assert it equals `(671, 168, 72064)`.
 
 ## (5) Still NEEDS-HOOK / open

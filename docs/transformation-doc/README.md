@@ -234,7 +234,7 @@ Goal: capture ground truth `input frames → output sec0_pre transforms` during 
 to verify a Python port. Run under the Wine gdb harness only (Frida does not work under Wine):
 
 ```
-GDB_DUMP_<HOOK>=1 gdb -p <WINE_PID> -x dev/gdb_dump.py
+GDB_DUMP_<HOOK>=1 gdb -p <WINE_PID> -x scripts/gdb_dump.py
 ```
 
 Six breakpoints, ordered outer→inner, each pulled from the function's own doc. Capturing

@@ -3,9 +3,9 @@
 Shared per-tile match/score routine in the Synaptics MoH fingerprint DLL
 (`/tmp/syna.dll`). Called by **both** sides of the matcher:
 
-- enrollment section-build via `sub_180008f10` (see `dev/decode_sub_180008f10.md`)
+- enrollment section-build via `sub_180008f10` (see `decode_sub_180008f10.md`)
 - identify / duplicate-check via `CeivMode::IdentifyUser` `sub_180027540`
-  (the `EnrollmentCheckForDuplicate` gate — see `dev/ENROLLMENT-checkforduplicate.md`)
+  (the `EnrollmentCheckForDuplicate` gate — see `ENROLLMENT-checkforduplicate.md`)
 
 It is the **wiring** around a 0x3840 = 14400-byte = **120×120-cell spatial voting
 grid** (1 byte/cell). It materializes the grid from a template, votes the
@@ -280,7 +280,7 @@ CeivMode::IdentifyUser sub_180027540`) and the enrollment section-builder
   occupied-cell consensus score, and on a winner sets `*(r13)=1`. **A match here
   means "same finger already enrolled" → duplicate.** This is the path the
   CheckForDuplicate gate consumes (`out[0x4d] = valid flag`, per
-  `dev/ENROLLMENT-checkforduplicate.md`).
+  `ENROLLMENT-checkforduplicate.md`).
 - **Enrollment section-build / merge (NOT-EQUAL arm):** the probe tile id differs
   from `refTileN`, so it skips the scorer and just compares union-coverage
   (`count2 >= count1`), records the tile index, and bumps `BYTE[rdi+0x10]`. This
@@ -330,7 +330,7 @@ the tile id `BYTE[query+0x10]` select which behavior fires.
    which is the only mechanism visible in c6a0. Full c510 notes in
    `/tmp/c510_analysis.json`.
 2. **Confirm the score at runtime under Wine + gdb** (the project already uses
-   `dev/gdb_dump.py` for this kind of capture; base image is `/tmp/syna.dll`).
+   `scripts/gdb_dump.py` for this kind of capture; base image is `/tmp/syna.dll`).
    The two highest-value breakpoints:
    - **`0x18000c789`** (the second `call sub_18000c240`): break here and read
      `ebp` (= `count1`) and, after stepping over, `eax` (= `count2`). These are
@@ -354,9 +354,9 @@ the tile id `BYTE[query+0x10]` select which behavior fires.
 
 ---
 
-*Cross-refs: `dev/decode_sub_180008f10.md` (section orchestrator / build side),
-`dev/ENROLLMENT-checkforduplicate.md` (CheckForDuplicate dispatch chain),
-`dev/MOH.md` / `dev/DLL-RE.md` (template architecture). v30 serializer
+*Cross-refs: `decode_sub_180008f10.md` (section orchestrator / build side),
+`ENROLLMENT-checkforduplicate.md` (CheckForDuplicate dispatch chain),
+`MOH.md` / `DLL-RE.md` (template architecture). v30 serializer
 `sub_1800057e0`, argsort `sub_18000bd10`, span-copy `sub_180003320`, TLV
 `sub_1800066a0`/`sub_180006a80` decoded previously.*
 

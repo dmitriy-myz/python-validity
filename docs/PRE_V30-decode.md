@@ -1,8 +1,8 @@
 # pre_v30 metadata — structural decode
 
 Decoded from the gdb capture `ws_body_1780084103036_23056.bin` (2026-05-29)
-via `dev/parse_ws_tlv.py`, using the TLV format reverse-engineered in
-`dev/PACKER-sub_180002240.md`. The ws-body body (after the 24-byte fixed
+via `scripts/parse_ws_tlv.py`, using the TLV format reverse-engineered in
+`PACKER-sub_180002240.md`. The ws-body body (after the 24-byte fixed
 header) is a **TLV stream**; the per-section "pre_v30" zones are TLV records,
 not opaque bytes.
 
@@ -67,7 +67,7 @@ So the persistent TLV field state to reproduce: `0x03=0x6b=5` (section count),
 
 ## Tools / next
 
-- `dev/parse_ws_tlv.py` — re-run on any captured ws_body.
+- `scripts/parse_ws_tlv.py` — re-run on any captured ws_body.
 - To finish the VARIANT zones: (a) the `GDB_DUMP_POSE` capture for the leads;
   (b) a **second** ws_body capture (different finger) to diff constant-vs-variant
   in `sec0_pre` and confirm `0x69=(112,112)` is fixed; (c) decode the sec0
@@ -128,7 +128,7 @@ The matrix loop (`0x1800052d0`–`0x18000536d`) emits `table[i][j]` for `j=i+1..
 (upper triangle, diagonal skipped). Records are 18 bytes (x@+0,y@+1, then a/b/tx/ty
 as 4 consecutive u32 — the in-memory +2 pad is dropped).
 
-**Byte-verified** (`dev/decode_sec0_pre.py`, 3 captures): the sec0_pre transform
+**Byte-verified** (`scripts/decode_sec0_pre.py`, 3 captures): the sec0_pre transform
 records all decode as **unit-scale rigid 2D similarity** (`a²+b² ≈ 0x10000²`, scale
 1.0000), with small inter-section rotations (≤±5°) and translations (≤~±70 px) —
 physically exactly right for frame-to-frame fingerprint alignment. So sec0_pre =

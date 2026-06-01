@@ -27,20 +27,20 @@ sections (with the layout fix + per-section trailer regen). The flow:
 
 1. **Recover/clean** (chip may be in 0x04b5 from prior writes → Wine enroll to reset):
    ```bash
-   sudo ./.venv-poc/bin/python dev/enroll_native_chip.py --list-users
-   sudo ./.venv-poc/bin/python dev/enroll_native_chip.py --delete-dbid <native_finger_dbid>
+   sudo ./.venv-poc/bin/python scripts/enroll_native_chip.py --list-users
+   sudo ./.venv-poc/bin/python scripts/enroll_native_chip.py --delete-dbid <native_finger_dbid>
    ```
 
 2. **Baseline (single frame)** — reference-free:
    ```bash
-   sudo ./.venv-poc/bin/python dev/enroll_native_chip.py \
+   sudo ./.venv-poc/bin/python scripts/enroll_native_chip.py \
      --identity-sec0pre --frames 1 --match --parent 6
    ```
    Then probe placement robustness — verify several times, each with a DELIBERATELY
    different finger placement (shift/roll up–down–left–right):
    ```bash
    for i in 1 2 3 4 5; do
-     sudo ./.venv-poc/bin/python dev/enroll_native_chip.py --match-only; done
+     sudo ./.venv-poc/bin/python scripts/enroll_native_chip.py --match-only; done
    ```
    Record how many of the varied placements matched.
 
@@ -48,11 +48,11 @@ sections (with the layout fix + per-section trailer regen). The flow:
    (IMPORTANT: shift/roll the finger between the 4 "place finger" prompts so they
    cover different regions):
    ```bash
-   sudo ./.venv-poc/bin/python dev/enroll_native_chip.py --delete-dbid <baseline_dbid>
-   sudo ./.venv-poc/bin/python dev/enroll_native_chip.py \
+   sudo ./.venv-poc/bin/python scripts/enroll_native_chip.py --delete-dbid <baseline_dbid>
+   sudo ./.venv-poc/bin/python scripts/enroll_native_chip.py \
      --identity-sec0pre --frames 4 --match --parent 6
    for i in 1 2 3 4 5; do
-     sudo ./.venv-poc/bin/python dev/enroll_native_chip.py --match-only; done
+     sudo ./.venv-poc/bin/python scripts/enroll_native_chip.py --match-only; done
    ```
    Record matches across the same varied placements.
 
@@ -61,7 +61,7 @@ sections (with the layout fix + per-section trailer regen). The flow:
   confirmed; robust from-scratch enrollment achieved with identity `sec0_pre`.
   (Recommended default: `--frames 4`.)
 - **No improvement / fewer** → the chip wants consolidated geometry; we'd then need
-  the `sec0_pre` registration port (the model-fitter, `dev/transformation-doc/`),
+  the `sec0_pre` registration port (the model-fitter, `transformation-doc/`),
   which is the only remaining hard piece.
 
 ## Notes

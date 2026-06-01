@@ -296,7 +296,7 @@ print(sensor.identify(lambda e: print(f"retry: {e}")))
 
 ## gdb-dump findings (known-input correlation)
 
-Frida can't attach to Wine (bootstrapper SIGSTOP), so `dev/gdb_dump.py`
+Frida can't attach to Wine (bootstrapper SIGSTOP), so `scripts/gdb_dump.py`
 captures the in-memory state instead. From one enrollment we dumped 8
 per-frame minutia tables + the final WS body. Results:
 
@@ -326,7 +326,7 @@ per-frame minutia tables + the final WS body. Results:
   step we haven't hooked; the per-frame minutia table is not the direct
   serializer input.
 
-Next instrumentation: `dev/gdb_dump.py` with `GDB_DUMP_STAGE5=1` hooks
+Next instrumentation: `scripts/gdb_dump.py` with `GDB_DUMP_STAGE5=1` hooks
 stage 5 (`sub_18000A5B0`) and snapshots its working buffer before/after
 each call, so the delta = the descriptor bytes produced for a known slot
 range. That yields (minutia → descriptor) pairs directly, bypassing both
@@ -337,10 +337,10 @@ the accumulator and the template bit-layout problem.
 **This supersedes the black-box "bit-packed stream" model below.** The WS
 body is a **TLV (tag-length-value) container**, not a bit-packed stream.
 Decoded by (a) reverse-engineering the host-side packer chain in the DLL
-and (b) hooking the packer live via `dev/gdb_dump.py GDB_DUMP_PACKER=1`
+and (b) hooking the packer live via `scripts/gdb_dump.py GDB_DUMP_PACKER=1`
 and diffing the WS body before/after every frame.
 
-### Host-side pipeline (see `dev/DLL-RE.md` for the function map)
+### Host-side pipeline (see `DLL-RE.md` for the function map)
 
 The per-frame processor `sub_1800D89C0` (reached via the object's `+104`
 function-pointer slot, dispatched by `sub_18009FD20`) does, per frame:
@@ -465,7 +465,7 @@ descriptor pipeline, not a wall.
 
 ### Isolation experiment — the descriptor is load-bearing (DEFINITIVE)
 
-`dev/splice_experiment.py` built variants from a known-good reference (one
+`scripts/splice_experiment.py` built variants from a known-good reference (one
 that matches the live finger), changing one v30 field at a time, each with a
 recomputed TID, then stored + `identify()`:
 
@@ -537,7 +537,7 @@ anchors) actually are:
   reading the in-memory record's `flag9` byte (which must be 0..8) at a
   32-byte stride gives uniform 0..255, and x/y read as garbage int32.
   (The 32-byte layout is the chip's *in-memory* working format, decoded
-  in `dev/DLL-RE.md`; it is serialized into this denser packed form.)
+  in `DLL-RE.md`; it is serialized into this denser packed form.)
 
 - **NOT an image at any dimension.** An adjacent-row-correlation sweep
   over 93,233 `(skip 0..700, width 4..136)` combinations peaks at only
@@ -681,8 +681,8 @@ Subsequent Linux operations work normally afterward.
 - `validitysensor/moh_extract.py` — RE'd structure code (scaffold)
 - `validitysensor/moh_opencv.py` — host-side OpenCV PoC (didn't work
   due to encryption — see Open questions)
-- `dev/DLL-RE.md` — DLL function-by-function reverse-engineering notes
-- `dev/bisect_ws.py` — bisection harness for chip-acceptance tests
-- `dev/store_then_read.py` — chip-storage round-trip check
-- `dev/map_template_layout.py` — diff/entropy analyzer for two captures
-- `dev/compare_image_template.py` — image vs template overlap check
+- `DLL-RE.md` — DLL function-by-function reverse-engineering notes
+- `scripts/bisect_ws.py` — bisection harness for chip-acceptance tests
+- `scripts/store_then_read.py` — chip-storage round-trip check
+- `scripts/map_template_layout.py` — diff/entropy analyzer for two captures
+- `scripts/compare_image_template.py` — image vs template overlap check

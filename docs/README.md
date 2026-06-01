@@ -1,14 +1,17 @@
-# dev/ — MoH (06cb:00a2) reverse-engineering & from-scratch enrollment
+# MoH (06cb:00a2) reverse-engineering & from-scratch enrollment
 
-Tooling + decode notes for reproducing the Synaptics 06cb:00a2 "Match-on-Host"
-fingerprint enrollment template entirely in Python (no `synaWudfBioUsb.dll`).
+Reverse-engineering notes (`docs/`) + tooling (`scripts/`) for reproducing the
+Synaptics 06cb:00a2 "Match-on-Host" fingerprint enrollment template entirely in
+Python (no `synaWudfBioUsb.dll`). The enrollment capability itself lives in the
+package (`validitysensor/moh_native.py`, `sensor.py`); this folder is the docs
+index, `scripts/` holds the CLIs/ports/capture tooling.
 
 **Status: SOLVED + hardware-confirmed.** A live finger captured by our pipeline
 builds a template the chip's `0x5e` matcher accepts — reference-free and
 placement-robust. Run it:
 
 ```bash
-sudo ./.venv-poc/bin/python dev/enroll_native_chip.py --identity-sec0pre --match --parent <user_dbid>
+sudo ./.venv-poc/bin/python scripts/enroll_native_chip.py --identity-sec0pre --match --parent <user_dbid>
 ```
 (`--frames 4` is the default; vary placement between captures. All dev tooling
 runs via `./.venv-poc/bin/python` — it has numpy/cv2; base python3 does not.)
@@ -33,8 +36,8 @@ live capture ──► extract_frame_native (moh_native: doh→nms→subpix→D9
               ──► compute_tid + _build_envelope  ──► raw 0x47 store ──► chip 0x5e match
 ```
 Core code lives in the package (`validitysensor/moh_native.py`, `moh_opencv.py`,
-`moh_extract.py`, `sensor.py`); `dev/` holds the CLIs, byte-exact ports, builders,
-and the capture/extract tooling.
+`moh_extract.py`, `sensor.py`); `scripts/` holds the CLIs, byte-exact ports,
+builders, and the capture/extract tooling; `docs/` holds these decode notes.
 
 ## Scripts (keepers)
 **CLIs**
@@ -52,7 +55,7 @@ and the capture/extract tooling.
 - `sec0pre_register.py` — `geom_register` (ported model-fitter math + offline study). NB: geometric registration can't reproduce the DLL's transforms (and isn't needed — identity works).
 
 **Capture / extract / parse tooling**
-- `gdb_dump.py` — the Wine gdb capture harness (`GDB_DUMP_<HOOK>=1 gdb -p <PID> -x dev/gdb_dump.py`). Frida does NOT work under Wine — use this.
+- `gdb_dump.py` — the Wine gdb capture harness (`GDB_DUMP_<HOOK>=1 gdb -p <PID> -x scripts/gdb_dump.py`). Frida does NOT work under Wine — use this.
 - `extract_funcs.py` — split objdump `.text` into per-function `.S` (for decoding).
 - `extract_log_images.py` — pull the `0x0278` source frames (112×112 working images) from a Wine enroll log.
 - `extract_finger_templates.py` — pull TID-valid `0x47 typ=6` finger templates from enroll logs.

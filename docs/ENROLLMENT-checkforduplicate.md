@@ -21,7 +21,7 @@ and the CheckForDuplicate dispatch are.)
 
 `CEohMohEIV` vtable base = **`0x18010db68`** (36 entries, preceded by a 16-byte
 COM interface IID GUID). Resolve any slot with
-`dev/find_vtable.py <dll> <func_vma> [slot_off]`.
+`scripts/find_vtable.py <dll> <func_vma> [slot_off]`.
 
 ```
 sub_18001e5f0  CEohMohEIV::EnrollmentCheckForDuplicate   (vtable idx 8, off 0x40)
@@ -44,7 +44,7 @@ sub_18001f670  vtable[0x78] (idx 15) — MODE DISPATCHER on *(int*)(this+0x28):
 The actual finger-vs-enrolled comparison/scoring is inside `IdentifyUser`
 (`sub_180027540`), which shares the v30 record serializer `sub_1800057e0`
 (`[16B desc][x][y]` 18-byte records) and the 120×120 spatial voting-grid scorer
-`sub_18000c6a0` with the enrollment path — see `dev/decode_sub_180008f10.md`.
+`sub_18000c6a0` with the enrollment path — see `decode_sub_180008f10.md`.
 
 For native enrollment, CheckForDuplicate is **orthogonal to building/storing a
 template** (it's a host-side identify gate). It matters only when implementing

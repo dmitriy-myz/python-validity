@@ -5,7 +5,7 @@ enrollment via the new `GDB_DUMP_SEC0PRE` hook. This is the authoritative
 structure of the inter-frame geometry that goes into `sec0_pre`.
 
 ## Capture
-- Hook: `Sec0PreEntryBP` on `sub_1800051f0` (dev/gdb_dump.py, `GDB_DUMP_SEC0PRE=1`).
+- Hook: `Sec0PreEntryBP` on `sub_1800051f0` (scripts/gdb_dump.py, `GDB_DUMP_SEC0PRE=1`).
 - Enroll: Wine log `1780253459.log` (5 sections), dumps in
   `/media/sf_vbox-rw/finger/frida_dumps/sec0pre_{obj,leads,blob,table}_*`.
 - 5 calls (idx1..idx5, one per section commit). Per call the obj at rcx holds:
@@ -60,7 +60,7 @@ matrix: upper-triangle table[i][j] for j>i, row-major, 18 bytes each:
 - Append helpers: `sub_1800064d0`=u32 LE, `sub_180006510`=u8, `sub_180006550`=N bytes — all LE,
   confirmed by the byte-exact decode.
 
-**Serializer + parser: `dev/sec0pre_serialize.py`** — `serialize_sec0pre(N, transforms, blob, flag)`
+**Serializer + parser: `scripts/sec0pre_serialize.py`** — `serialize_sec0pre(N, transforms, blob, flag)`
 round-trips the stored template byte-for-byte (`__main__` asserts `template[24:292] == output`).
 The lone approximate field for SYNTHESIS is `blob` (per-section quality, source `sub_180008980`
 `[rec+0x38]`); leads ignores it and the matcher uses the matrix transforms, so it is likely
@@ -70,7 +70,7 @@ non-load-bearing.
 We now have the EXACT in-memory structure. To build a byte-faithful sec0_pre:
 1. **Nail the serialization** (in-memory N×N table → the `sec0_pre` byte stream): map the captured `call04` table to the stored template's sec0_pre bytes (extract template from `1780253459.log`'s `0x47 typ=6` record; the naive 18-byte scan in `decode_sec0_pre.py` is unreliable across the leads/blob boundary — use the capture as the oracle). Determine exact record order (upper+lower triangle? row-major?), leads/blob placement, TLV framing.
 2. **Build the serializer** (inverse of the above) + the per-section pre_v30 for sections 1..4.
-3. **Compute transforms for our frames**: `geom_register` (dev/sec0pre_register.py) — VALIDATE it reproduces the captured DLL transforms for THIS enroll's frames (log 1780253459 images via extract_log_images); they're small consecutive-frame alignments so it should be close. blob/leads: compute section quality + argsort.
+3. **Compute transforms for our frames**: `geom_register` (scripts/sec0pre_register.py) — VALIDATE it reproduces the captured DLL transforms for THIS enroll's frames (log 1780253459 images via extract_log_images); they're small consecutive-frame alignments so it should be close. blob/leads: compute section quality + argsort.
 4. Assemble mode-B 5-section template, test `--match`.
 
 Note: orientation bug already fixed (feature frame must NOT be transposed; identity gives 242-250/250 keypoint overlap — commit 53c762e). Chip matching is geometric (positional Hough sub_18000c6a0), so close transforms + correct positions should suffice.
@@ -97,7 +97,7 @@ pipeline reproduces their keypoints 238-248/250 exact-xy):
   positional (sub_18000c6a0: "a cell holds a count, not a descriptor"), so this is
   likely irrelevant — the diagnostic template tests exactly that.
 
-**Diagnostic templates** (`dev/build_diagnostic_template.py`): T0 = exact DLL template
+**Diagnostic templates** (`scripts/build_diagnostic_template.py`): T0 = exact DLL template
 (positive control); T1 = OUR v30 for the mapped frames + the DLL's BYTE-EXACT sec0_pre/
 leads/blob/framing (TID recomputed). If the chip matches T1, then sec0_pre transform
 GENERATION is the SOLE remaining from-scratch blocker. PATHS to generate transforms:

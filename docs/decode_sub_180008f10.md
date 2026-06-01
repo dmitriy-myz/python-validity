@@ -149,11 +149,11 @@ This is the call that produces the consolidated record stream for the **single s
 ### NEEDS-HOOK — two links are not statically nailed down
 
 1. **`sub_1800057e0` body was never independently disassembled** (`/tmp/func_1800057e0.S` does not exist). The 18-byte `[16B][x][y]` loop, the `*(src+8)` count, and the `0x14/0x18/0x20` offsets come from the **c6a0 decoder's read of c6a0's call into it** (c6a0 itself rated *medium* confidence). Whether the count is the live `*(src+8)` (=250 for enrollment) and whether the descriptor is copied **verbatim from the v30 source `arg12`** vs. the model-fitter's 48-byte out struct `[rsp+0xe8]` is **not proven**.
-   - **HOOK:** `GDB_DUMP_PACKER_EMIT=1` (`dev/gdb_dump.py`, sites `0x2540..0x25d0` + `0x25d5`, 16-byte cursor at `[rsp+0x50]` of the packer `sub_180002240`). Diff consecutive stream snapshots across the c6a0 emit to confirm the 18-byte stride, the 250 count, and the byte deltas of each `put-N`.
+   - **HOOK:** `GDB_DUMP_PACKER_EMIT=1` (`scripts/gdb_dump.py`, sites `0x2540..0x25d0` + `0x25d5`, 16-byte cursor at `[rsp+0x50]` of the packer `sub_180002240`). Diff consecutive stream snapshots across the c6a0 emit to confirm the 18-byte stride, the 250 count, and the byte deltas of each `put-N`.
    - **HOOK:** add a breakpoint at `0x18000c8b1` (call to `5780`) and `0x1800057e0` entry; dump `rsi` (stream obj) before/after and `*(src+8)`/`src+0x14`/`src+0x18` for the first few records. Also re-dump the function: `objdump`/IDA export `func_1800057e0.S` so the loop is read, not inferred.
 
 2. **Which buffer the 4500 bytes physically live in before TLV commit** (section-slot `[rsp+0x88]` written directly by c6a0 through the handle, vs. DEST array `r12` then copied). The `sub_1800051f0`-does-not-emit-bulk contract strongly implies c6a0 writes through the handle, but this is inference.
-   - **HOOK:** `RVA_46E0` (`DescEntryBP`, opt-in in `dev/gdb_dump.py`) to capture the per-frame descriptor inputs/outputs, **plus** a watchpoint on the section-slot data pointer (`*(([rsp+0x88])+0x18)` row buffers from `sub_180005d10`) across the `0x1800094c5` call to see who fills it.
+   - **HOOK:** `RVA_46E0` (`DescEntryBP`, opt-in in `scripts/gdb_dump.py`) to capture the per-frame descriptor inputs/outputs, **plus** a watchpoint on the section-slot data pointer (`*(([rsp+0x88])+0x18)` row buffers from `sub_180005d10`) across the `0x1800094c5` call to see who fills it.
 
 ---
 
@@ -223,11 +223,11 @@ Tail / final builder:
 ## 7. Recommended next steps (ordered)
 
 1. **Disassemble `sub_1800057e0` and decode it.** Export `/tmp/func_1800057e0.S` (it is the only undumped function in the critical content path). Confirm: the variable-count loop, `count = *(src+8)`, source stride `0x20`, the `[16B put-N][x:u8 src+0x14][y:u8 src+0x18]` layout, and **where the 16 descriptor bytes are read from** (v30 source `arg12` vs out-struct `[rsp+0xe8]`). This resolves contradiction #3 and the primary open question.
-2. **Run `GDB_DUMP_PACKER_EMIT=1`** (`dev/gdb_dump.py`, RVA_2240 packer, 16-byte cursor at `[rsp+0x50]`, sites `0x2540..0x25d5`) during a native enrollment and diff consecutive stream snapshots across the `sub_18000c6a0` emit. Verify the per-record byte delta is 18 bytes and count the records (expect either 250 or the per-tile culled count). This empirically settles whether the section is a fixed 4500-byte area.
+2. **Run `GDB_DUMP_PACKER_EMIT=1`** (`scripts/gdb_dump.py`, RVA_2240 packer, 16-byte cursor at `[rsp+0x50]`, sites `0x2540..0x25d5`) during a native enrollment and diff consecutive stream snapshots across the `sub_18000c6a0` emit. Verify the per-record byte delta is 18 bytes and count the records (expect either 250 or the per-tile culled count). This empirically settles whether the section is a fixed 4500-byte area.
 3. **Add a breakpoint at `0x18000c8b1` (call into `5780`) + `0x1800057e0` entry**, and a watchpoint on the `sub_180005d10` section-slot row-buffer pointer (`*(([rsp+0x88])+0x18)`), to prove the bytes land in the section slot (handle) vs. `r12`. Resolves NEEDS-HOOK #2.
 4. **Decode `sub_18000c6a0` to high confidence** (currently medium). It is the function that holds the per-keypoint loop; with `5780` dumped this becomes the authoritative "4500-byte builder" decode.
 5. **Run `RVA_46E0` (`DescEntryBP`)** to capture `sub_1800046e0` inputs/outputs and confirm the v30 source layout (`+0x14`/`+0x18`/`+0x10` of the `0x20`-stride source records line up with the serializer's x/y/descriptor offsets).
-6. **Extend `dev/inspect_ws.py`** (the WS body byte-zone annotator) with an 18-byte-record `[16B][x][y]` zone parser for the v30 sections, parameterized by the per-section record count from step 2, so the captured emit deltas can be diffed against the chip's stored WS body. Also extend `dev/decode_variants.py` to test the "fixed 4500 vs per-tile-culled-count" hypothesis using the counts `29,27,17,33,36,33,30,26,19`.
+6. **Extend `scripts/inspect_ws.py`** (the WS body byte-zone annotator) with an 18-byte-record `[16B][x][y]` zone parser for the v30 sections, parameterized by the per-section record count from step 2, so the captured emit deltas can be diffed against the chip's stored WS body. Also extend `scripts/decode_variants.py` to test the "fixed 4500 vs per-tile-culled-count" hypothesis using the counts `29,27,17,33,36,33,30,26,19`.
 
 ---
 

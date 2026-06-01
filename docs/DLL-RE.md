@@ -92,7 +92,7 @@ int32 feature values (sign-extended small numbers fill the byte
 distribution evenly), not encryption. The 96% inter-capture byte diff
 is feature-extraction noise — slightly different image captures of the
 same finger produce different minutiae, coordinates, scores, and
-descriptors. See `dev/MOH.md` "TL;DR" and "TID derivation".
+descriptors. See `MOH.md` "TL;DR" and "TID derivation".
 
 ---
 
@@ -132,7 +132,7 @@ Python port it lives in `validitysensor/moh_extract.py`.
 | `sub_18000FDF0` | Sobel-style gradient (horizontal pass / I_x)          | body present, not ported |
 | `sub_18000CE80` | Response: `(buf30>>12)·(buf40>>12) − (buf38>>12)²` in **Q12 fixed-point**, int32. Operates per *plane* (list at ctx+0x50, count ctx+0x58, stride 0x70; per plane +0=w +4=h +0x30/0x38/0x40=tensor +0x50=response). | DECODED |
 
-#### Detector diagnosis (GDB_DUMP_HARRIS capture, `dev/diff_v30.py compare_harris`)
+#### Detector diagnosis (GDB_DUMP_HARRIS capture, `scripts/diff_v30.py compare_harris`)
 
 Hooking `sub_18000CE80` and diffing its dumps against `moh_opencv`:
 
@@ -197,7 +197,7 @@ the enhanced image, `sub_18000FDF0`'s RCX input, 57×57 int32 Q10 in
 `[0,255·1024]`). Running our **2nd-derivative** `Lxx` (Sobel-5) on that
 captured enhanced image correlates **+0.89..+0.92** with the DLL's `Ixx`
 buffer (vs ~0 for first-derivative `Ix²`). So the detector is DoH
-(`Lxx·Lyy − Lxy²`), not Harris — `dev/DLL-RE.md`'s old "Harris" label is
+(`Lxx·Lyy − Lxy²`), not Harris — `DLL-RE.md`'s old "Harris" label is
 wrong in operator, right in formula shape.
 
 **The remaining wall = the enhancement transform** (raw 112² frame → the
@@ -249,7 +249,7 @@ Tables (file offsets, `.rdata` VMA 0x18010a000 → file 0x108c00):
 The BRIEF pairs come from `sub_18000E6B0` (`moh_extract.BRIEF_SEED_TABLE`).
 
 **This completes the pipeline RE.** Everything from raw frame to `v30` is now
-classical CV with known tables — see `dev/NEXT-SESSION.md` for the
+classical CV with known tables — see `NEXT-SESSION.md` for the
 implementation plan (port + validate against captured `v30`).
 
 ### Gradient kernel chain (decoded; the bit-exact leaves remain)
@@ -349,7 +349,7 @@ norm2: Ixx[*]*=v10 ; Ixy[*]*=v10 ; Iyy[*]*=v10
 ⇒ `Ixx=v9³·DxDx`, `Iyy=v9³·DyDy`, `Ixy=v9³·DyDx` of the Gaussian-pre-smoothed
 tile, each pass deriv on one axis + smooth on the other, per-pass >>6/<<6.
 
-**PORT STATUS (dev/port_gradient.py): BYTE-EXACT** ✅ — `Ixx`/`Iyy`/`Ixy`
+**PORT STATUS (scripts/port_gradient.py): BYTE-EXACT** ✅ — `Ixx`/`Iyy`/`Ixy`
 reproduce the per-pass `GDB_DUMP_G380` captures with **0 mismatches** (interior;
 edges pending the exact L/M/R region logic). The per-pass dumps cracked three
 details that blind reconstruction missed:
@@ -367,7 +367,7 @@ details that blind reconstruction missed:
 input = `<<6( Gaussian₅(tile, shift 12) )` — Gaussian size 5, applied to the Q10
 tile directly (NOT >>6 first), shift 12, then <<6. 0 mismatches (border 2) vs
 g380 call1_before. ⇒ **the whole DoH front-end `gradin → Ixx/Iyy/Ixy/resp` is
-byte-exact end-to-end** (dev/port_gradient.py `doh()`; 0 mismatches at border 5).
+byte-exact end-to-end** (scripts/port_gradient.py `doh()`; 0 mismatches at border 5).
 This also validates the FF00/FEC0 Gaussian-builder port. The Gaussian size (5
 here) comes from ctx[+0x14] via sub_1800101C0's size calc — parametrize when a
 varying-scale tile appears. REMAINING for full-tile (not interior) exactness:
@@ -378,11 +378,11 @@ excludes borders anyway.
 REMAINING = pure implementation: port the two builders + the separable apply +
 the 3-plane dataflow in `sub_18000CC20`, then validate **bit-exact** against the
 captured `harris_Ixx/Iyy/Ixy/resp` planes (57×57) in `$FRIDA_DUMP_DIR` (already
-on disk; `dev/diff_v30.py compare_harris`). The exact per-plane source/dest
+on disk; `scripts/diff_v30.py compare_harris`). The exact per-plane source/dest
 buffer wiring in `sub_18000CC20` (struct offsets +0x20/+0x28/+0x30/+0x38/+0x40/
 +0x48/+0x50) and the scale params from the ctx struct ([+0x18],[+0x5c],[+0x60])
 are the only thing to read off carefully during the port. See
-`dev/NEXT-SESSION.md`.
+`NEXT-SESSION.md`.
 
 ### BRIEF descriptor selection
 
@@ -470,13 +470,13 @@ not plain SHA-256 of WS. (The exact DLL function is unconfirmed — the
 earlier "sub_1800E0A60 orchestrator" attribution was wrong; that's memset.
 `sub_18004B710` = a CryptHashData/SHA-256 wrapper is plausibly involved, but
 unverified.) The recipe itself is empirically verified end-to-end; full
-reference implementation: `dev/MOH.md` "TID derivation" and
+reference implementation: `MOH.md` "TID derivation" and
 `validitysensor/moh_extract.compute_tid()`.
 
 ### WS-body packer chain (DECODED — the descriptor serialization path)
 
 The WS body is a **TLV container**, written per-frame by this chain.
-Full byte layout + live validation in `dev/MOH.md` "WS body layout".
+Full byte layout + live validation in `MOH.md` "WS body layout".
 
 | VA              | Role                                                  | Status |
 |-----------------|-------------------------------------------------------|--------|
@@ -494,7 +494,7 @@ Full byte layout + live validation in `dev/MOH.md` "WS body layout".
 ### 180-byte working record (the per-minutia descriptor builder output)
 
 `sub_1800046E0` fills one 180-byte record (45 dwords) per minutia from the
-image patch. Decoded from a 12-minutia live capture (`dev/gdb_dump.py
+image patch. Decoded from a 12-minutia live capture (`scripts/gdb_dump.py
 GDB_DUMP_DESC=1`, dumping the record at `[rsp+0x30]` before/after the call).
 The input image is **128×128 8-bit grayscale** (confirmed by row
 correlation; `desc_image_*` dumps). Builder writes dwords `[1–4], [23–35],
@@ -530,7 +530,7 @@ each section is the packer's input feature buffer `v30` copied verbatim**
 orchestrator `sub_18000AAB0`. `sub_1800043D0` only fills `record[26..40]`
 metadata + samples image patches into scratch; it does NOT produce the
 section blob. So native enrollment reduces to reproducing `v30` bit-for-bit
-(see `dev/MOH.md` "Implication for native enrollment").
+(see `MOH.md` "Implication for native enrollment").
 
 ### Envelope serialization (the final write step)
 
@@ -542,7 +542,7 @@ section blob. So native enrollment reduces to reproducing `v30` bit-for-bit
 | `sub_180031CD0`  | Caching wrapper around `sub_180036590`. Memoizes the envelope output keyed on `(a2_buf, a3_buf)` so identical inputs don't re-serialize. | body decompiled |
 
 The byte-exact envelope structure (verified against five distinct
-chip-accepted Wine captures, see `dev/extract_finger_templates.py`) is:
+chip-accepted Wine captures, see `scripts/extract_finger_templates.py`) is:
 
 ```
 offset      size    field
@@ -572,7 +572,7 @@ first 4 bytes of the real WS body (which the chip also reads as zeros),
 and the "WS body tail" we thought we were writing actually contained the
 TLV2 header. The serializer's real layout has the WS body starting at
 offset 12 and the TID introduced by a TLV2 header at offset 23068. See
-`dev/MOH.md` "Wire format" for the full table.
+`MOH.md` "Wire format" for the full table.
 
 ---
 
@@ -600,7 +600,7 @@ offset 12 and the TID introduced by a TLV2 header at offset 23068. See
 
 ## What we proved at the protocol level (no DLL needed)
 
-Detailed in `dev/MOH.md`. Summary:
+Detailed in `MOH.md`. Summary:
 
 - **Storage** path: chip stores any 23136-byte template with no content
   validation; only structure (size + envelope framing) is checked.
@@ -620,14 +620,14 @@ Detailed in `dev/MOH.md`. Summary:
 
 1. **What is the per-field bit layout of the WS-body feature sections?**
    THE blocker for native enrollment. Black-box analysis is exhausted
-   (see "WS body feature encoding (black-box findings)" in `dev/MOH.md`):
+   (see "WS body feature encoding (black-box findings)" in `MOH.md`):
    the sections are **bit-packed** (entropy 7.86), **not an image** at
    any (skip, width) — a 93k-combination correlation sweep peaks at 0.485
    vs 0.81 for a real frame — and **not byte-aligned records**. The
    packing period is **36 bytes (two 144-bit units)**. Going from
    "36-byte packed units" to "bits a..b = x, bits c..d = y, …" needs
    **known inputs**: dump the in-memory minutia table beside the WS body
-   via `dev/frida_dump.py` and search for known field values inside the
+   via `scripts/frida_dump.py` and search for known field values inside the
    36-byte records of a clean mid-section.
 2. **What is the trailer byte?** Hash byte? Subtype-related? Per-record
    counter encoded in single byte? Captured values: `0x11`, `0x70`,
@@ -653,7 +653,7 @@ Detailed in `dev/MOH.md`. Summary:
   for the low-entropy prelude. The byte skew (0x44 ~3.5× uniform) argues
   against AES (which is uniform) and for bit-packed binary descriptors.
   So: not symmetric-encrypted, but also not trivially readable — it's a
-  bit-packed serialization. See `dev/MOH.md` "WS body feature encoding".
+  bit-packed serialization. See `MOH.md` "WS body feature encoding".
 
 - ~~**How is the 32-byte TID at offset 23072 derived?**~~ HMAC-SHA256
   chain with a self-derived key, decoded from `enroll-fresh.log` lines
@@ -684,5 +684,5 @@ Detailed in `dev/MOH.md`. Summary:
   envelopes with correct TIDs; the open question is whether the
   feature-extraction approximation is close enough to the DLL's that
   the chip's matcher accepts our minutiae. Test by running, storing,
-  then identifying — see `dev/MOH.md` "Why the OpenCV PoC didn't match".
-- `dev/MOH.md` — protocol-side findings, replay workflow, TID recipe.
+  then identifying — see `MOH.md` "Why the OpenCV PoC didn't match".
+- `MOH.md` — protocol-side findings, replay workflow, TID recipe.

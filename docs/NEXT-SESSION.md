@@ -11,26 +11,26 @@ here and `enroll_native_chip.py --match`. **Read `~/.claude` memory
 
 - **WS-body packer `sub_180002240`** fully decompiled + adversarially verified —
   it's a per-frame TLV-stream section appender; accumulator lives in
-  `*(algo+8)`. `dev/PACKER-sub_180002240.md`.
+  `*(algo+8)`. `PACKER-sub_180002240.md`.
 - **Section/descriptor builder `sub_180008f10`** + serializer `sub_1800057e0`
-  decoded. `dev/decode_sub_180008f10.md`.
+  decoded. `decode_sub_180008f10.md`.
 - **Matcher `sub_18000c6a0`** = Hough geometric-voting inlier counter (120×120
   grid, rigid Q16 transforms). `bdf0`/`180006da0` inverse-transform math
-  byte-verified. `dev/SCORER-sub_18000c6a0.md`.
+  byte-verified. `SCORER-sub_18000c6a0.md`.
 - **EnrollmentCheckForDuplicate chain** (`sub_18001e5f0`→vtable[0x78]→
-  `CeivMode::IdentifyUser`) resolved. `dev/find_vtable.py`,
-  `dev/ENROLLMENT-checkforduplicate.md`.
+  `CeivMode::IdentifyUser`) resolved. `scripts/find_vtable.py`,
+  `ENROLLMENT-checkforduplicate.md`.
 - **WS-body layout**: v30 record = `[x:u8][y:u8][16B desc]` (ground-truth
   confirmed 250/250). `sec0_pre` = inter-section rigid-Q16 alignment transforms
-  (`dev/parse_ws_tlv.py`, `dev/decode_sec0_pre.py`, `dev/PRE_V30-decode.md`).
-  `serialize_v30_section()` byte-exact (`dev/verify_v30_serializer.py`).
+  (`scripts/parse_ws_tlv.py`, `scripts/decode_sec0_pre.py`, `PRE_V30-decode.md`).
+  `serialize_v30_section()` byte-exact (`scripts/verify_v30_serializer.py`).
 - **Cull confirmed DONE**: `sub_18000A1B0` is the per-frame FEATURE BUILDER, the
   cull is `sub_18000CF90` (= our `nms()`, byte-exact: t_lo=671,t_hi=168,
-  dedup_q=72064,margin=10). `dev/CULL-sub_18000CF90.md`.
+  dedup_q=72064,margin=10). `CULL-sub_18000CF90.md`.
 - **Descriptor pipeline byte-exact on ground truth**: `descriptor_gradient`
   reproduces the chip's gradX/gradY byte-exact; `tile_image`==F250 (diff 0);
   `orient_d920` 60/60; chain (`_descriptor_at`) 40/40. Harness
-  `dev/validate_descriptor_gradient.py`.
+  `scripts/validate_descriptor_gradient.py`.
 
 ## STEP 1 — RESOLVED 2026-05-31 → cause (B), pipeline is byte-exact
 
@@ -41,7 +41,7 @@ exact 18-byte records, with two candidate causes — (A) our `subpix_refine_kp` 
 sectionN" compares different images).
 
 **The clean same-image test settled it decisively: cause (B).**
-`dev/validate_same_image.py` runs our full per-tile detection on the chip's
+`scripts/validate_same_image.py` runs our full per-tile detection on the chip's
 EXACT F250 input tile (session 1780170; 34 chip gradient tiles paired to F250
 raw tiles by interior byte-exact `descriptor_gradient` match) and compares
 against the chip's `descbrief_kp_before` (subpix @+0x14/+0x18, orient @+0xc) +
@@ -74,7 +74,7 @@ framing now comes from a baked-in scaffold `validitysensor/native_ws_scaffold.bi
 real descriptors shipped). At runtime we overlay OUR v30 records into the 4
 pinned regions `(309, 4913, 9453, 13993)` and recompute the TID, so the entire
 template — keypoints AND framing — is ours, with no reference file. Verified
-byte-faithful: `dev/verify_reference_free.py` (22/22 checks) confirms the
+byte-faithful: `scripts/verify_reference_free.py` (22/22 checks) confirms the
 framing is byte-identical to fresh.bin outside the v30 areas, the TID validates,
 the explicit-`--ref` path still works (regression), and the real pipeline runs
 end-to-end. `native_template(img)`, `Sensor.enroll_native(...)`, and
@@ -83,7 +83,7 @@ end-to-end. `native_template(img)`, `Sensor.enroll_native(...)`, and
 Caveat (the honest gap): the scaffold's pre-v30 metadata (sec0_pre pose table,
 per-section counts/leads) still describes fresh.bin's frames, not ours — full
 first-principles pre-v30 synthesis is blocked by NEEDS-HOOK rows in
-`dev/PACKER-sub_180002240.md`. Whether the matcher needs pre-v30 to describe OUR
+`PACKER-sub_180002240.md`. Whether the matcher needs pre-v30 to describe OUR
 geometry is exactly what the match gate (below) settles.
 
 ## STEP 2 — match gate RESULT (2026-05-31): NO MATCH → cause is CONTENT
@@ -92,7 +92,7 @@ Ran on hardware: enroll stored fine (finger dbid=8 subtype 0xf6 under real
 StgWindsor user dbid=6, 250 kp) but the chip `0x5e` matcher returned no-match.
 Root-caused WITHOUT more hardware:
 
-- **Plumbing RULED OUT.** `dev/extract_finger_templates.py` over the captured
+- **Plumbing RULED OUT.** `scripts/extract_finger_templates.py` over the captured
   `enroll*.log`s shows the DLL stores the finger with parameters BYTE-IDENTICAL
   to ours: `0x47 parent=<user> typ=6 storage=3 len=23136` + 1 random trailer.
   (And `0x68`/`0x6b` session enrollment is MoC-only → `0x0401` here, so raw
@@ -105,21 +105,21 @@ Root-caused WITHOUT more hardware:
 
 ### BLOCKER: chip in `0x04b5` "bad state"
 Repeated raw `0x47` writes degraded the chip; it now rejects writes with
-`0x04b5`. Only documented recovery (dev/MOH.md "Chip-state recovery") is a
+`0x04b5`. Only documented recovery (MOH.md "Chip-state recovery") is a
 **Wine re-enroll** — which also re-creates a matchable finger and a fresh
 capturable DLL template for field-by-field diffing.
 
 ### STEP 3 — multi-frame template with computed sec0_pre (BUILT 2026-05-31)
 
-The full registration algorithm is decompiled (`dev/transformation-doc/`, 55 funcs)
+The full registration algorithm is decompiled (`transformation-doc/`, 55 funcs)
 and ported. Key finding: **sec0_pre is GEOMETRIC** — stored v30 descriptors are
 useless across frames (median Hamming ~52/128), so registration = geometric
 overlap, not descriptor matching (matches `sub_18000c6a0` being a positional Hough
-grid). `dev/sec0pre_register.py:geom_register` (correspondence-free overlap-max +
+grid). `scripts/sec0pre_register.py:geom_register` (correspondence-free overlap-max +
 ICP) computes valid inter-frame transforms; reproduces the dominant stored
 transform exactly (T7) but not all (DLL's are descriptor/reference-composed).
 
-`dev/build_multiframe_template.py` assembles a complete mode-A (4-section) template
+`scripts/build_multiframe_template.py` assembles a complete mode-A (4-section) template
 = our 4 frames' v30 + our geom sec0_pre (4 slots @ ws+79/97/115/133 → pairs
 (0,3)(1,2)(3,0)(2,3)) + TID. Offline self-test passes (structure valid, TID OK).
 Wired as `enroll_native_chip.py --multiframe` (no `--ref` needed; uses the baked
@@ -128,14 +128,14 @@ scaffold).
 HARDWARE TEST (the arbiter — does geometric sec0_pre match?):
 ```
 # clean stale native fingers first (delete the FINGER dbid, not the user!):
-sudo python dev/enroll_native_chip.py --list-users
-sudo python dev/enroll_native_chip.py --delete-dbid <stale-finger-dbid>
+sudo python scripts/enroll_native_chip.py --list-users
+sudo python scripts/enroll_native_chip.py --delete-dbid <stale-finger-dbid>
 # capture 4 frames (move finger slightly between each), build, store, match:
-sudo python dev/enroll_native_chip.py --multiframe --match --parent 6 --subtype 0xf8
+sudo python scripts/enroll_native_chip.py --multiframe --match --parent 6 --subtype 0xf8
 ```
 MATCH (subtype=0xf8) ⇒ from-scratch multi-frame template WORKS. NO MATCH ⇒ the
 geom sec0_pre / stale leads-blob aren't accepted → do the gdb capture
-(`dev/transformation-doc/README.md` 6-breakpoint plan) for byte-exact DLL
+(`transformation-doc/README.md` 6-breakpoint plan) for byte-exact DLL
 transforms + the exact sec0_pre serialization (leads/blob/slot count), then rebuild.
 
 ### STEP 2-NEXT (superseded by STEP 3)  (chip recovered via Wine log 1780232416)
@@ -167,17 +167,17 @@ Plan:
 
 - Captures in `/media/sf_vbox-rw/finger/frida_dumps/` (session 1780170xxx has it
   ALL: F250 raw tiles, descbrief gradX/gradY/desc/kp, ws_body, minutia_tables;
-  log `1780170395.log`). Extract images: `dev/extract_log_images.py <log> -o DIR`.
-- `/tmp/syna_all.S` (objdump), `dev/extract_funcs.py` (per-function splitter →
-  `/tmp/func_<addr>.S`), `dev/find_vtable.py` (virtual-call resolver).
+  log `1780170395.log`). Extract images: `scripts/extract_log_images.py <log> -o DIR`.
+- `/tmp/syna_all.S` (objdump), `scripts/extract_funcs.py` (per-function splitter →
+  `/tmp/func_<addr>.S`), `scripts/find_vtable.py` (virtual-call resolver).
 - Pipeline: `validitysensor/moh_native.py` (extract_frame_native, nms,
   descriptor_gradient, subpix_refine_kp, orient_d920, _descriptor_at,
   serialize_v30_section, native_template). venv: `./.venv-poc/bin/python`.
 
 ## WORKFLOW RULES (do not repeat past mistakes)
 
-- **Frida does NOT work under Wine — gdb only** (`dev/gdb_dump.py` via
-  `GDB_DUMP_<HOOK>=1 gdb -p <PID> -x dev/gdb_dump.py`).
+- **Frida does NOT work under Wine — gdb only** (`scripts/gdb_dump.py` via
+  `GDB_DUMP_<HOOK>=1 gdb -p <PID> -x scripts/gdb_dump.py`).
 - **ALWAYS `git push` immediately after every commit** — the Wine capture box
   pulls from origin; local-only commits run stale code (cost: wasted sessions).
 - **The capture box must `git pull` before a capture run.**

@@ -20,9 +20,9 @@ generated for OUR keypoints. Two artefacts:
    per-section **quality blob** (`[0x54,0x5c,0x5c,0x5a,0x57]<<24`) inside
    `sec0_pre`.
 
-Cross-refs: `dev/bucket_table_180005720.py` (proven byte-exact port of #1),
-`dev/decode_sub_180008f10.md` §8/§9, `dev/SCORER-sub_18000c6a0.md`,
-`dev/PRE_V30-decode.md`, `dev/V30-emitter-and-layout.md`.
+Cross-refs: `scripts/bucket_table_180005720.py` (proven byte-exact port of #1),
+`decode_sub_180008f10.md` §8/§9, `SCORER-sub_18000c6a0.md`,
+`PRE_V30-decode.md`, `V30-emitter-and-layout.md`.
 
 ---
 
@@ -73,7 +73,7 @@ tail of each section, after the `N × 18` records:
 | `+2 .. +24` (22 B) | two `sub_180005720` calls | **orientation-bucket CDF**, two halves of 11 buckets. |
 
 **Generating algorithm** (`sub_180005720`, byte-exact in
-`dev/bucket_table_180005720.py`; self-test `ALL SECTIONS BYTE-EXACT: True`):
+`scripts/bucket_table_180005720.py`; self-test `ALL SECTIONS BYTE-EXACT: True`):
 
 - Per keypoint `i` the source array `S` (stride `0x20`) holds the orientation at
   `u32[S + i*0x20 + 0x0c]`. `bucket(i) = orient // 15` (DLL magic
@@ -99,7 +99,7 @@ Observed sec0 (enroll 1780253459): `[141,84, 21,28,29,31,42,68,92,105,109,112,
 Two DISTINCT artefacts that the prior notes conflated:
 
 **(a) `[rec+0x38]` frame-selection quality (0..3000)** — produced by
-`sub_180008980` (`dev/decode_sub_180008f10.md` §9). The clamp/quantize stage and
+`sub_180008980` (`decode_sub_180008f10.md` §9). The clamp/quantize stage and
 its 17-channel `[base,denom]` table `@0x18011fb90` are byte-exact; but the final
 scalar comes from a learned regression (`sub_180002d20`) whose coefficient
 matrix lives in a **runtime ctx object**, so `[rec+0x38]` is **not statically
@@ -111,7 +111,7 @@ it is *internal frame selection*, NOT a template byte.
 (`obj+8`) by the **matcher path** `sub_18000c6a0`/`sub_18000bdf0`, appended
 one-per-section across the 5 serializer calls, then serialized into `sec0_pre`
 by `sub_1800051f0` (`[blob: edi*4 bytes from *(obj+8)]`, see
-`dev/PRE_V30-decode.md` §"sec0_pre serialization"). It is a per-section quality
+`PRE_V30-decode.md` §"sec0_pre serialization"). It is a per-section quality
 **byte**, NOT `[rec+0x38]` (which is 0..3000 and cannot fit `<<24`). Deriving it
 from scratch needs the `c6a0`/`bdf0` blob-byte logic, which is not decoded.
 
@@ -138,7 +138,7 @@ cannot reproduce. Plan accordingly.
 
 ### 2A. NEW module helper — port the trailer generator into the package
 
-Promote the proven `dev/bucket_table_180005720.py` into the package (or import
+Promote the proven `scripts/bucket_table_180005720.py` into the package (or import
 it) and add a per-section trailer builder that consumes OUR per-section kp list.
 Our `extract_frame_native` already yields `(gx, gy, orient_q16, desc)` tuples;
 the trailer needs `orient_q16` (the same field `S+0xc`).
@@ -239,7 +239,7 @@ Two practical wrinkles, both addressable:
 The key question per artefact: does the matcher `sub_18000c6a0` (verify path)
 re-read it, or is it enrollment-only bookkeeping that storage tolerates?
 
-**What the matcher actually consumes (from `dev/SCORER-sub_18000c6a0.md`):** the
+**What the matcher actually consumes (from `SCORER-sub_18000c6a0.md`):** the
 verify path is a **120×120 spatial voting grid** over **rigid-similarity
 transforms** of keypoint coordinates. Its inputs are:
 - the **candidate/query keypoint records** (the `[x][y]` + per-pair transform
@@ -298,7 +298,7 @@ in the metadata, then running the on-chip match.
 
 Run on hardware:
 ```
-sudo ./.venv-poc/bin/python dev/enroll_native_chip.py --subtype 0xf5 --match   # T_copy
+sudo ./.venv-poc/bin/python scripts/enroll_native_chip.py --subtype 0xf5 --match   # T_copy
 # then rebuild with the trailer regen patch applied and re-run --match         # T_regen
 ```
 
@@ -325,7 +325,7 @@ whether the chip (a) ignores the trailer (all three identical), (b) needs it
 needs it well-formed regardless of values (T_copy==T_regen, T_zero fails).
 
 **Even cheaper signal without three enrollments:** run the gdb verify hook
-(`dev/gdb_dump.py`) breaking at `0x18000c789` (the second `c240` occupied-count)
+(`scripts/gdb_dump.py`) breaking at `0x18000c789` (the second `c240` occupied-count)
 and `0x18000c7ed` (the match gate) during a verify of T_copy. If the occupied
 cell `count1`/`count2` and the `*(rbx)` best-index are computed entirely from
 the v30 `[x][y]` records — with no read touching `anchor + N*18` (the trailer)
