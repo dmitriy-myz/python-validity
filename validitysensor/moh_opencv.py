@@ -372,13 +372,16 @@ V30_RECORDS_PER_SECTION = 250
 
 
 def build_v30_record(x: int, y: int, descriptor_128: int) -> bytes:
-    """One 18-byte v30 minutia record: [x][y][16-byte little-endian desc]."""
-    return bytes((x & 0xff, y & 0xff)) + (descriptor_128 & ((1 << 128) - 1)).to_bytes(16, 'little')
+    """One 18-byte v30 minutia record: [16-byte little-endian desc][x][y].
+    (Descriptor FIRST — decoded from the v30 emitter sub_1800057e0, 2026-06-01.)"""
+    return (descriptor_128 & ((1 << 128) - 1)).to_bytes(16, 'little') + bytes((x & 0xff, y & 0xff))
 
 
 def find_v30_regions(ws: bytes, min_run: int = 30) -> List[int]:
     """Locate each section's v30 record array by detecting long runs of
-    18-byte records whose leading (x,y) bytes are valid 112px coordinates."""
+    18-byte records. Returns the (x,y) ANCHOR offset of each region; the
+    record layout is [16B desc][x:u8][y:u8], so the record area (first
+    descriptor) starts at `anchor - 16` and the (x,y) bytes are at +16/+17."""
     regions, p, n = [], 0, len(ws)
     while p < n - V30_RECORD_LEN * min_run:
         good, q = 0, p
@@ -402,7 +405,7 @@ def splice_minutiae(reference_ws: bytes, records: List[bytes]) -> bytes:
     regions = find_v30_regions(reference_ws)
     for base in regions:
         for i, r in enumerate(recs):
-            off = base + i * V30_RECORD_LEN
+            off = (base - 16) + i * V30_RECORD_LEN   # records start at anchor-16 ([desc][x][y])
             ws[off:off + V30_RECORD_LEN] = r
     log.info("spliced %d minutiae into %d v30 regions at %s",
              min(len(records), V30_RECORDS_PER_SECTION), len(regions), regions)

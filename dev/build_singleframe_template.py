@@ -66,7 +66,7 @@ def build(ws0, regs, subtype, section_records, out):
     ws = bytearray(ws0)
     for j, base in enumerate(regs):
         sec = serialize_v30_section([(x, y, d) for (x, y, d) in section_records[j]])
-        ws[base:base + len(sec)] = sec
+        ws[base - 16:base - 16 + len(sec)] = sec   # records start at anchor-16 ([desc][x][y])
     force_identity_sec0pre(ws)
     nws = bytes(ws)
     env = _build_envelope(subtype, nws, compute_tid(nws))

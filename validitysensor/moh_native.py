@@ -629,6 +629,7 @@ def build_v30(global_kps, max_records=250, tag=4, body_len=4533):
 # only when our detector yields < 250.
 V30_SECTION_RECORDS = 250
 V30_SECTION_BYTES = V30_SECTION_RECORDS * 18  # 4500
+V30_DESC_LEN = 16   # record = [desc:16][x:u8][y:u8]; x,y anchor is +16 into the record
 
 
 def serialize_v30_section(records, n_slots=V30_SECTION_RECORDS):
@@ -638,18 +639,22 @@ def serialize_v30_section(records, n_slots=V30_SECTION_RECORDS):
     n_slots; short tail zero-padded. Returns exactly n_slots*18 bytes
     (4500 for the default 250-slot section).
 
-    Byte-exact-verified to reproduce a captured ws_body section when fed
-    that section's own (x, y, desc) — see dev/verify_v30_serializer.py."""
+    TRUE on-wire record layout = [16B descriptor][x:u8][y:u8] (descriptor
+    FIRST), decoded from the v30 emitter sub_1800057e0 (2026-06-01) and
+    verified: parsing a stored section this way pairs (x,y,desc) 238-248/250
+    against our single-frame extraction (vs 0/250 for the old [x][y][desc]).
+    The section's record area starts at (find_v30_regions anchor − 16), so
+    callers must write this buffer at `anchor - V30_DESC_LEN`."""
     out = bytearray(n_slots * 18)
     for i, rec in enumerate(records):
         if i >= n_slots:
             break
         x, y, desc = rec[0], rec[1], rec[2]
         o = i * 18
-        out[o] = x & 0xFF
-        out[o + 1] = (y & 0xFF) if y is not None else 0
         d = bytes(desc[:16])
-        out[o + 2:o + 2 + len(d)] = d
+        out[o:o + len(d)] = d
+        out[o + 16] = x & 0xFF
+        out[o + 17] = (y & 0xFF) if y is not None else 0
     return bytes(out)
 
 
@@ -1125,8 +1130,11 @@ def native_template(image_q16, reference_template=None, subtype=None,
     section = serialize_v30_section(
         [(gx, gy, desc) for (gx, gy, _orient, desc) in kps])
     target_regions = regions if fill_all_sections else regions[:1]
+    # find_v30_regions returns the (x,y) ANCHOR; the record area (descriptor of
+    # the first kp) starts V30_DESC_LEN bytes earlier — records are [desc][x][y].
     for base in target_regions:
-        ws_body[base:base + len(section)] = section
+        start = base - V30_DESC_LEN
+        ws_body[start:start + len(section)] = section
 
     # 4. Recompute TID over the new WS body, wrap in the envelope.
     ws_body_bytes = bytes(ws_body)

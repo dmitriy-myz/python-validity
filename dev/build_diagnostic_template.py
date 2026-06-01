@@ -50,13 +50,17 @@ def extract_template(log):
 
 
 def sec_records(wsb, base):
+    """Parse a v30 section. TRUE layout = [16B desc][x:u8][y:u8]; the (x,y)
+    anchor returned by find_v30_regions is +16 into the record, so the record
+    area starts at base-16."""
     recs = []
+    s = base - 16
     for k in range(250):
-        o = base + k * 18
-        x, y = wsb[o], wsb[o + 1]
+        o = s + k * 18
+        x, y = wsb[o + 16], wsb[o + 17]
         if not (0 < x <= 112 and 0 < y <= 112):
             break
-        recs.append((x, y, bytes(wsb[o + 2:o + 18])))
+        recs.append((x, y, bytes(wsb[o:o + 16])))
     return recs
 
 
@@ -124,8 +128,7 @@ def main():
     nws = bytearray(ws)
     for j, base in enumerate(regs):
         sec = serialize_v30_section([(x, y, d) for x, y, d in our_secs[j]])
-        assert len(sec) == len(serialize_v30_section(stored_secs[j]))
-        nws[base:base + len(sec)] = sec
+        nws[base - 16:base - 16 + len(sec)] = sec   # records start at anchor-16
     nws = bytes(nws)
     env = _build_envelope(subtype, nws, compute_tid(nws))
     assert len(env) == 23136 and find_v30_regions(env[12:12 + WS_SIZE]) == regs
