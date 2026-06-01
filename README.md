@@ -1,6 +1,26 @@
 # python-validity
 Validity fingerprint sensor driver.
 
+Table of Contents
+=================
+
+   * [python-validity](#python-validity)
+      * [Setting up](#setting-up)
+         * [Error situations](#error-situations)
+            * [list devices failed ](#list-devices-failed)
+            * [Errors on startup](#errors-on-startup)
+            * [Fingerprint not working after waking up from suspend](#fingerprint-not-working-after-waking-up-from-suspend)
+      * [Enabling fingerprint for system authentication](#enabling-fingerprint-for-system-authentication)
+         * [The actual change from pam-auth-update](#the-actual-change-from-pam-auth-update)
+      * [Windows interoperability](#windows-interoperability)
+      * [Playground](#playground)
+         * [Initialize a session](#initialize-a-session)
+         * [Enroll a new user](#enroll-a-new-user)
+         * [Delete database record (user/finger/whatever)](#delete-database-record-userfingerwhatever)
+         * [Identify a finger (scan)](#identify-a-finger-scan)
+      * [DBus service](#dbus-service)
+      * [Debugging](#debugging)
+
 ## Setting up
 
 On Ubuntu system:
@@ -21,10 +41,24 @@ $ yay -S python-validity
 $ fprintd-enroll
 ```
 
+On Fedora Linux
+
+```
+$ sudo dnf copr enable sneexy/python-validity
+$ sudo dnf install open-fprintd fprintd-clients fprintd-clients-pam python3-validity
+...wait a bit...
+$ fprintd-enroll
+```
+
 ### Error situations
-If `fprintd-enroll` returns with `list_devices failed:`, you can check
+
+#### List devices failed
+
+If `fprintd-enroll` returns with `list_devices failed:` or `GDBus.Error:net.reactivated.Fprint.error.NoSuchDevice`, you can check
 the logs of the `python3-validity` daemon using `$ sudo systemctl status python3-validity`.
 If it's not running, you can enable and/or start it by substituting `status` with `enable` or `start`.
+
+#### Errors on startup
 
 It `systemctl status python3-validity` complains about errors on startup, you may need to factory-reset the fingerprint chip. Do that like so:
 ```
@@ -42,28 +76,47 @@ $ sudo systemctl start python3-validity
 $ fprintd-enroll
 ```
 
+#### Fingerprint not working after waking up from suspend 
+
+Enable *open-fprintd-resume* and *open-fprintd-suspend* services:
+```
+$ sudo systemctl enable open-fprintd-resume open-fprintd-suspend
+```
+
 For even more error procedures, check [this Arch comment thread](https://aur.archlinux.org/packages/python-validity/#comment-755904) or [this python-validity bug comment thread](https://github.com/uunicorn/python-validity/issues/3).
 
 ## Enabling fingerprint for system authentication
-To enable fingerprint login, if it doesn't come automatically, run
-```
-$ sudo pam-auth-update
-```
-and use the space-bar to enable fingerprint authentication.
-The change will take effect immediately. At this point, the fingerprint
-will be tried first, and only if that fails or times out will you see
-a password prompt. Take note of the led-stripe above the fingerprint
-sensor to see whether it is active.
 
-### The actual change from pam-auth-update
-The above mentioned command `$ sudo pam-auth-update` simply makes a small modification to /etc/pam.d/common-auth:
+if it doesn't come automatically, you might need to make changes to files in `/etc/pam.d` to enable fingerprint login (depending on your distro).
 
-```
-# In /etc/pam.d/common-auth, the following line is added, and the next line changed.
-# The end result (apart from other things that may be in the file) is this:
-auth  [success=2 default=ignore]  pam_fprintd.so max_tries=1 timeout=10 # debug
-auth  [success=1 default=ignore]  pam_unix.so nullok_secure try_first_pass
-```
+- On Fedora, use `authselect`[^1]:
+  ```
+  $ sudo authselect current
+  $ sudo authselect enable-feature with-fingerprint
+  $ sudo authselect apply-changes
+  ```
+
+- On other distros, run
+  ```
+  $ sudo pam-auth-update
+  ```
+  and use the space-bar to enable fingerprint authentication.
+  The change will take effect immediately. At this point, the fingerprint
+  will be tried first, and only if that fails or times out will you see
+  a password prompt. Take note of the led-stripe above the fingerprint
+  sensor to see whether it is active.
+
+  You can also take a look at [Configuration: fprint](https://wiki.archlinux.org/title/Fprint#Configuration) on the Arch Wiki for an idea how the file should be modified.
+  
+  ### The actual change from pam-auth-update
+  The above mentioned command `$ sudo pam-auth-update` simply makes a small modification to /etc/pam.d/common-auth:
+  
+  ```
+  # In /etc/pam.d/common-auth, the following line is added, and the next line changed.
+  # The end result (apart from other things that may be in the file) is this:
+  auth  [success=2 default=ignore]  pam_fprintd.so max_tries=1 timeout=10 # debug
+  auth  [success=1 default=ignore]  pam_unix.so nullok_secure try_first_pass
+  ```
 
 ## Windows interoperability
 
@@ -82,6 +135,7 @@ user_to_sid:
     "myusername": "S-1-5-21-1234567890-1234567890-1234567890-1001"
     "someotheruser": "S-1-5-21-1234567890-1234567890-1234567890-1003"
 ```
+Note the indentation; each entry has to be preceded by at least one space.
 
 ## Playground
 
@@ -185,3 +239,5 @@ If you are curious you can enable tracing to see what flows in and out of device
 10: User S-1-5-21-394619333-3876782012-1672975908-3333 with 0 fingers:
 >>> 
 ```
+
+[^1]: Credit to u/trollpunny: [https://old.reddit.com/r/Fedora/comments/oik8sq/comment/h4xvrqv/?utm_source=share&utm_medium=web2x&context=3](https://old.reddit.com/r/Fedora/comments/oik8sq/comment/h4xvrqv/?utm_source=share&utm_medium=web2x&context=3)

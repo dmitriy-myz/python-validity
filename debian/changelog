@@ -1,3 +1,26 @@
+python-validity (0.15~ppa2) noble; urgency=medium
+
+  * Change all write paths to /var/run/python-validity
+  * Use a different partition table + signature for 0090 devices
+  * Docs fixes
+  * switch to noble
+
+ -- unicorn <viktor.dragomiretskyy@gmail.com>  Mon, 09 Jun 2025 20:19:55 +1200
+
+python-validity (0.14~ppa1) bionic; urgency=medium
+
+  * Retry establishing TLS on Resume in case if it was already established. 
+
+ -- unicorn <viktor.dragomiretskyy@gmail.com>  Fri, 03 Jun 2022 08:27:55 +1200
+
+python-validity (0.13~ppa1) bionic; urgency=medium
+
+  * Bugfixes
+  * Support for 138a:009d
+  * Fedora installation items
+
+ -- unicorn <viktor.dragomiretskyy@gmail.com>  Sun, 26 Sep 2021 13:03:20 +1300
+
 python-validity (0.12~ppa1) bionic; urgency=medium
 
   * Implement Suspend/Resume methods to reset the TLS state 
