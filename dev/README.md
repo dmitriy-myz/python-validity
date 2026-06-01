@@ -72,8 +72,12 @@ and the capture/extract tooling.
 - `DLL-RE.md`, `MOH.md` — master RE notes (gradient kernel chain, protocol, TID derivation, chip-state recovery).
 
 **Historical (superseded — kept for context)**
-- `CONSOLIDATION-capture-plan.md` — a capture plan for a "multi-frame consolidation" that turned out to be an artifact of the layout bug (no consolidation exists).
 - `NEXT-SESSION.md` — a mid-investigation handoff, now superseded by this README + memory.
+
+(A `CONSOLIDATION-capture-plan.md` once existed for a "multi-frame consolidation"
+that turned out to be an artifact of the layout bug — there is no consolidation —
+so it was dropped. The v30 emitter it analyzed is documented in
+`V30-emitter-and-layout.md` + `PER-SECTION-METADATA.md`.)
 
 > ~39 one-off investigation/diff/validate scripts were removed in the cleanup
 > (`moh-opencv-cleanup`); they remain recoverable from the `moh-opencv-poc`
