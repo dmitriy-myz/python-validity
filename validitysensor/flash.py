@@ -1,4 +1,3 @@
-import logging
 import typing
 from struct import pack, unpack
 
@@ -150,22 +149,10 @@ def write_flash(partition: int, addr: int, buf: bytes):
 
 def write_flash_all(partition: int, ptr: int, buf: bytes):
     bs = 0x1000
-    total = len(buf)
-    written = 0
     while len(buf) > 0:
         chunk, buf = buf[:bs], buf[bs:]
-        logging.debug('write_flash_all: partition %d addr 0x%x (%d/%d)',
-                      partition, ptr, written, total)
-        try:
-            write_flash(partition, ptr, chunk)
-        except Exception:
-            logging.error('write_flash_all: FAILED on partition %d at addr 0x%x '
-                          '= chunk %d/%d (%d of %d bytes written ok)',
-                          partition, ptr, written // bs, (total + bs - 1) // bs,
-                          written, total)
-            raise
+        write_flash(partition, ptr, chunk)
         ptr += len(chunk)
-        written += len(chunk)
 
 
 def read_flash_all(partition: int, start: int, size: int):
