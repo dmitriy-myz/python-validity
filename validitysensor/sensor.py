@@ -862,7 +862,6 @@ class Sensor:
 
         Returns: the recid created in the chip's storage."""
         import numpy as np
-        from . import blobs
 
         from .moh_native import (extract_frame_native, _load_ws_scaffold,
                                  NATIVE_WS_V30_REGIONS,
@@ -950,7 +949,7 @@ class Sensor:
                 # send_finger() doesn't wait either, and it works.
                 logging.info('enroll_moh: storing on chip...')
                 db.db_info()
-                assert_status(tls.cmd(blobs.db_write_enable()))
+                write_enable()
                 try:
                     msg = (pack('<BHHHH', 0x47, parent_dbid, 6, 3, len(envelope))
                            + envelope + b'\x00')
