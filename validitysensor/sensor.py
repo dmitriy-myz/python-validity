@@ -84,6 +84,11 @@ def reboot():
 
 
 def factory_reset():
+    # The device only accepts the reset/format command once it has been brought
+    # to a known state. The Windows driver always sends the init sequence
+    # (RomInfo / init_hardcoded) before touching the flash; mirror that here,
+    # otherwise an uninitialised sensor rejects reset_blob (e.g. 0x04be/0x0003).
+    usb.send_init()
     assert_status(usb.cmd(reset_blob))
     assert_status(usb.cmd(b'\x10' + b'\0' * 0x61))
     reboot()
