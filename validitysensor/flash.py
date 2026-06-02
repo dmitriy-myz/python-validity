@@ -4,7 +4,24 @@ from struct import pack, unpack
 from .blobs import db_write_enable
 from .hw_tables import flash_ic_table_lookup, FlashIcInfo
 from .tls import tls
+from .usb import usb
 from .util import assert_status, unhex
+
+# Flash erase/program is far slower than a normal command — erasing a large
+# partition can take well over a minute. The Windows driver bumps the bulk-read
+# pipe timeout (PIPE_TRANSFER_TIMEOUT) to 120s for these operations; the default
+# 15s otherwise produces spurious USBTimeoutError during format/firmware upload.
+FLASH_OP_TIMEOUT = 120000  # ms
+
+
+def _with_flash_timeout(fn):
+    dev = usb.dev
+    saved = dev.default_timeout
+    dev.default_timeout = FLASH_OP_TIMEOUT
+    try:
+        return fn()
+    finally:
+        dev.default_timeout = saved
 
 
 # type 01 is for the firmware - written blocks are decrypted on the fly using fw key
@@ -123,7 +140,7 @@ def call_cleanups():
 def erase_flash(partition: int):
     assert_status(tls.cmd(db_write_enable))
     try:
-        assert_status(tls.cmd(pack('<BB', 0x3f, partition)))
+        _with_flash_timeout(lambda: assert_status(tls.cmd(pack('<BB', 0x3f, partition))))
     finally:
         call_cleanups()
 
@@ -141,7 +158,7 @@ def write_flash(partition: int, addr: int, buf: bytes):
     tls.cmd(db_write_enable)
     cmd = pack('<BBBHLL', 0x41, partition, 1, 0, addr, len(buf)) + buf
     try:
-        rsp = tls.cmd(cmd)
+        rsp = _with_flash_timeout(lambda: tls.cmd(cmd))
         assert_status(rsp)
     finally:
         call_cleanups()
