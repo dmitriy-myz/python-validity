@@ -95,7 +95,15 @@ class Usb:
         if err != 0:
             # fwext is not loaded
             logging.info('Clean slate')
-            self.cmd(init_hardcoded_clean_slate)
+            # 06cb:00a2 must NOT receive the clean-slate init blob here. The
+            # Windows driver sends only init_hardcoded before the flash/fwext
+            # commands — verified against both the format capture (1780409730)
+            # and the fwext-upload recovery capture (1780432549): init_hardcoded
+            # appears once, clean_slate never. Sending it leaves the chip unable
+            # to accept the firmware write — it drops off the USB bus on the
+            # first 0x41 chunk.
+            if (self.usb_dev().idVendor, self.usb_dev().idProduct) != (0x06cb, 0x00a2):
+                self.cmd(init_hardcoded_clean_slate)
 
     def cmd(self, out: typing.Union[bytes, typing.Callable[[], bytes]]):
         if callable(out):
