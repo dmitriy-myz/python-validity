@@ -64,7 +64,7 @@ class Usb:
             raise Exception('No matching devices found')
 
         self.dev = dev
-        self.dev.default_timeout = 15000
+        self.dev.default_timeout = 20000
         dev.set_configuration()
 
     def close(self):
