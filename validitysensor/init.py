@@ -28,8 +28,13 @@ def close():
 
 def open_common():
     init_data_dir()
-    init_flash()
+    # The device firmware expects the init sequence (RomInfo / init_hardcoded)
+    # before ANY flash command. A freshly reset/wiped sensor won't answer flash
+    # commands — not even get_flash_info (0x3e) — until it has, so the bulk read
+    # just times out. The Windows driver always inits first; mirror that here,
+    # before init_flash() issues its first 0x3e.
     usb.send_init()
+    init_flash()
     tls.parse_tls_flash(read_tls_flash())
     tls.open()
     upload_fwext()

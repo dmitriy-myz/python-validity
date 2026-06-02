@@ -127,12 +127,9 @@ def init_flash():
     else:
         logging.info('Flash was not initialized yet. Formatting...')
 
-    # Bring the device to a known state before resetting/formatting the flash.
-    # The Windows driver sends the init sequence (RomInfo / init_hardcoded)
-    # before any flash command; on a fresh/wiped sensor reset_blob is otherwise
-    # rejected because the device has not been initialised yet.
-    usb.send_init()
-
+    # send_init() already ran in open_common() before any flash command, so the
+    # device is in a known state and accepts reset_blob here (no reboot happened
+    # in between to lose that state).
     assert_status(usb.cmd(reset_blob))
 
     skey = ec.generate_private_key(ec.SECP256R1(), crypto_backend)
