@@ -187,37 +187,37 @@ _s32, _sar32, _imul32, _idiv32 = s32, sar32, mul32, trunc_div
 
 # ─── kernel builders (byte-exact vs the DLL; see dev/port_gradient.py) ────
 def gauss_tap(coef, x):
-    """sub_18000FEC0: one Gaussian tap = EXP_TABLE[|quantized -coef·x²|]."""
-    t = _sar32(_s32(coef * x), 2)
-    t = _sar32(_s32(t * x), 8)
-    q = (_s32(t) * 0x51eb851f) >> 35
+    """One Gaussian tap = EXP_TABLE[quantized -coef*x^2]  (sub_18000FEC0)."""
+    t = sar32(coef * x, 2)
+    t = sar32(t * x, 8)
+    q = (t * 0x51eb851f) >> 35      # signed reciprocal-multiply (divide by ~12.8)
     if q < 0:
-        q += 1
+        q += 1                       # floor -> truncate toward zero
     i = -(q >> 13)
     return int(EXP_TABLE[min(max(i, 0), len(EXP_TABLE) - 1)])
 
 
 def build_gaussian(n):
-    """sub_18000FF00: normalized 1D Gaussian (size n) → [(offset, tap)], Q12."""
-    sigma = _sar32(_s32(0x26600 * n + 0x59acd), 10)
-    coef = _idiv32(0xe0000000, _s32(sigma * sigma))
-    taps, s = [], 0
+    """Normalized 1-D Gaussian (size n) -> [(offset, tap_Q12)]  (sub_18000FF00)."""
+    sigma = sar32(0x26600 * n + 0x59acd, 10)
+    coef = trunc_div(0xe0000000, sigma * sigma)     # 0xe0000000 is negative as i32
+    taps, total = [], 0
     for i in range(n):
-        t = _sar32(gauss_tap(coef, 512 * (2 * i - n + 1)), 4)
-        taps.append(t); s += t
-    norm = _sar32(_idiv32(0x40000000, s), 3)
+        t = sar32(gauss_tap(coef, 512 * (2 * i - n + 1)), 4)
+        taps.append(t)
+        total += t
+    norm = sar32(trunc_div(0x40000000, total), 3)
     half = n // 2
-    return [(i - half, _sar32(_s32(t * norm), 15)) for i, t in enumerate(taps)]
+    return [(i - half, sar32(t * norm, 15)) for i, t in enumerate(taps)]
 
 
 def build_3tap(scale, deriv):
-    """sub_180010280: sparse 3-point kernel at offsets ±scale.
-    deriv → [1024,0,-1024]; smooth → [c, round(c·3.33), c], c=2^20/(scale·0x2aaa).
-    For scale 1: smooth = [96,320,96] (sum 512)."""
+    """Sparse 3-point kernel at offsets +/-scale  (sub_180010280).
+    deriv -> [1024, 0, -1024]; smooth -> [c, round(c*3.33), c]."""
     if deriv:
         return [(-scale, 1024), (0, 0), (scale, -1024)]
-    c = _idiv32(0x100000, _s32(scale * 0x2aaa))
-    mid = _sar32(_s32(c * 0xd55) + (1 << 9), 10)
+    c = trunc_div(0x100000, scale * 0x2aaa)
+    mid = sar32(c * 0xd55 + (1 << 9), 10)
     return [(-scale, c), (0, mid), (scale, c)]
 
 
