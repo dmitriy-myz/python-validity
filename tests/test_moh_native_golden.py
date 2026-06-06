@@ -94,16 +94,16 @@ def test_stages_match():
             kpsN = live.nms(resp)
             kpsO = frozen.nms(resp)
             assert kpsN == kpsO, f"nms {name} {i},{j}"
-            for (sc, lx, ly) in kpsO:
+            for (_sc, lx, ly) in kpsO:
                 aN = live.subpix_refine_kp(resp, lx, ly)
                 aO = frozen.subpix_refine_kp(resp, lx, ly)
                 assert aN == aO, f"subpix {name} {i},{j} ({lx},{ly})"
                 if aO is None:
                     continue
                 sx, sy = aO
-                assert live.orient_d920(gxO, gyO, sx, sy) == \
-                    frozen.orient_d920(gxO, gyO, sx, sy), f"orient {name} {i},{j}"
-                idx = frozen.orient_to_index(frozen.orient_d920(gxO, gyO, sx, sy)) % 360
+                oO = frozen.orient_d920(gxO, gyO, sx, sy)
+                assert live.orient_d920(gxO, gyO, sx, sy) == oO, f"orient {name} {i},{j}"
+                idx = frozen.orient_to_index(oO) % 360
                 rgxN, rgyN = live.desc_sample_rotate(gxO, gyO, sx, sy, idx)
                 rgxO, rgyO = frozen.desc_sample_rotate(gxO, gyO, sx, sy, idx)
                 assert np.array_equal(rgxN, rgxO) and np.array_equal(rgyN, rgyO), \
@@ -123,9 +123,9 @@ def _run_all():
         try:
             fn()
             print(f"  PASS {fn.__name__}")
-        except AssertionError as e:
+        except Exception as e:
             failed += 1
-            print(f"  FAIL {fn.__name__}: {e}")
+            print(f"  FAIL {fn.__name__}: {type(e).__name__}: {e}")
     if failed:
         print(f"{failed} CHECK(S) FAILED")
         sys.exit(1)
