@@ -47,9 +47,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
-from dataclasses import dataclass, field
-from struct import pack, unpack
-from typing import List, Optional, Tuple
+from struct import pack
 
 import numpy as np
 
@@ -181,10 +179,6 @@ def trunc_div(a, b):
     return -q if (a < 0) ^ (b < 0) else q
 
 
-# Legacy aliases — removed in the final cleanup task once all call sites migrate.
-_s32, _sar32, _imul32, _idiv32 = s32, sar32, mul32, trunc_div
-
-
 # ─── kernel builders (byte-exact vs the DLL; see dev/port_gradient.py) ────
 def gauss_tap(coef, x):
     """One Gaussian tap = EXP_TABLE[quantized -coef*x^2]  (sub_18000FEC0)."""
@@ -266,13 +260,13 @@ def cc20_planes(smoothed, v9=1):
     sub_180010380 pass = (>>6, separable kx·ky shift10, <<6)."""
     dk = build_3tap(v9, True); sk = build_3tap(v9, False)
     P = lambda im, kx, ky: (apply_sep(im >> 6, kx, ky, 10)) << 6
-    buf20 = smoothed.copy()
-    buf28 = P(buf20, sk, dk)                          # prep1 → Dy
-    buf20 = P(buf20, dk, sk)                          # prep2 → Dx
-    buf20 = buf20 * v9; buf28 = buf28 * v9            # norm1 ·v9
-    ixy = P(buf20, sk, dk); ixx = P(buf20, dk, sk); iyy = P(buf28, sk, dk)
+    dx = smoothed.copy()
+    dy = P(dx, sk, dk)                                # smooth-x · deriv-y → Dy
+    dx = P(dx, dk, sk)                                # deriv-x · smooth-y → Dx
+    dx = dx * v9; dy = dy * v9                        # normalize ·v9
+    ixy = P(dx, sk, dk); ixx = P(dx, dk, sk); iyy = P(dy, sk, dk)
     v10 = v9 * v9
-    return ixx * v10, iyy * v10, ixy * v10            # norm2 ·v9²
+    return ixx * v10, iyy * v10, ixy * v10            # normalize ·v9²
 
 
 def doh(tile, size=5, v9=1):
