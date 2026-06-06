@@ -145,21 +145,44 @@ EXP_TABLE = np.array([
 ], dtype=np.int64)
 
 
-# ─── 32-bit fixed-point helpers (match x86 imul/sar/idiv semantics) ──────
-_M32 = (1 << 32)
-def _s32(x):
+# ─── 32-bit fixed-point helpers (x86 imul/sar/idiv semantics) ────────────────
+# The DLL does all detector math in signed 32-bit registers. These four helpers
+# reproduce that exactly; they are load-bearing only where an intermediate can
+# exceed 32 bits (a multiply, or a sum/shift of large response values). Where a
+# value provably fits in i32, call sites use plain Python `*`/`>>` instead.
+_M32 = 1 << 32
+
+
+def s32(x):
+    """Truncate to signed 32-bit (wrap like an x86 register)."""
     x &= _M32 - 1
     return x - _M32 if x & 0x80000000 else x
-def _sar32(x, n):
-    return _s32(_s32(x) >> n)
-def _idiv32(a, b):
-    a, b = _s32(a), _s32(b)
+
+
+def sar32(x, n):
+    """Arithmetic right shift of a signed-32-bit value (x86 SAR).
+    Equivalent to the old `_sar32(_s32(EXPR), n)` — the inner truncation is
+    folded in, so `sar32(EXPR, n)` replaces that whole nested form."""
+    return s32(s32(x) >> n)
+
+
+def mul32(a, b):
+    """Low 32 bits of a signed 32-bit product (x86 IMUL r32, r32). Differs from
+    plain `a*b` only when the true product overflows i32 — that truncation is
+    the behavior, so keep mul32 wherever overflow is possible."""
+    return s32(s32(a) * s32(b))
+
+
+def trunc_div(a, b):
+    """Signed division truncating toward zero (x86 IDIV). NOT Python `//`,
+    which floors toward -inf and differs for mixed-sign operands."""
+    a, b = s32(a), s32(b)
     q = abs(a) // abs(b)
     return -q if (a < 0) ^ (b < 0) else q
-def _imul32(a, b):
-    """x86 IMUL r32, r32: 32-bit signed multiply, result truncated to i32."""
-    p = (_s32(a) * _s32(b)) & (_M32 - 1)
-    return p - _M32 if p & 0x80000000 else p
+
+
+# Legacy aliases — removed in the final cleanup task once all call sites migrate.
+_s32, _sar32, _imul32, _idiv32 = s32, sar32, mul32, trunc_div
 
 
 # ─── kernel builders (byte-exact vs the DLL; see dev/port_gradient.py) ────

@@ -115,6 +115,47 @@ def test_stages_match():
                     f"brief_pack {name} {i},{j}"
 
 
+def _i32_samples(n, seed):
+    rng = np.random.default_rng(seed)
+    big = rng.integers(-(1 << 31), 1 << 31, size=n, dtype=np.int64)
+    small = rng.integers(-(1 << 16), 1 << 16, size=n, dtype=np.int64)
+    edge = np.array([0, 1, -1, (1 << 31) - 1, -(1 << 31), 1 << 30, -(1 << 30),
+                     0x800000, -0x800000], dtype=np.int64)
+    return np.concatenate([big, small, edge]).tolist()
+
+
+def test_helper_fuzz():
+    """Prove the RETAINED helpers are byte-exact vs the oracle over the full
+    i32 domain (incl. overflow), so any call site using them is safe at any
+    range. This is the defense-in-depth behind dropping wrappers elsewhere."""
+    xs = _i32_samples(40000, 1)
+    ys = _i32_samples(40000, 2)
+    shifts = [0, 1, 2, 4, 6, 8, 12, 15, 24]
+    for k, x in enumerate(xs):
+        assert live.s32(x) == frozen._s32(x), f"s32({x})"
+        assert live.sar32(x, shifts[k % len(shifts)]) == \
+            frozen._sar32(x, shifts[k % len(shifts)]), f"sar32({x})"
+    for a, b in zip(xs, ys):
+        assert live.mul32(a, b) == frozen._imul32(a, b), f"mul32({a},{b})"
+        if frozen._s32(b) != 0:
+            assert live.trunc_div(a, b) == frozen._idiv32(a, b), f"trunc_div({a},{b})"
+    # atan2 trio — this is where 32-bit overflow actually bites
+    for gy, gx in zip(ys, xs):
+        assert live._fast_atan2(gy, gx) == frozen._fast_atan2(gy, gx), f"fast_atan2({gy},{gx})"
+        assert live._precise_atan2(gx, gy) == frozen._precise_atan2(gx, gy), f"precise_atan2({gx},{gy})"
+    for a in _i32_samples(15000, 3):
+        assert live._angle_to_bin(a) == frozen._angle_to_bin(a), f"angle_to_bin({a})"
+    # kernel builders + Cramer solver over their plausible domains
+    for nn in range(2, 16):
+        assert live.build_gaussian(nn) == frozen.build_gaussian(nn), f"build_gaussian({nn})"
+        assert live.build_3tap(nn, True) == frozen.build_3tap(nn, True)
+        assert live.build_3tap(nn, False) == frozen.build_3tap(nn, False)
+    rng = np.random.default_rng(7)
+    for _ in range(4000):
+        coeffs = rng.integers(-(1 << 20), 1 << 20, size=6).tolist()
+        assert live._solve_2x2_d4c0(coeffs) == frozen._solve_2x2_d4c0(coeffs), f"solve {coeffs}"
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]
