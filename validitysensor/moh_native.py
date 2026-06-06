@@ -413,56 +413,62 @@ def subpix_refine_kp(resp, x_int, y_int, scale_shift=0):
 
 
 def _fast_atan2(gy_in, gx_in):
-    """sub_1800030A0: fixed-point atan2 returning angle in [0, ~408960]
-    (full-circle scale ~2π·65086). Args ordered as (y, x). Strict <0
-    sign branches — `jns` jumps if non-negative, NOT if ≤0."""
-    r10d = _s32(gx_in); r11d = _s32(gy_in)
-    r8d = r10d if r10d > 0 else _s32(-r10d)
-    r9d = r11d if r11d > 0 else _s32(-r11d)
-    if r8d < r9d: eax = r8d; ecx = r9d
-    else:         eax = r9d; ecx = r8d
-    ecx = _s32(ecx + 1)
-    eax = _s32(eax << 8)
-    if ecx == 0:
+    """Fixed-point atan2 (sub_1800030A0). Args are (y, x). Returns an angle on
+    a ~2*pi*65086 full-circle scale. Method: evaluate a cubic-polynomial arctan
+    on the (smaller/larger) magnitude ratio in [0, 1], then fold by octant and
+    quadrant using the sign branches."""
+    gx = s32(gx_in)
+    gy = s32(gy_in)
+    abs_gx = gx if gx > 0 else s32(-gx)
+    abs_gy = gy if gy > 0 else s32(-gy)
+    small, large = (abs_gx, abs_gy) if abs_gx < abs_gy else (abs_gy, abs_gx)
+    large = s32(large + 1)
+    small = s32(small << 8)
+    if large == 0:
         return 0
-    q = abs(eax) // abs(ecx); sgn = (eax < 0) ^ (ecx < 0)
-    eax = _s32(-q if sgn else q)
-    eax = _s32(eax << 8); ecx_tan = eax
-    eax = _sar32(eax, 4); ecx = _sar32(ecx_tan, 6)
-    ecx = _imul32(ecx, ecx); ecx = _sar32(ecx, 4); ecx = _sar32(ecx, 4)
-    edx = _imul32(ecx, 0xFFFFF5D7); edx = _sar32(edx, 12); edx = _s32(edx + 0x23A7)
-    edx = _imul32(edx, ecx);        edx = _sar32(edx, 12); edx = _s32(edx - 0x4AAC)
-    edx = _imul32(edx, ecx);        edx = _sar32(edx, 12); edx = _s32(edx + 0xE522)
-    edx = _imul32(edx, eax);        edx = _sar32(edx, 6)
-    if r8d < r9d: edx = _s32(0x5A0000 - edx)
-    if r10d < 0:  edx = _s32(0xB40000 - edx)
-    if r11d < 0:  edx = _s32(0x1680000 - edx)
-    edx = _sar32(edx, 8); edx = _imul32(edx, 0x47); edx = _sar32(edx, 4)
-    return _s32(edx)
+    q = abs(small) // abs(large)
+    ratio = s32(-q if (small < 0) ^ (large < 0) else q)
+    ratio = s32(ratio << 8)
+    t = sar32(ratio, 4)                # arctan argument
+    t2 = sar32(ratio, 6)
+    t2 = mul32(t2, t2)
+    t2 = sar32(sar32(t2, 4), 4)        # t^2 in the polynomial's working scale
+    poly = sar32(mul32(t2, 0xFFFFF5D7), 12); poly = s32(poly + 0x23A7)
+    poly = sar32(mul32(poly, t2), 12);       poly = s32(poly - 0x4AAC)
+    poly = sar32(mul32(poly, t2), 12);       poly = s32(poly + 0xE522)
+    angle = sar32(mul32(poly, t), 6)
+    if abs_gx < abs_gy:                # reflect across the 45-degree octant line
+        angle = s32(0x5A0000 - angle)
+    if gx < 0:                         # x-quadrant fold
+        angle = s32(0xB40000 - angle)
+    if gy < 0:                         # y-quadrant fold
+        angle = s32(0x1680000 - angle)
+    angle = sar32(angle, 8)
+    angle = mul32(angle, 0x47)         # rescale into the cos/sin table's units
+    return sar32(angle, 4)
 
 
 def _precise_atan2(gx, gy):
-    """sub_180003150(rcx=gx, rdx=gy): 4-quadrant atan2 in [0, 2π·65536).
-    Wraps _fast_atan2 with sign-aware combinators (0x3243F = π·65536,
-    0x6487E ≈ 2π·65536). Returns the orient_q16 stored at kp[+0xc]."""
-    gx = _s32(gx); gy = _s32(gy)
+    """4-quadrant atan2 in [0, 2*pi*65536) (sub_180003150). 0x3243F = pi*65536,
+    0x6487E ~= 2*pi*65536. Returns the orient_q16 stored at kp[+0xc]."""
+    gx = s32(gx)
+    gy = s32(gy)
     if gx >= 0:
-        if gy >= 0: return _fast_atan2(gy, gx)
-        else:       return _s32(0x6487E - _fast_atan2(-gy, gx))
-    else:
-        if gy >= 0: return _s32(0x3243F - _fast_atan2(gy, -gx))
-        else:       return _s32(0x3243F + _fast_atan2(-gy, -gx))
+        return _fast_atan2(gy, gx) if gy >= 0 else s32(0x6487E - _fast_atan2(-gy, gx))
+    if gy >= 0:
+        return s32(0x3243F - _fast_atan2(gy, -gx))
+    return s32(0x3243F + _fast_atan2(-gy, -gx))
 
 
 def _angle_to_bin(ang):
-    """Signed-div magic-constant emulation: bin ≈ ang / 9830, trunc-toward-
-    zero (matches the DLL's `imul 0x6AAAAABD; sar edx,24; shr eax,31; add`)."""
-    ecx_shifted = _s32((_s32(ang) << 12) & 0xFFFFFFFF)
-    prod = _s32(ecx_shifted) * 0x6AAAAABD
-    edx_hi = (prod >> 32) & 0xFFFFFFFF
-    if edx_hi & 0x80000000: edx_hi -= 0x100000000
-    edx = _sar32(edx_hi, 24)
-    return _s32(edx + (1 if edx < 0 else 0))
+    """bin ~= angle / 9830, truncating toward zero, via a signed reciprocal-
+    multiply (DLL: `imul 0x6AAAAABD; sar edx,24; add sign-bit`)."""
+    shifted = s32((s32(ang) << 12) & 0xFFFFFFFF)
+    hi = (s32(shifted) * 0x6AAAAABD >> 32) & 0xFFFFFFFF   # high 32 bits of the product
+    if hi & 0x80000000:
+        hi -= 0x100000000
+    b = sar32(hi, 24)
+    return s32(b + (1 if b < 0 else 0))
 
 
 def orient_d920(gradX, gradY, subpix_x_q16, subpix_y_q16):
