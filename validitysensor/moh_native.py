@@ -11,7 +11,7 @@ Pipeline (all stages classical CV; no proprietary enhancement):
       → BRIEF bit-pack (per-kp 128 binary tests)         [brief_pack]     BYTE-EXACT
       → orientation (Gaussian-weighted grad histogram)   [orient_d920]    BYTE-EXACT (60/60)
       → oriented BRIEF descriptor                        [descriptor]     BYTE-EXACT (2026-05-30)
-      → [x][y][128-bit desc] × 250 → v30                 [build_v30]       format known
+      → [x][y][128-bit desc] × 250 → v30                 [serialize_v30_section] format known
 
 Validation: each stage is checked against the live captures in
 $FRIDA_DUMP_DIR (see dev/diff_v30.py). The tiling stage matches `gradin`
@@ -121,8 +121,6 @@ GAUSS_Q = np.array([
 # against the DLL .rdata tables at 0x180131050 (cos) and 0x1801315F0 (sin).
 COS_Q16 = np.round(np.cos(np.deg2rad(np.arange(360))) * 65536).astype(np.int64)
 SIN_Q16 = np.round(np.sin(np.deg2rad(np.arange(360))) * 65536).astype(np.int64)
-
-ATAN2_FULLSCALE = np.pi * 65536        # 205887.4 — sub_180003150 Q16-radian full scale
 
 
 def orient_to_index(orient_q16):
@@ -364,19 +362,6 @@ def subpix_refine_kp(resp, x_int, y_int, scale_shift=0):
     return x_q16, y_q16
 
 
-def subpix_refine_kps(resp, kps, scale_shift=0):
-    """sub_18000D5D0 driver — refine all NMS keypoints, CULL failures.
-    `kps`: list of (score, x_int, y_int) from `nms()`.
-    Returns: list of (score, x_q16, y_q16). Length ≤ input (failed kps
-    are removed, exactly like the DLL's sub_18000D570 memmove-down)."""
-    out = []
-    for s, x, y in kps:
-        r = subpix_refine_kp(resp, x, y, scale_shift)
-        if r is not None:
-            out.append((s, r[0], r[1]))
-    return out
-
-
 # NEXT after NMS: orientation (sub_18000D920) + oriented BRIEF (sub_18000E090).
 
 
@@ -562,13 +547,6 @@ def descriptor_gradient(tile_q16):
 # Header = [u16 tag=4][u16 len=4533][8 zeros].
 
 
-def tile_origin_yx(i, j, h, w):
-    """Top-left (row, col) of tile (i, j) in the 3×3 grid. Re-export of
-    tile_image's internal `tile_origin` formula so callers can use it
-    independently of the iteration."""
-    return tile_origin(i, j, h, w)
-
-
 def merge_tile_kps_to_global(per_tile_kps, h, w, margin=3):
     """Merge per-tile keypoint lists into a single global list, applying
     the DLL's bound check (margin ≤ global_xy < dim-margin).
@@ -603,38 +581,8 @@ def merge_tile_kps_to_global(per_tile_kps, h, w, margin=3):
     return out
 
 
-def build_v30(global_kps, max_records=250, tag=4, body_len=4533):
-    """Build the 18-byte-per-record v30 buffer that goes into a frame
-    section. Layout matches the captured v30: 12 B header + body_len
-    payload (~17 B lead-in zeros + N × 18 B records + trailer zeros).
-
-    `global_kps`: list of (gx_int, gy_int, ..., desc_16B) from
-        merge_tile_kps_to_global. Only x, y, and descriptor are used —
-        orient/quality stay in the per-kp records elsewhere.
-
-    Returns: bytes object of (12 + body_len) bytes."""
-    header = bytes([tag & 0xFF, (tag >> 8) & 0xFF,
-                    body_len & 0xFF, (body_len >> 8) & 0xFF]) + bytes(8)
-    body = bytearray(body_len)
-    # 17-byte zero lead-in (matches the captured records — empirical;
-    # disasm of the v30 packer is pending).
-    rec_offset = 17
-    for kp in global_kps[:max_records]:
-        gx, gy = kp[0], kp[1]
-        desc = kp[-1]                        # last field is the 16-byte descriptor
-        if not isinstance(desc, (bytes, bytearray)):
-            desc = bytes(desc)
-        body[rec_offset]     = gx & 0xFF
-        body[rec_offset + 1] = gy & 0xFF
-        body[rec_offset + 2:rec_offset + 18] = desc[:16]
-        rec_offset += 18
-    return header + bytes(body)
-
-
 # ─── WS-body v30 SECTION serializer ──────────────────────────────────────
-# The v30 record area of ONE ws-body section. Distinct from build_v30()
-# above, which models the *standalone* per-frame v30 buffer (12-B header +
-# 17-B lead-in + body). A ws-body section is a PURE record area: exactly
+# The v30 record area of ONE ws-body section: a PURE record area of exactly
 # n_slots × 18-byte records, no header/lead-in/trailer.
 #
 # GROUND-TRUTH CONFIRMED (gdb capture ws_body_1780084103036_23056.bin,
@@ -646,29 +594,8 @@ def build_v30(global_kps, max_records=250, tag=4, body_len=4533):
 V30_SECTION_RECORDS = 250
 V30_SECTION_BYTES = V30_SECTION_RECORDS * 18  # 4500
 V30_DESC_LEN = 16   # record = [desc:16][x:u8][y:u8]; x,y anchor is +16 into the record
-V30_RECORD_LEN = 18         # full v30 record stride
 WS_SIZE = 23056             # chip-view WS body size
 DEFAULT_SUBTYPE = 0x00f7    # default WinBio finger subtype
-
-
-def find_v30_regions(ws, min_run=30):
-    """Locate each section's v30 record array by detecting long runs of 18-byte
-    records. Returns the (x,y) ANCHOR offset of each region; the record layout is
-    [16B desc][x:u8][y:u8], so the record area (first descriptor) starts at
-    `anchor - V30_DESC_LEN` and the (x,y) bytes are at +16/+17. (Moved from the
-    retired moh_opencv module.)"""
-    regions, p, n = [], 0, len(ws)
-    while p < n - V30_RECORD_LEN * min_run:
-        good, q = 0, p
-        while q + 1 < n and 0 < ws[q] <= 112 and ws[q + 1] <= 112:
-            good += 1
-            q += V30_RECORD_LEN
-        if good >= min_run:
-            regions.append(p)
-            p += V30_SECTION_RECORDS * V30_RECORD_LEN
-        else:
-            p += 1
-    return regions
 
 
 def serialize_v30_section(records, n_slots=V30_SECTION_RECORDS):
@@ -682,7 +609,7 @@ def serialize_v30_section(records, n_slots=V30_SECTION_RECORDS):
     FIRST), decoded from the v30 emitter sub_1800057e0 (2026-06-01) and
     verified: parsing a stored section this way pairs (x,y,desc) 238-248/250
     against our single-frame extraction (vs 0/250 for the old [x][y][desc]).
-    The section's record area starts at (find_v30_regions anchor − 16), so
+    The section's record area starts at (the v30-region anchor − 16), so
     callers must write this buffer at `anchor - V30_DESC_LEN`."""
     out = bytearray(n_slots * 18)
     for i, rec in enumerate(records):
@@ -735,16 +662,6 @@ def serialize_v30_section(records, n_slots=V30_SECTION_RECORDS):
 # gradX/gradY arrays, and the 29-entry *(ctx[+0x60]) table. Hooks updated in
 # dev/gdb_dump.py (descbrief_gradstruct/_gradX/_gradY/_aggrtbl); re-run
 # enrollment with GDB_DUMP_DESC_BRIEF=1 to grab them.
-
-
-def _rotate_sample_pair(gx, gy, cos_q16, sin_q16):
-    """E090 inner rotation: takes raw (gx, gy) i32 samples, returns rotated pair.
-    Bit-exact emulation of the x86 imul/sar sequence at e3cd-e418."""
-    gx8 = np.int32(gx) >> 8
-    gy8 = np.int32(gy) >> 8
-    rgx = (np.int32(cos_q16 * gx8) >> 8) + (np.int32(sin_q16 * gy8) >> 8)
-    rgy = (np.int32(cos_q16 * gy8) >> 8) - (np.int32(sin_q16 * gx8) >> 8)
-    return np.int32(rgx), np.int32(rgy)
 
 
 def desc_sample_rotate(grad_x, grad_y, subpix_x_q16, subpix_y_q16, orient_idx,
@@ -1025,8 +942,8 @@ def extract_frame_native(image_q16, h=112, w=112,
 # captured reference template needs to be supplied. The real descriptors of
 # the source template are NOT shipped (zeroed for privacy + clarity).
 #
-# The v30 record areas live at these fixed offsets in the scaffold (from
-# find_v30_regions on fresh.bin); each is 250×18 = 4500 bytes. They're pinned
+# The v30 record areas live at these fixed offsets in the scaffold (detected
+# on fresh.bin); each is 250×18 = 4500 bytes. They're pinned
 # rather than re-detected because the scaffold's record areas are zeroed (so
 # the coordinate-run heuristic can't find them).
 NATIVE_WS_V30_REGIONS = (309, 4913, 9453, 13993)
