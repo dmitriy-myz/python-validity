@@ -719,16 +719,15 @@ def serialize_v30_section(records, n_slots=V30_SECTION_RECORDS):
 
 def desc_sample_rotate(grad_x, grad_y, subpix_x_q16, subpix_y_q16, orient_idx,
                        N=7):
-    """E090 rotation+sampling (stage 1).  Returns two int32 arrays of length
-    (2N+2)² = 256 (for N=7) — the rotated_gx/rotated_gy buffers that the
-    aggregation stage sums over.
+    """E090 rotation+sampling (stage 1). Returns two int32 arrays of length
+    (2N+2)^2 (256 for N=7): the rotated_gx/rotated_gy buffers the aggregation
+    stage sums over.
 
-    Storage order matches the DLL: COLUMN-MAJOR — xL is the OUTER loop variable
-    in the disasm (e306 cmp r11d, ..+1), yL is inner (e424 cmp r10d, ..+1), and
-    rdi/rbp advance by 4 once per inner iter.  So index = (xL+N)*(2N+2) + (yL+N).
-    The aggregation step `field1*span + field2` then walks rows of xL (NOT yL):
-    `field1` = dx (xL offset), `field2` = dy (yL offset).
-    """
+    Storage is COLUMN-MAJOR (xL outer, yL inner): index = (xL+N)*(2N+2)+(yL+N).
+    Out-of-bounds samples read mid-gray (0x800000). The rotated_gy term mirrors
+    the DLL's `NEG ecx; SAR ecx,8` (e413/e415): negate the full product FIRST,
+    then arithmetic-shift, which differs from -(v>>8) by one for non-multiples
+    of 256 — so it is reproduced exactly here."""
     stride = grad_x.shape[1]
     height = grad_x.shape[0]
     cos_q = int(COS_Q16[orient_idx])
@@ -737,18 +736,12 @@ def desc_sample_rotate(grad_x, grad_y, subpix_x_q16, subpix_y_q16, orient_idx,
     rgx = np.zeros(span * span, dtype=np.int64)
     rgy = np.zeros(span * span, dtype=np.int64)
 
-    def _s32(v):
-        v &= 0xFFFFFFFF
-        return v - (1 << 32) if v & 0x80000000 else v
-
-    for xi in range(span):                              # outer = xL
+    for xi in range(span):                             # outer = xL
         xL = xi - N
-        for yi in range(span):                          # inner = yL
+        for yi in range(span):                         # inner = yL
             yL = yi - N
-            px_q = subpix_x_q16 + xL * cos_q - yL * sin_q + 0x8000
-            py_q = subpix_y_q16 + xL * sin_q + yL * cos_q + 0x8000
-            px = px_q >> 16
-            py = py_q >> 16
+            px = (subpix_x_q16 + xL * cos_q - yL * sin_q + 0x8000) >> 16
+            py = (subpix_y_q16 + xL * sin_q + yL * cos_q + 0x8000) >> 16
             if 0 <= px < stride and 0 <= py < height:
                 gx = int(grad_x[py, px])
                 gy = int(grad_y[py, px])
@@ -756,14 +749,11 @@ def desc_sample_rotate(grad_x, grad_y, subpix_x_q16, subpix_y_q16, orient_idx,
                 gx = gy = 0x800000
             gx8 = gx >> 8
             gy8 = gy >> 8
-            # rotated_gy uses `NEG ecx; SAR ecx,8` (e413/e415) — NEG first, then
-            # arithmetic shift.  For non-multiples of 256, `(-v) >> 8 ≠ -(v >> 8)`
-            # by one (the SAR rounds toward −∞).  Reproduce exactly:
-            rx = _s32(_s32(cos_q * gx8) >> 8) + _s32(_s32(sin_q * gy8) >> 8)
-            ry = _s32(_s32(cos_q * gy8) >> 8) + _s32(_s32(-(sin_q * gx8)) >> 8)
+            rx = (s32(cos_q * gx8) >> 8) + (s32(sin_q * gy8) >> 8)
+            ry = (s32(cos_q * gy8) >> 8) + (s32(-(sin_q * gx8)) >> 8)
             idx = xi * span + yi
-            rgx[idx] = _s32(rx)
-            rgy[idx] = _s32(ry)
+            rgx[idx] = s32(rx)
+            rgy[idx] = s32(ry)
     return rgx.astype(np.int32), rgy.astype(np.int32)
 
 
