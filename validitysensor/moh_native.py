@@ -472,38 +472,41 @@ def _angle_to_bin(ang):
 
 
 def orient_d920(gradX, gradY, subpix_x_q16, subpix_y_q16):
-    """Reproduce sub_18000D920's kp[+0xc] orient_q16 byte-exact.
-
-    `gradX, gradY` are the i32 first-derivative buffers at ctx[+0x50]+0x20/
-    +0x28 (same buffers E090 reads — see descriptor_gradient()). `subpix_*`
-    are kp[+0x14, +0x18] in Q16. Returns the i32 orient_q16."""
-    W = gradX.shape[1]; H = gradX.shape[0]
-    cx = (subpix_x_q16 + 0x8000) >> 16     # ROUNDED, not truncated
+    """Dominant-gradient orientation, byte-exact reproduction of sub_18000D920's
+    kp[+0xc] orient_q16. gradX/gradY are the i32 first-derivative buffers; the
+    subpix coords are kp[+0x14,+0x18] in Q16. Returns the i32 orient_q16."""
+    W = gradX.shape[1]
+    H = gradX.shape[0]
+    cx = (subpix_x_q16 + 0x8000) >> 16     # rounded, not truncated
     cy = (subpix_y_q16 + 0x8000) >> 16
     H_gx = [0] * 42
     H_gy = [0] * 42
     for dy in range(-6, 7):
         for dx in range(-6, 7):
-            if dy * dy + dx * dx >= 36:    # circular mask, radius 6
+            if dy * dy + dx * dx >= 36:     # circular mask, radius 6
                 continue
-            y = cy + dy; x = cx + dx
+            y = cy + dy
+            x = cx + dx
             if not (0 <= y < H and 0 <= x < W):
                 continue
-            w = int(GAUSS_Q[abs(dy), abs(dx)])
-            ggx = _imul32(_s32(int(gradX[y, x])) >> 10, w); ggx = _sar32(ggx, 4)
-            ggy = _imul32(_s32(int(gradY[y, x])) >> 10, w); ggy = _sar32(ggy, 4)
+            weight = int(GAUSS_Q[abs(dy), abs(dx)])
+            ggx = sar32(mul32(s32(int(gradX[y, x])) >> 10, weight), 4)
+            ggy = sar32(mul32(s32(int(gradY[y, x])) >> 10, weight), 4)
             b = _angle_to_bin(_fast_atan2(ggy, ggx))
-            for k in range(7):             # 7-bin smear: bin-6 .. bin
+            for k in range(7):              # 7-bin smear: bin-6 .. bin
                 sb = (b + 36 + k) % 42
-                H_gx[sb] = _s32(H_gx[sb] + ggx)
-                H_gy[sb] = _s32(H_gy[sb] + ggy)
-    maxbin = 0; maxmag = 0
+                H_gx[sb] = s32(H_gx[sb] + ggx)
+                H_gy[sb] = s32(H_gy[sb] + ggy)
+    maxbin = 0
+    maxmag = 0
     for i in range(42):
-        a = _sar32(H_gx[i], 13); b = _sar32(H_gy[i], 13)
-        m = _s32(_imul32(a, a) + _imul32(b, b))
+        a = sar32(H_gx[i], 13)
+        b = sar32(H_gy[i], 13)
+        m = s32(mul32(a, a) + mul32(b, b))
         if m > maxmag:
-            maxmag = m; maxbin = i
-    return _precise_atan2(_sar32(H_gx[maxbin], 10), _sar32(H_gy[maxbin], 10))
+            maxmag = m
+            maxbin = i
+    return _precise_atan2(sar32(H_gx[maxbin], 10), sar32(H_gy[maxbin], 10))
 
 
 # ─── Descriptor gradient pair — BYTE-EXACT (interior, dist≥3 from edge) ───
