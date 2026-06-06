@@ -131,10 +131,10 @@ def test_helper_fuzz():
     xs = _i32_samples(40000, 1)
     ys = _i32_samples(40000, 2)
     shifts = [0, 1, 2, 4, 6, 8, 12, 15, 24]
-    for k, x in enumerate(xs):
+    for x in xs:
         assert live.s32(x) == frozen._s32(x), f"s32({x})"
-        assert live.sar32(x, shifts[k % len(shifts)]) == \
-            frozen._sar32(x, shifts[k % len(shifts)]), f"sar32({x})"
+        for sh in shifts:
+            assert live.sar32(x, sh) == frozen._sar32(x, sh), f"sar32({x},{sh})"
     for a, b in zip(xs, ys):
         assert live.mul32(a, b) == frozen._imul32(a, b), f"mul32({a},{b})"
         if frozen._s32(b) != 0:
