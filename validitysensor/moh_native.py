@@ -338,46 +338,43 @@ def nms(resp, t_lo=671, t_hi=168, dedup_q=72064, margin=10):
 #   Δx = (d*e - f*c) // det ;  Δy = (b*e - f*a) // (-det)
 # All arithmetic is signed 32-bit truncating (idiv = trunc-toward-zero).
 def _solve_2x2_d4c0(coeffs):
-    """sub_18000D4C0 — Cramer 2×2 solver. Returns (Δx, Δy) or None on
-    singular Hessian. `coeffs` = [a, b, c, d, e, f] (i32 each)."""
-    a, b, c, d, e, f = [_sar32(v, 4) for v in coeffs]
-    det_pos = _sar32(_imul32(a, d) - _imul32(b, c), 7)
-    det_neg = _sar32(_imul32(b, c) - _imul32(a, d), 7)
+    """Cramer 2x2 solver -> (dx, dy) or None on singular Hessian (sub_18000D4C0).
+    coeffs = [a, b, c, d, e, f] (i32 each)."""
+    a, b, c, d, e, f = (sar32(v, 4) for v in coeffs)
+    det_pos = sar32(mul32(a, d) - mul32(b, c), 7)
+    det_neg = sar32(mul32(b, c) - mul32(a, d), 7)
     if det_pos == 0 or det_neg == 0:
         return None
-    num_x = _imul32(d, e) - _imul32(f, c)
-    num_y = _imul32(b, e) - _imul32(f, a)
-    return _idiv32(num_x, det_pos), _idiv32(num_y, det_neg)
+    num_x = mul32(d, e) - mul32(f, c)
+    num_y = mul32(b, e) - mul32(f, a)
+    return trunc_div(num_x, det_pos), trunc_div(num_y, det_neg)
 
 
 def subpix_refine_kp(resp, x_int, y_int, scale_shift=0):
-    """sub_18000D5D0 — subpixel refine a single integer keypoint.
-    Returns (x_q16, y_q16) or None if the kp should be removed.
-    `scale_shift` = ctx[+0x50]+0x60 (typically 0 on 06cb:00a2)."""
+    """Subpixel-refine one integer keypoint via Hessian-Newton (sub_18000D5D0).
+    Returns (x_q16, y_q16), or None if the keypoint should be culled (singular
+    system, or |delta| > 1 px). scale_shift = ctx[+0x50]+0x60 (0 on 06cb:00a2)."""
     h, w = resp.shape
     if not (1 <= x_int <= w - 2 and 1 <= y_int <= h - 2):
         return None
-    cV = _s32(int(resp[y_int,     x_int]))
-    L  = _s32(int(resp[y_int,     x_int - 1]))
-    R  = _s32(int(resp[y_int,     x_int + 1]))
-    T  = _s32(int(resp[y_int - 1, x_int]))
-    B  = _s32(int(resp[y_int + 1, x_int]))
-    TL = _s32(int(resp[y_int - 1, x_int - 1]))
-    TR = _s32(int(resp[y_int - 1, x_int + 1]))
-    BL = _s32(int(resp[y_int + 1, x_int - 1]))
-    BR = _s32(int(resp[y_int + 1, x_int + 1]))
-    dxx = _sar32(_s32(L + R - 2 * cV), 2)
-    dyy = _sar32(_s32(T + B - 2 * cV), 2)
-    dxy = _sar32(
-        _s32(_sar32(_s32(BR + TL), 2) - _sar32(_s32(BL + TR), 2)),
-        2,
-    )
-    dx_neg = _sar32(_s32(-_sar32(_s32(R - L), 1)), 2)
-    dy_neg = _sar32(_s32(-_sar32(_s32(B - T), 1)), 2)
-    res = _solve_2x2_d4c0([dxx, dxy, dxy, dyy, dx_neg, dy_neg])
-    if res is None:
+    center = s32(int(resp[y_int,     x_int]))
+    left   = s32(int(resp[y_int,     x_int - 1]))
+    right  = s32(int(resp[y_int,     x_int + 1]))
+    top    = s32(int(resp[y_int - 1, x_int]))
+    bottom = s32(int(resp[y_int + 1, x_int]))
+    tl     = s32(int(resp[y_int - 1, x_int - 1]))
+    tr     = s32(int(resp[y_int - 1, x_int + 1]))
+    bl     = s32(int(resp[y_int + 1, x_int - 1]))
+    br     = s32(int(resp[y_int + 1, x_int + 1]))
+    dxx = sar32(left + right - 2 * center, 2)
+    dyy = sar32(top + bottom - 2 * center, 2)
+    dxy = sar32(sar32(br + tl, 2) - sar32(bl + tr, 2), 2)
+    dx_neg = sar32(-sar32(right - left, 1), 2)
+    dy_neg = sar32(-sar32(bottom - top, 1), 2)
+    delta = _solve_2x2_d4c0([dxx, dxy, dxy, dyy, dx_neg, dy_neg])
+    if delta is None:
         return None
-    dx, dy = res
+    dx, dy = delta
     if not (-0x80 <= dx <= 0x80 and -0x80 <= dy <= 0x80):
         return None
     scale_mul = 1 << scale_shift
