@@ -11,7 +11,7 @@ Pipeline (all stages classical CV; no proprietary enhancement):
       → BRIEF bit-pack (per-kp 128 binary tests)         [brief_pack]     BYTE-EXACT
       → orientation (Gaussian-weighted grad histogram)   [orient_d920]    BYTE-EXACT (60/60)
       → oriented BRIEF descriptor                        [descriptor]     BYTE-EXACT (2026-05-30)
-      → [x][y][128-bit desc] × 250 → v30                 [build_v30]       format known
+      → [x][y][128-bit desc] × 250 → v30                 [serialize_v30_section]       format known
 
 Validation: each stage is checked against the live captures in
 $FRIDA_DUMP_DIR (see dev/diff_v30.py). The tiling stage matches `gradin`
@@ -38,10 +38,9 @@ truncation is why Ixy never recovered as one linear kernel). Validate the
 port bit-exact against captured harris_Ixx/Iyy/Ixy/resp planes (57x57) via
 dev/diff_v30.py compare_harris BEFORE chaining downstream.
 
-This module also contains the host-side template serializer / TID derivation
-and the (mostly RE-scaffold) CEohMohEIV port that previously lived in
-moh_extract.py — see the "Host-side feature-extraction pipeline" section at
-the bottom of this file.
+This module also contains the host-side template serializer (_build_envelope)
+and TID derivation (compute_tid) — see the "Envelope + TemplateId" section
+after native_template().
 """
 from __future__ import annotations
 
@@ -584,10 +583,10 @@ def merge_tile_kps_to_global(per_tile_kps, h, w, margin=3):
 
 
 # ─── WS-body v30 SECTION serializer ──────────────────────────────────────
-# The v30 record area of ONE ws-body section. Distinct from build_v30()
-# above, which models the *standalone* per-frame v30 buffer (12-B header +
-# 17-B lead-in + body). A ws-body section is a PURE record area: exactly
-# n_slots × 18-byte records, no header/lead-in/trailer.
+# The v30 record area of ONE ws-body section. A ws-body section is a PURE
+# record area: exactly n_slots × 18-byte records, no header/lead-in/trailer
+# (unlike the standalone per-frame v30 buffer, which has a 12-B header +
+# 17-B lead-in + body).
 #
 # GROUND-TRUTH CONFIRMED (gdb capture ws_body_1780084103036_23056.bin,
 # 2026-05-29): record = [x:u8][y:u8][16B descriptor], x/y FIRST (verified
@@ -1064,7 +1063,7 @@ def native_template(image_q16, subtype=None, fill_all_sections=True):
         23136-byte envelope ready for db.new_finger() (= chip cmd 0x47).
 
     compute_tid / _build_envelope are defined further down in this module
-    (formerly moh_extract.py)."""
+    (the "Envelope + TemplateId" section)."""
     ws_body = bytearray(_load_ws_scaffold())
     regions = list(NATIVE_WS_V30_REGIONS)
     if subtype is None:
