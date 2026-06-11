@@ -25,7 +25,7 @@ from .usb import CancelledException
 def enroll_moh(sensor, parent_dbid: int, subtype: int,
                update_cb: typing.Callable[[typing.Any, typing.Optional[Exception]], None] = lambda *a, **k: None,
                max_attempts: int = 6,
-               num_frames: int = 4):
+               num_frames: int = 6):
     """Enroll a finger using the native feature pipeline (no DLL).
 
     Captures `num_frames` placements, builds a 23136-byte template via the
@@ -47,10 +47,10 @@ def enroll_moh(sensor, parent_dbid: int, subtype: int,
             Called after each frame with a 1-byte percentage (0-100), or
             (None, exception) on a failed attempt.
         max_attempts: how many capture retries on transient errors.
-        num_frames: how many placements to capture. The template has 4 v30
-            sections filled round-robin from the captured frames, so 4
-            (the default) gives one distinct placement per section; frames
-            beyond the 4th would be captured but never used.
+        num_frames: how many placements to capture (default 6). The
+            template has 4 v30 sections, each holding one placement; the
+            best 4 frames (most keypoints) fill them, so extra captures
+            let weak placements be dropped.
 
     Returns: the recid created in the chip's storage."""
     import numpy as np
@@ -123,6 +123,14 @@ def enroll_moh(sensor, parent_dbid: int, subtype: int,
             # (tx=ty=1) makes each section a valid candidate alignment at verify.
             ws_body = bytearray(
                 patch_pre_v30_near_identity(bytes(ws_body), regions)[0])
+            # Keep the best len(regions) frames (most keypoints — a frame-
+            # quality proxy) in capture order; each section then holds one
+            # geometrically consistent placement.
+            if len(per_frame_kps) > len(regions):
+                best = sorted(range(len(per_frame_kps)),
+                              key=lambda i: len(per_frame_kps[i]),
+                              reverse=True)[:len(regions)]
+                per_frame_kps = [per_frame_kps[i] for i in sorted(best)]
             for idx, base in enumerate(regions):
                 src_frame = per_frame_kps[idx % len(per_frame_kps)]
                 # v30 records are [16B desc][x][y]; the record area starts

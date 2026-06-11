@@ -56,10 +56,11 @@ def main():
     ap.add_argument('--parent', type=int, default=5,
                     help='parent user dbid (use --list-users to find the '
                          'StgWindsor user dbid; default 5)')
-    ap.add_argument('--frames', type=int, default=4,
-                    help='number of DISTINCT placements to capture, one per v30 '
-                         'section (default 4 = one per section). Vary finger '
-                         'placement between captures for coverage.')
+    ap.add_argument('--frames', type=int, default=6,
+                    help='number of DISTINCT placements to capture (default 6); '
+                         'the best 4 (most keypoints) fill the template\'s 4 v30 '
+                         'sections. Vary finger placement between captures for '
+                         'coverage.')
     ap.add_argument('--match', action='store_true',
                     help='after enroll, capture again and try to identify')
     ap.add_argument('--dry-run', action='store_true',
