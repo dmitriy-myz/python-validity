@@ -583,41 +583,73 @@ def patch_pre_v30_near_identity(ws_body, regions):
     return bytes(ws), patched
 
 
-def native_template(image_q16, subtype=None, fill_all_sections=True):
-    """End-to-end REFERENCE-FREE native enrollment template.
+def assemble_template(per_frame_kps, subtype=None, regions=None,
+                      target_regions=None):
+    """Assemble a finger-template envelope from one or more frames' keypoint
+    lists.
 
-    Detects keypoints in `image_q16` with the native pipeline, formats them
-    into 18-byte v30 records [16B desc][x][y], overwrites every v30 region of
-    the baked WS-body scaffold, recomputes the TID, and returns the envelope
-    ready for db.new_finger() (chip cmd 0x47).
+    Overwrites the baked WS-body scaffold's v30 record areas with our
+    keypoints, sets the inter-section sec0_pre transforms to near-identity,
+    recomputes the TID, and wraps it in the 0x47 envelope.
 
-    `image_q16`: (h, w) int Q16 image (mid-gray = 0x800000). The sensor returns
-    uint8; convert via `img.astype(np.int32) << 16`."""
-    ws_body = bytearray(_load_ws_scaffold())
-    regions = list(NATIVE_WS_V30_REGIONS)
+    Args:
+        per_frame_kps: list of per-frame keypoint lists, each item being
+            (gx, gy, orient, desc) as produced by extract_frame_native.
+            `target_regions[i]` is filled with frame `i % len(per_frame_kps)`,
+            so a single-frame list fills every target region with that frame.
+        subtype: WinBio finger subtype (default DEFAULT_SUBTYPE).
+        regions: v30 record-region anchors (default NATIVE_WS_V30_REGIONS).
+            sec0_pre is always patched across ALL of these.
+        target_regions: which regions to overwrite with our records
+            (default: all of `regions`).
+
+    Returns: the envelope bytes ready for the 0x47 store / db.new_finger()."""
+    if not per_frame_kps:
+        raise ValueError("per_frame_kps must contain at least one frame")
     if subtype is None:
         subtype = DEFAULT_SUBTYPE
+    if regions is None:
+        regions = list(NATIVE_WS_V30_REGIONS)
+    if target_regions is None:
+        target_regions = regions
+
+    ws_body = bytearray(_load_ws_scaffold())
     assert len(ws_body) == WS_SIZE, f"WS body must be {WS_SIZE}B, got {len(ws_body)}"
 
-    # Inter-section sec0_pre transforms must be NEAR-identity (load-bearing).
+    # Inter-section sec0_pre transforms must be NEAR-identity (load-bearing):
+    # the matcher skips pure-identity records as the 'unmatched' sentinel.
     ws_body = bytearray(patch_pre_v30_near_identity(bytes(ws_body), regions)[0])
 
-    # 1. Detect OUR keypoints + descriptors from OUR image.
-    kps = extract_frame_native(image_q16, h=image_q16.shape[0],
-                               w=image_q16.shape[1])
-
-    # 2-3. Serialize into [16B desc][x][y] × 250 and overwrite every v30 region.
-    section = serialize_v30_section(
-        [(gx, gy, desc) for (gx, gy, _orient, desc) in kps])
-    target_regions = regions if fill_all_sections else regions[:1]
-    for base in target_regions:
+    # v30 records are [16B desc][x][y]; the record area starts V30_DESC_LEN
+    # before the (x,y) anchor.
+    for idx, base in enumerate(target_regions):
+        frame = per_frame_kps[idx % len(per_frame_kps)]
+        section = serialize_v30_section(
+            [(gx, gy, desc) for (gx, gy, _orient, desc) in frame])
         start = base - V30_DESC_LEN
         ws_body[start:start + len(section)] = section
 
-    # 4. Recompute TID over the new WS body, wrap in the envelope.
     ws_body_bytes = bytes(ws_body)
     tid = compute_tid(ws_body_bytes)
     return _build_envelope(subtype, ws_body_bytes, tid)
+
+
+def native_template(image_q16, subtype=None, fill_all_sections=True):
+    """End-to-end REFERENCE-FREE native enrollment template (single frame).
+
+    Detects keypoints in `image_q16` with the native pipeline and assembles
+    them into the envelope ready for db.new_finger() (chip cmd 0x47), filling
+    every v30 region with that single frame (or just the first region when
+    `fill_all_sections=False`).
+
+    `image_q16`: (h, w) int Q16 image (mid-gray = 0x800000). The sensor returns
+    uint8; convert via `img.astype(np.int32) << 16`."""
+    kps = extract_frame_native(image_q16, h=image_q16.shape[0],
+                               w=image_q16.shape[1])
+    regions = list(NATIVE_WS_V30_REGIONS)
+    target = regions if fill_all_sections else regions[:1]
+    return assemble_template([kps], subtype=subtype, regions=regions,
+                             target_regions=target)
 
 
 # ══════════════════════════════════════════════════════════════════════

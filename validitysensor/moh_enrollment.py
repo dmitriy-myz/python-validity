@@ -55,11 +55,7 @@ def enroll_moh(sensor, parent_dbid: int, subtype: int,
     # sensor.py imports this module lazily from enroll(), so by the time we
     # run, sensor.py is fully loaded.
     from .sensor import CaptureMode, glow_start_scan, glow_end_scan
-    from .moh_native import (extract_frame_native, _load_ws_scaffold,
-                             NATIVE_WS_V30_REGIONS,
-                             patch_pre_v30_near_identity,
-                             serialize_v30_section, V30_DESC_LEN,
-                             compute_tid, _build_envelope)
+    from .moh_native import extract_frame_native, assemble_template
 
     last_err = None
     for attempt in range(max_attempts):
@@ -109,29 +105,11 @@ def enroll_moh(sensor, parent_dbid: int, subtype: int,
                 # capture (harmless) rather than duplicating a stored record.
                 update_cb(bytes([int((f + 1) * 100 / num_frames)]), None)
 
-            # 2. Build envelope. Distribute frames across the v30 sections
-            # (round-robin if num_frames != #sections). The baked scaffold's
-            # WS framing bytes stay (header, anchors, section counts).
+            # 2. Build envelope. Frames are distributed across the v30
+            # sections round-robin (frame i % #frames per section); the baked
+            # scaffold's WS framing bytes and the per-section trailer stay.
             logging.info('enroll_moh: building envelope...')
-            ws_body = bytearray(_load_ws_scaffold())
-            regions = list(NATIVE_WS_V30_REGIONS)
-            # sec0_pre must be NEAR-identity (load-bearing): the matcher skips
-            # pure-identity records as the 'unmatched' sentinel, so near-identity
-            # (tx=ty=1) makes each section a valid candidate alignment at verify.
-            ws_body = bytearray(
-                patch_pre_v30_near_identity(bytes(ws_body), regions)[0])
-            for idx, base in enumerate(regions):
-                src_frame = per_frame_kps[idx % len(per_frame_kps)]
-                # v30 records are [16B desc][x][y]; the record area starts
-                # V30_DESC_LEN before the (x,y) anchor. The per-section trailer
-                # is enroll-only bookkeeping the matcher ignores — leave it.
-                section = serialize_v30_section(
-                    [(gx, gy, desc) for (gx, gy, _o, desc) in src_frame[:250]])
-                start = base - V30_DESC_LEN
-                ws_body[start:start + len(section)] = section
-            ws_body_bytes = bytes(ws_body)
-            tid = compute_tid(ws_body_bytes)
-            envelope = _build_envelope(subtype, ws_body_bytes, tid)
+            envelope = assemble_template(per_frame_kps, subtype=subtype)
             logging.info(f'  envelope: {len(envelope)} bytes')
 
             # 3. Store via the proven replay protocol.  No wait_int()
