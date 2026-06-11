@@ -180,13 +180,9 @@ def main():
         glow_end_scan()
         img = np.frombuffer(img_data, dtype=np.uint8).reshape(x, y)  # NO transpose (feature frame)
         if img.shape != (112, 112):
-            try:
-                import cv2
-                img112 = cv2.resize(img, (112, 112), interpolation=cv2.INTER_LINEAR)
-            except ImportError:
-                ys = (np.arange(112) * img.shape[0] // 112)
-                xs = (np.arange(112) * img.shape[1] // 112)
-                img112 = img[ys[:, None], xs[None, :]]
+            ys = (np.arange(112) * img.shape[0] // 112)
+            xs = (np.arange(112) * img.shape[1] // 112)
+            img112 = img[ys[:, None], xs[None, :]]
         else:
             img112 = img
         img_q16 = img112.astype(np.int32) << 16
