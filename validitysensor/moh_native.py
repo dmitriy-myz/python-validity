@@ -28,13 +28,10 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import logging
 import math
 from struct import pack
 
 import numpy as np
-
-log = logging.getLogger(__name__)
 
 TWO_PI = 2.0 * math.pi
 
@@ -311,6 +308,9 @@ def desc_sample_rotate(grad_x, grad_y, subpix_x_q16, subpix_y_q16, orient, N=7):
                 gx = float(grad_x[iy, ix])
                 gy = float(grad_y[iy, ix])
             else:
+                # Off-tile samples: zero gradient (a flat extension has no
+                # gradient). The DLL filled these with mid-gray 0x800000 in
+                # its Q16 gradient domain; 0.0 is the natural-units equivalent.
                 gx = gy = 0.0
             idx = xi * span + yi
             rgx[idx] = cos_o * gx + sin_o * gy
