@@ -764,6 +764,8 @@ class Sensor:
             return x, y, w1, w2, img_data
 
         finally:
+            # MoH devices (a2) reject the 0x04 capture-stop after a streamed
+            # capture (the chip returns an error), so skip the cleanup there.
             if not moh_enroll():
                 tls.app(unhexlify('04'))  # capture stop if still running, cleanup
 
@@ -856,8 +858,8 @@ class Sensor:
             usr = usr.dbid
 
         # MoH and other native-pipeline devices enroll via enroll_moh
-        # (byte-exact pipeline + raw 0x47 store) instead of the DLL-style
-        # 0x68/0x6b enrollment session. The DLL uses 8 placements.
+        # (native feature pipeline + raw 0x47 store) instead of the
+        # DLL-style 0x68/0x6b enrollment session.
         if moh_enroll():
             return self.enroll_moh(usr, subtype,
                                       update_cb=update_cb)

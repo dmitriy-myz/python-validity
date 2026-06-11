@@ -3,7 +3,7 @@
 Isolated from sensor.py so the generic Sensor class stays device-agnostic.
 `Sensor.enroll()` delegates here for devices whose blob sets `moh_enroll = True`
 (see blobs_a2.py): instead of the DLL-style 0x68/0x6b enrollment session, MoH
-devices build a byte-exact template with the native pipeline (moh_native.py)
+devices build a template with the native feature pipeline (moh_native.py)
 and store it via the raw 0x47 new_record protocol.
 
 The single entry point is `enroll_moh(sensor, ...)`; `Sensor.enroll_moh` is a
@@ -25,8 +25,8 @@ from .usb import CancelledException
 def enroll_moh(sensor, parent_dbid: int, subtype: int,
                update_cb: typing.Callable[[typing.Any, typing.Optional[Exception]], None] = lambda *a, **k: None,
                max_attempts: int = 6,
-               num_frames: int = 6):
-    """Enroll a finger using the byte-exact native pipeline (no DLL).
+               num_frames: int = 4):
+    """Enroll a finger using the native feature pipeline (no DLL).
 
     Captures `num_frames` placements, builds a 23136-byte template via the
     native pipeline (our keypoints into the baked WS-body framing scaffold,
@@ -47,6 +47,10 @@ def enroll_moh(sensor, parent_dbid: int, subtype: int,
             Called after each frame with a 1-byte percentage (0-100), or
             (None, exception) on a failed attempt.
         max_attempts: how many capture retries on transient errors.
+        num_frames: how many placements to capture. The template has 4 v30
+            sections filled round-robin from the captured frames, so 4
+            (the default) gives one distinct placement per section; frames
+            beyond the 4th would be captured but never used.
 
     Returns: the recid created in the chip's storage."""
     import numpy as np
@@ -64,9 +68,8 @@ def enroll_moh(sensor, parent_dbid: int, subtype: int,
     last_err = None
     for attempt in range(max_attempts):
         try:
-            # 1. Capture N frames (default 8; multi-frame enrollment
-            # fills the WS body's 4 v30 sections with different per-
-            # frame data).
+            # 1. Capture N frames; multi-frame enrollment fills the WS
+            # body's 4 v30 sections with different per-frame data.
             logging.info(f'enroll_moh: capturing {num_frames} frame(s)...')
             per_frame_kps = []
             for f in range(num_frames):
@@ -136,8 +139,7 @@ def enroll_moh(sensor, parent_dbid: int, subtype: int,
 
             # 3. Store via the proven replay protocol.  No wait_int()
             # — the typ=6-direct path doesn't emit an interrupt the
-            # way db.new_finger's typ=0xb-magic path does.  bisect_ws
-            # send_finger() doesn't wait either, and it works.
+            # way db.new_finger's typ=0xb-magic path does.
             logging.info('enroll_moh: storing on chip...')
             db.db_info()
             write_enable()

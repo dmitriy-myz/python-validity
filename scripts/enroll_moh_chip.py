@@ -1,10 +1,11 @@
-"""End-to-end REFERENCE-FREE native enrollment ON THE ACTUAL CHIP.
+"""Debug/CLI tool: native enrollment on a 06cb:00a2 sensor.
 
-Captures N frames from the connected 06cb:00a2 sensor, runs the byte-exact
-native pipeline, builds a chip-storable template from a baked-in framing
-scaffold (validitysensor/native_ws_scaffold.bin) — no captured reference
-template needed — stores it via raw 0x47, then optionally tries to identify
-the finger to verify the chip accepts our template.
+Captures N frames from the connected sensor, runs the native feature
+pipeline (validitysensor/moh_native.py), builds a chip-storable template
+from the baked-in framing scaffold (blobs_a2.build_ws_scaffold) — no
+captured reference template needed — stores it via raw 0x47, then
+optionally tries to identify the finger to verify the chip accepts our
+template.
 
 Run on a machine with the sensor plugged in and python-validity
 initialised (i.e., the usual `validity-sensors-firmware` & TLS handshake
@@ -12,7 +13,7 @@ have already been done — same prerequisites as the existing `enroll`
 script in this repo).
 
 Usage:
-  sudo ./.venv-poc/bin/python scripts/enroll_moh_chip.py \\
+  sudo python3 scripts/enroll_moh_chip.py \\
       --parent <user_dbid> \\
       [--match]                          # try to identify after enroll
 
@@ -57,8 +58,7 @@ def main():
                          'StgWindsor user dbid; default 5)')
     ap.add_argument('--frames', type=int, default=4,
                     help='number of DISTINCT placements to capture, one per v30 '
-                         'section (default 4 — hardware-confirmed more placement-'
-                         'robust than 1; a real DLL enroll uses 8). Vary finger '
+                         'section (default 4 = one per section). Vary finger '
                          'placement between captures for coverage.')
     ap.add_argument('--match', action='store_true',
                     help='after enroll, capture again and try to identify')
@@ -66,22 +66,19 @@ def main():
                     help='build the envelope but DO NOT store on chip; '
                          'write it to /tmp/native_envelope.bin instead')
     ap.add_argument('--match-only', action='store_true',
-                    help='do NOT enroll; just run the chip 0x5e identify against '
-                         'whatever is already stored. Control: if even a known-'
-                         'good Wine-enrolled finger does not match, the 0x5e '
-                         '(match-on-chip) path is dead on this MoH chip.')
+                    help='do NOT enroll; just run the chip identify against '
+                         'whatever is already stored.')
     ap.add_argument('--delete-dbid', type=int, default=None,
                     help='delete the FINGER record with this dbid (see '
-                         '--list-users), then exit. Use to remove the Wine '
-                         'finger so a --match-only cleanly tests OUR template. '
+                         '--list-users), then exit. '
                          'Refuses to delete a USER record (would orphan fingers) '
                          'unless --force.')
     ap.add_argument('--force', action='store_true',
                     help='allow --delete-dbid to delete a non-finger record')
     ap.add_argument('--user-sid', default=None,
                     help='enroll under this user SID, creating the user if it '
-                         'does not exist (self-contained: no Wine-made user '
-                         'needed). Overrides --parent.')
+                         'does not exist (self-contained: no pre-existing '
+                         'user needed). Overrides --parent.')
     ap.add_argument('--list-users', action='store_true',
                     help='dump the chip DB tree (db.dump_raw) and exit; '
                          'use to find a real parent dbid to pass via --parent')
@@ -130,12 +127,8 @@ def main():
 
     if args.match_only:
         ok = _try_match(log)
-        log.info('MATCH-ONLY (chip 0x5e identify against stored fingers): '
-                 + ('MATCHED → 0x5e works on this chip.'
-                    if ok else
-                    'NO MATCH. If a known-good Wine finger is enrolled and this '
-                    'still fails, 0x5e (match-on-chip) is dead here → matching '
-                    'must be done host-side (port sub_18000c6a0).'))
+        log.info('MATCH-ONLY (chip identify against stored fingers): '
+                 + ('MATCHED.' if ok else 'NO MATCH.'))
         return 0 if ok else 3
 
     if args.list_users:
@@ -165,7 +158,7 @@ def main():
                     val = bytes(rec.value)
                     log.info(f'  root {r}: type={rec.type} '
                               f'val[:32]={val[:32].hex()}')
-                except Exception as ex:
+                except Exception:
                     pass
         return 0
 
@@ -186,18 +179,15 @@ def main():
         else:
             img112 = img
         img_q16 = img112.astype(np.int32) << 16
-        # DIAGNOSTIC (live-enroll no-match debug): log stats + save the frame.
-        # Reference DLL working image: 112x112, min=0 max=255 mean~135 std~75.
+        # Log frame stats + save the raw frame for offline inspection.
+        # A good capture looks like: 112x112, min=0 max=255 mean~135 std~75.
         log.info(f'  CAPTURE: raw dims {x}x{y} ({len(img_data)}B); 112x112 '
                  f'min={int(img112.min())} max={int(img112.max())} '
                  f'mean={float(img112.mean()):.1f} std={float(img112.std()):.1f}')
-        for _p in (f'/tmp/native_capture_{x}x{y}.bin',
-                   f'/media/sf_vbox-rw/finger/native_capture_{x}x{y}.bin'):
-            try:
-                open(_p, 'wb').write(img112.astype(np.uint8).tobytes())
-                log.info(f'  saved capture -> {_p}')
-            except Exception:
-                pass
+        _p = f'/tmp/native_capture_{x}x{y}.bin'
+        with open(_p, 'wb') as fp:
+            fp.write(img112.astype(np.uint8).tobytes())
+        log.info(f'  saved capture -> {_p}')
         from validitysensor.moh_native import extract_frame_native as _ext
         log.info(f'  pipeline on live frame: {len(_ext(img_q16))} keypoints')
         envelope = native_template(img_q16, subtype=subtype)

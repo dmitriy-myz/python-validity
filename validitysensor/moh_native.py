@@ -1,9 +1,9 @@
 """Native MoH feature pipeline (06cb:00a2) — image → v30 path.
 
 This is the **float / native-Python** variant of the pipeline. It is the same
-algorithm the Windows DLL runs (decoded in dev/DLL-RE.md and dev/MOH.md), but
-the bit-exact x86 fixed-point emulation has been replaced with ordinary
-floating-point math:
+algorithm the Windows DLL runs (reverse-engineered from the synaWudfBioUsb
+driver DLL), but the bit-exact x86 fixed-point emulation has been replaced
+with ordinary floating-point math:
 
     working image (112²)
       → 3×3 grid of 57×57 tiles (mid-gray pad)          [tile_image]
@@ -16,13 +16,12 @@ floating-point math:
 
 NOTE: the math here is intentionally NOT byte-exact with the DLL. The chip-side
 matcher is a Hough geometric-voting / relative-argmax scheme with no fixed
-threshold (see dev/SCORER-sub_18000c6a0.md), so small numeric drift in the
-descriptor pipeline is expected to be tolerable. This module exists to test
-that hypothesis on hardware.
+threshold, so small numeric drift in the descriptor pipeline is tolerable
+(confirmed on hardware: enroll + recognize work).
 
 The byte-format / framing functions at the bottom (serialize_v30_section,
-merge, scaffold, TID, envelope) are unchanged from the byte-exact build — they
-are pure format/data, not arithmetic, and the chip parses them literally.
+merge, scaffold, TID, envelope) are pure format/data, not arithmetic — the
+chip parses them literally.
 """
 from __future__ import annotations
 
@@ -140,8 +139,8 @@ def apply_sep(img, kx, ky, fill=None):
 # response = Ixx·Iyy − Ixy² of the pre-smoothed image, in natural pixel units,
 # rescaled by RESP_SCALE so the NMS thresholds (t_lo/t_hi) — which were tuned
 # to the DLL's fixed-point response magnitude — still apply. RESP_SCALE was
-# fit by least-squares against the byte-exact doh() on synthetic tiles
-# (median 17.04, std/mean 2.4%); see dev/calib_resp_scale.py.
+# fit by least-squares against the DLL's fixed-point doh() on synthetic tiles
+# (median 17.04, std/mean 2.4%).
 RESP_SCALE = 17.04
 
 
@@ -170,7 +169,11 @@ def doh(tile_q16, size=5):
 def nms(resp, t_lo=671, t_hi=168, dedup_q=72064, margin=10):
     """8-neighbour non-maximum suppression on the response map. A pixel is a
     keypoint iff `resp > t_lo`, `resp >= t_hi`, and strictly greater than all 8
-    neighbours; score = |resp|. Returns `(score, x, y)` in raster-scan order."""
+    neighbours; score = |resp|. Returns `(score, x, y)` in raster-scan order.
+
+    Both thresholds are kept separate for parity with the DLL's NMS
+    (sub_18000CF90), even though t_hi < t_lo makes the second test redundant
+    at the default values."""
     h, w = resp.shape
     r2 = ((dedup_q >> 6) ** 2) >> 20
     kps = []   # (score, x, y)
@@ -407,7 +410,7 @@ def serialize_v30_section(records, n_slots=V30_SECTION_RECORDS):
         d = bytes(desc[:16])
         out[o:o + len(d)] = d
         out[o + 16] = x & 0xFF
-        out[o + 17] = (y & 0xFF) if y is not None else 0
+        out[o + 17] = y & 0xFF
     return bytes(out)
 
 
@@ -440,8 +443,8 @@ FRAME_KP_CAP = 250
 def _a960_passes_global_edge(sx_q16, sy_q16, oy, ox, h, w, ti=None, tj=None):
     """Project (subpix_x_q16, subpix_y_q16) into the global frame via the tile
     origin and return True iff 3 ≤ gx < w-3 and 3 ≤ gy < h-3, with one
-    corner-tile tightening observed in Wine enrollment captures (bottom-right
-    tile caps gy at oy + last-row-step)."""
+    corner-tile tightening observed in captures of the Windows driver's
+    enrollment (bottom-right tile caps gy at oy + last-row-step)."""
     gx = ((ox << 16) + sx_q16) >> 16
     gy = ((oy << 16) + sy_q16) >> 16
     gx_hi = w - 3
@@ -465,8 +468,8 @@ def extract_frame_native(image_q16, h=112, w=112,
 
     `image_q16`: (h, w) int array, mid-gray = 0x800000 (uint8 image << 16)."""
     image_q16 = np.asarray(image_q16, dtype=np.int64)
-    assert image_q16.shape == (h, w), \
-        f"expected ({h}, {w}), got {image_q16.shape}"
+    if image_q16.shape != (h, w):
+        raise ValueError(f"expected ({h}, {w}), got {image_q16.shape}")
 
     # Phase 1: per-tile detect + subpix + edge filter into a tile-tagged pool.
     per_tile_grads = {}
@@ -521,7 +524,7 @@ def extract_frame_native(image_q16, h=112, w=112,
 
 
 # ─── Baked WS-body scaffold — makes native enrollment REFERENCE-FREE ───────
-# A genuine chip-accepted Wine template with its v30 RECORD areas zeroed —
+# A genuine chip-accepted Windows-driver template with its v30 RECORD areas zeroed —
 # i.e. the TLV framing only (header, per-section counts, sec0_pre inter-section
 # pose table, section markers, tail). Finger-INDEPENDENT RE-derived constant
 # data; we overlay OUR v30 records onto it and recompute the TID.
