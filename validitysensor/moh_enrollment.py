@@ -126,6 +126,20 @@ def enroll_moh(sensor, parent_dbid: int, subtype: int,
             # Keep the best len(regions) frames (most keypoints — a frame-
             # quality proxy) in capture order; each section then holds one
             # geometrically consistent placement.
+            #
+            # NOTE: this is a structural APPROXIMATION of the Windows DLL, not
+            # a reproduction of it. The DLL (EnrollmentUpdate → commit) folds
+            # every placement into a persistent session accumulator, culls
+            # keypoints by cross-frame CONSENSUS (sub_180008ec0 coord
+            # histograms — the source of the per-tile survivor counts), and
+            # builds each v30 section from a frame chosen by a learned QUALITY
+            # regression (sub_180008980 score vs the 0x699=1689 gate), not by
+            # keypoint count. That regression's coefficients live in a runtime
+            # ctx object and are not statically portable, and we have no
+            # cross-frame consensus step, so we substitute: distinct placement
+            # per section, ranked by keypoint count. The chip's voting matcher
+            # tolerates this (enroll + recognize confirmed on hardware), but the
+            # exact DLL section<->frame mapping was never RE-confirmed.
             if len(per_frame_kps) > len(regions):
                 best = sorted(range(len(per_frame_kps)),
                               key=lambda i: len(per_frame_kps[i]),
