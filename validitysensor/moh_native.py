@@ -458,13 +458,21 @@ def _a960_passes_global_edge(sx_q16, sy_q16, oy, ox, h, w, ti=None, tj=None):
 
 def extract_frame_native(image_q16, h=112, w=112,
                          t_lo=671, t_hi=168, dedup_q=72064, nms_margin=10,
-                         subpix_refine=True, frame_kp_cap=FRAME_KP_CAP):
+                         subpix_refine=True, frame_kp_cap=FRAME_KP_CAP,
+                         stats=None):
     """Single-frame native feature extractor.
 
     Per-tile: DoH → NMS → subpixel refine → global-edge cull. Then a global
     sort by |resp| descending, cap to 250, re-sort by (tile_id, |resp| desc),
     and run orientation + descriptor per keypoint. Returns a list of
     (gx_int, gy_int, orient_rad, desc_16B) after the global merge.
+
+    `stats`, if a dict, is filled with frame-quality metrics that survive the
+    250-cap (the returned list saturates at `frame_kp_cap` on any healthy
+    frame, so its length cannot rank frames — see dev/FRAME-QUALITY.md):
+      n_pool     uncapped keypoint count (pool size before the cap)
+      cap_score  |resp| of the weakest KEPT keypoint if the cap was hit, else 0
+      med_score  median |resp| of the kept keypoints
 
     `image_q16`: (h, w) int array, mid-gray = 0x800000 (uint8 image << 16)."""
     image_q16 = np.asarray(image_q16, dtype=np.int64)
@@ -496,6 +504,13 @@ def extract_frame_native(image_q16, h=112, w=112,
 
     # Phase 2: global sort by |resp| desc, cap to frame_kp_cap.
     pool.sort(key=lambda r: -r[0])
+    if stats is not None:
+        kept_scores = [r[0] for r in pool[:frame_kp_cap]]
+        stats['n_pool'] = len(pool)
+        stats['cap_score'] = (float(kept_scores[-1])
+                              if len(pool) >= frame_kp_cap else 0.0)
+        stats['med_score'] = (float(np.median(kept_scores))
+                              if kept_scores else 0.0)
     pool = pool[:frame_kp_cap]
 
     # Phase 3: re-sort by (tile_id asc, |resp| desc).

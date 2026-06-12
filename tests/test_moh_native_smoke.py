@@ -37,6 +37,17 @@ def test_extract_frame_native_shape_and_bounds():
         assert len(desc) == m.V30_DESC_LEN == 16
 
 
+def test_extract_frame_native_stats():
+    stats = {}
+    kps = m.extract_frame_native(_synthetic_frame(), stats=stats)
+    assert stats['n_pool'] >= len(kps), "pool is pre-cap, can't be smaller"
+    assert stats['med_score'] > 0
+    # cap_score > 0 iff the 250-cap was actually hit
+    assert (stats['cap_score'] > 0) == (stats['n_pool'] >= m.FRAME_KP_CAP)
+    # the stats keyword must not change the extraction result
+    assert kps == m.extract_frame_native(_synthetic_frame())
+
+
 def test_serialize_v30_section_layout():
     desc = bytes(range(16))
     sec = m.serialize_v30_section([(5, 7, desc)], n_slots=m.V30_SECTION_RECORDS)

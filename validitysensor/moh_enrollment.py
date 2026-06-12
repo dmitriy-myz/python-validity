@@ -25,7 +25,8 @@ from .usb import CancelledException
 def enroll_moh(sensor, parent_dbid: int, subtype: int,
                update_cb: typing.Callable[[typing.Any, typing.Optional[Exception]], None] = lambda *a, **k: None,
                max_attempts: int = 6,
-               num_frames: int = 6):
+               num_frames: int = 6,
+               min_frame_pool: typing.Optional[int] = None):
     """Enroll a finger using the native feature pipeline (no DLL).
 
     Captures `num_frames` placements, builds a 23136-byte template via the
@@ -49,8 +50,17 @@ def enroll_moh(sensor, parent_dbid: int, subtype: int,
         max_attempts: how many capture retries on transient errors.
         num_frames: how many placements to capture (default 6). The
             template has 4 v30 sections, each holding one placement; the
-            best 4 frames (most keypoints) fill them, so extra captures
-            let weak placements be dropped.
+            best 4 frames (largest uncapped keypoint pool) fill them, so
+            extra captures let weak placements be dropped.
+        min_frame_pool: minimum UNCAPPED keypoint-pool size for a frame
+            to be accepted; weaker frames are recaptured (within the
+            per-frame retry budget). Defaults to FRAME_KP_CAP (250): a
+            healthy placement yields a pool of ~500 (measured on real
+            captures — see dev/FRAME-QUALITY.md), so a frame that cannot
+            even fill its 250 template slots is severely degraded
+            (partial contact / smear / light press). Note the CAPPED
+            keypoint count is NOT a usable quality signal — even a
+            half-empty frame still saturates the 250 cap.
 
     Returns: the recid created in the chip's storage."""
     import numpy as np
@@ -60,10 +70,13 @@ def enroll_moh(sensor, parent_dbid: int, subtype: int,
     # run, sensor.py is fully loaded.
     from .sensor import CaptureMode, glow_start_scan, glow_end_scan
     from .moh_native import (extract_frame_native, _load_ws_scaffold,
-                             NATIVE_WS_V30_REGIONS,
+                             NATIVE_WS_V30_REGIONS, FRAME_KP_CAP,
                              patch_pre_v30_near_identity,
                              serialize_v30_section, V30_DESC_LEN,
                              compute_tid, _build_envelope)
+
+    if min_frame_pool is None:
+        min_frame_pool = FRAME_KP_CAP
 
     last_err = None
     for attempt in range(max_attempts):
@@ -72,17 +85,19 @@ def enroll_moh(sensor, parent_dbid: int, subtype: int,
             # body's 4 v30 sections with different per-frame data.
             logging.info(f'enroll_moh: capturing {num_frames} frame(s)...')
             per_frame_kps = []
+            per_frame_pool = []   # uncapped pool size, the frame-quality rank
             for f in range(num_frames):
                 # Per-frame retry: if the sensor errors mid-capture
                 # (e.g. "Scanning problem: 8080000" — finger lifted too
-                # early), retry JUST this frame instead of restarting
-                # the whole enrollment.
+                # early) or the frame is too weak to fill its 250
+                # template slots, retry JUST this frame instead of
+                # restarting the whole enrollment.
+                kps, stats = None, None
                 for frame_attempt in range(max_attempts):
                     glow_start_scan()
                     logging.info(f'  frame {f+1}/{num_frames}: place finger')
                     try:
                         x, y, w1, w2, img_data = sensor.capture(CaptureMode.ENROLL)
-                        break
                     except usb_core.USBError:
                         glow_end_scan()
                         raise
@@ -97,14 +112,31 @@ def enroll_moh(sensor, parent_dbid: int, subtype: int,
                         if frame_attempt + 1 == max_attempts:
                             raise
                         sleep(0.1)
-                glow_end_scan()
-                img = np.frombuffer(img_data, dtype=np.uint8).reshape(x, y)
-                img_q16 = img.astype(np.int32) << 16
+                        continue
+                    glow_end_scan()
+                    img = np.frombuffer(img_data, dtype=np.uint8).reshape(x, y)
+                    img_q16 = img.astype(np.int32) << 16
 
-                logging.info(f'  frame {f+1}: extracting features...')
-                kps = extract_frame_native(img_q16, h=112, w=112)
-                logging.info(f'  frame {f+1}: {len(kps)} kp(s)')
+                    logging.info(f'  frame {f+1}: extracting features...')
+                    stats = {}
+                    kps = extract_frame_native(img_q16, h=112, w=112,
+                                               stats=stats)
+                    logging.info(f"  frame {f+1}: {len(kps)} kp(s), "
+                                  f"pool={stats['n_pool']} "
+                                  f"cap_score={stats['cap_score']:.0f} "
+                                  f"med_score={stats['med_score']:.0f}")
+                    if stats['n_pool'] >= min_frame_pool:
+                        break
+                    # Quality gate: the frame did not even fill the 250
+                    # template slots — severely degraded placement. On the
+                    # last attempt keep it anyway (the ranking below will
+                    # deprioritize it) rather than failing the enrollment.
+                    logging.warning(
+                        f"  frame {f+1} too weak (pool={stats['n_pool']} "
+                        f'< {min_frame_pool}), recapture '
+                        f'(attempt {frame_attempt+1}/{max_attempts})')
                 per_frame_kps.append(kps)
+                per_frame_pool.append(stats['n_pool'])
                 # Report percentage complete after each frame is processed,
                 # via the OS update_cb(progress_bytes, error) contract (see
                 # scripts/prototype.py) — the percent is a single byte.
@@ -123,9 +155,12 @@ def enroll_moh(sensor, parent_dbid: int, subtype: int,
             # (tx=ty=1) makes each section a valid candidate alignment at verify.
             ws_body = bytearray(
                 patch_pre_v30_near_identity(bytes(ws_body), regions)[0])
-            # Keep the best len(regions) frames (most keypoints — a frame-
-            # quality proxy) in capture order; each section then holds one
-            # geometrically consistent placement.
+            # Keep the best len(regions) frames in capture order; each section
+            # then holds one geometrically consistent placement. Frames are
+            # ranked by the UNCAPPED keypoint-pool size (stats['n_pool']) —
+            # NOT by len(kps), which saturates at the 250 cap on every healthy
+            # frame (real placements pool ~500) and so cannot rank anything.
+            # See dev/FRAME-QUALITY.md for the calibration data.
             #
             # NOTE: this is a structural APPROXIMATION of the Windows DLL, not
             # a reproduction of it. The DLL (EnrollmentUpdate → commit) folds
@@ -133,17 +168,19 @@ def enroll_moh(sensor, parent_dbid: int, subtype: int,
             # keypoints by cross-frame CONSENSUS (sub_180008ec0 coord
             # histograms — the source of the per-tile survivor counts), and
             # builds each v30 section from a frame chosen by a learned QUALITY
-            # regression (sub_180008980 score vs the 0x699=1689 gate), not by
-            # keypoint count. That regression's coefficients live in a runtime
-            # ctx object and are not statically portable, and we have no
-            # cross-frame consensus step, so we substitute: distinct placement
-            # per section, ranked by keypoint count. The chip's voting matcher
-            # tolerates this (enroll + recognize confirmed on hardware), but the
-            # exact DLL section<->frame mapping was never RE-confirmed.
+            # regression (sub_180008980 score vs the 0x699=1689 gate). That
+            # regression's coefficients live in a runtime ctx object and are
+            # not statically portable, and we have no cross-frame consensus
+            # step, so we substitute: distinct placement per section, ranked
+            # by detector pool size. The chip's voting matcher tolerates this
+            # (enroll + recognize confirmed on hardware), but the exact DLL
+            # section<->frame mapping was never RE-confirmed.
             if len(per_frame_kps) > len(regions):
                 best = sorted(range(len(per_frame_kps)),
-                              key=lambda i: len(per_frame_kps[i]),
+                              key=lambda i: per_frame_pool[i],
                               reverse=True)[:len(regions)]
+                logging.info(f'  keeping frames {sorted(best)} '
+                              f'(pools: {per_frame_pool})')
                 per_frame_kps = [per_frame_kps[i] for i in sorted(best)]
             for idx, base in enumerate(regions):
                 src_frame = per_frame_kps[idx % len(per_frame_kps)]
