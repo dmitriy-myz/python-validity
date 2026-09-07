@@ -76,3 +76,12 @@ def test_subpix_refine_rejects_out_of_range():
     assert m.subpix_refine_kp(resp, 0, 10) is None    # x on the border
     assert m.subpix_refine_kp(resp, 10, 0) is None    # y on the border
     assert m.subpix_refine_kp(resp, 10, 10) is None   # flat → singular Hessian
+
+
+def test_ws_scaffold_is_prepatched_near_identity():
+    # The near-identity sec0_pre transforms are applied once when the scaffold
+    # is loaded; re-running the patcher must be a byte-level no-op.
+    scaffold = m._load_ws_scaffold()
+    patched, n = m.patch_pre_v30_near_identity(scaffold, m.NATIVE_WS_V30_REGIONS)
+    assert n == 6
+    assert patched == scaffold

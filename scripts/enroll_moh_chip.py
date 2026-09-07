@@ -34,6 +34,30 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 
+def resolve_parent(parent, user_sid):
+    """Resolve the user dbid the new finger attaches to.
+
+    `user_sid` (an "S-1-5-21-..." string) wins: the user is looked up and
+    created if missing. Otherwise `parent` must be the dbid of an existing
+    USER (type 5) record — a wrong parent is accepted by the storage layer
+    but the chip's matcher then never finds the finger."""
+    from validitysensor.db import db
+    from validitysensor.sid import sid_from_string
+
+    if user_sid:
+        identity = sid_from_string(user_sid)
+        usr = db.lookup_user(identity)
+        if usr is None:
+            return db.new_user(identity)
+        return usr.dbid
+    if parent is None:
+        raise ValueError('pass --parent <user dbid> (see --list-users) or --user-sid')
+    rec = db.get_record_value(parent)
+    if rec.type != 5:
+        raise ValueError(f'dbid {parent} is a type {rec.type} record, not a USER (type 5)')
+    return parent
+
+
 def _try_match(log):
     """Capture a fresh frame and ask the chip to identify. Returns True on a
     match, False on 'not recognized' (logged cleanly, no traceback)."""
@@ -53,9 +77,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--subtype', default='0xf5',
                     help='WinBio subtype, hex or decimal (default 0xf5)')
-    ap.add_argument('--parent', type=int, default=5,
-                    help='parent user dbid (use --list-users to find the '
-                         'StgWindsor user dbid; default 5)')
+    ap.add_argument('--parent', type=int, default=None,
+                    help='parent USER dbid (use --list-users to find it); '
+                         'required unless --user-sid is given')
     ap.add_argument('--frames', type=int, default=6,
                     help='number of DISTINCT placements to capture (default 6); '
                          'the best 4 (most keypoints) fill the template\'s 4 v30 '
@@ -197,19 +221,18 @@ def main():
         log.info(f'✓ wrote /tmp/native_envelope.bin ({len(envelope)} bytes)')
         return 0
 
-    if args.user_sid:
-        usr = db.lookup_user(args.user_sid)
-        if usr is None:
-            parent = db.new_user(args.user_sid)
-            log.info(f'created user {args.user_sid!r} → dbid {parent}')
-        else:
-            parent = usr.dbid
-            log.info(f'using existing user {args.user_sid!r} → dbid {parent}')
+    # Resolved after the captures (enroll_moh calls it), so an aborted
+    # enrollment never leaves a freshly created finger-less user behind.
+    def parent_dbid():
+        dbid = resolve_parent(parent, args.user_sid)
+        log.info(f'parent user dbid {dbid}')
+        return dbid
 
-    log.info(f'enrolling subtype 0x{subtype:x} under parent dbid {parent} '
-              f'with {args.frames} frame(s)...')
-    recid = Sensor.enroll_moh(parent, subtype,
-                                   num_frames=args.frames)
+    if not args.user_sid:
+        parent_dbid()   # validate before asking for finger placements
+
+    log.info(f'enrolling subtype 0x{subtype:x} with {args.frames} frame(s)...')
+    recid = Sensor.enroll_moh(parent_dbid, subtype, num_frames=args.frames)
     log.info(f'✓ native enrollment stored, recid={recid}')
 
     if args.match:

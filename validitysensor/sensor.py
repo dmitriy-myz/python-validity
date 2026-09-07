@@ -694,6 +694,7 @@ class Sensor:
         usb.cancel = True
 
     def capture(self, mode: CaptureMode) -> typing.Tuple[int, int, int, int, bytes]:
+        completed = False
         try:
             assert_status(tls.app(self.build_cmd_02(mode)))
 
@@ -727,7 +728,7 @@ class Sensor:
             l, = unpack('<L', l)
 
             if l != len(res):
-                raise Exception('Response size does not match %d != %d', l, len(res))
+                raise Exception('Response size does not match %d != %d' % (l, len(res)))
 
             x, y, w1, w2, error = unpack('<HHHHL', res[:12])
             if error != 0:
@@ -758,16 +759,25 @@ class Sensor:
                     l, res = res[:4], res[4:]
                     l, = unpack('<L', l)
                     if l != len(res):
-                        raise Exception('Response size does not match %d != %d', l, len(res))
+                        raise Exception('Response size does not match %d != %d' % (l, len(res)))
                     img_data += res
 
+            completed = True
             return x, y, w1, w2, img_data
 
         finally:
-            # MoH devices (a2) reject the 0x04 capture-stop after a streamed
-            # capture (the chip returns an error), so skip the cleanup there.
-            if not moh_enroll():
-                tls.app(unhexlify('04'))  # capture stop if still running, cleanup
+            # MoH devices (a2) reject the 0x04 capture-stop after a COMPLETED
+            # streamed capture (the chip returns an error), so skip it there.
+            # On an interrupted capture (cancel, USB error, scan error) the
+            # chip is still in capture mode and the next 0x02 would hit it, so
+            # the stop is sent on every device; an a2 rejection is only logged.
+            if not (completed and moh_enroll()):
+                try:
+                    tls.app(unhexlify('04'))  # capture stop if still running, cleanup
+                except Exception as e:
+                    if not moh_enroll():
+                        raise
+                    logging.warning('capture stop after interrupted capture: %s', e)
 
     def enrollment_update_start(self, key: int) -> int:
         rsp = tls.app(pack('<BLL', 0x68, key, 0))
@@ -837,37 +847,37 @@ class Sensor:
 
         return tinfo
 
-    def enroll_moh(self, parent_dbid: int, subtype: int, **kwargs):
+    def enroll_moh(self, parent, subtype: int, **kwargs):
         """Match-on-Host enrollment — delegates to moh_enrollment.enroll_moh.
+        `parent` is a user dbid or a zero-arg callable resolving to one.
 
         Kept as a thin method so existing callers (and enroll() below) can use
         the sensor instance directly; the implementation lives in
         validitysensor/moh_enrollment.py to keep this class device-agnostic."""
         from .moh_enrollment import enroll_moh
-        return enroll_moh(self, parent_dbid, subtype, **kwargs)
+        return enroll_moh(self, parent, subtype, **kwargs)
 
     # TODO: Better typing information needed.
     def enroll(self, identity: SidIdentity, subtype: int,
                update_cb: typing.Callable[[typing.Any, typing.Optional[Exception]], None]):
-        # Resolve the identity to a user dbid up front, creating the user if
-        # needed. Shared by both enrollment paths below.
-        usr = db.lookup_user(identity)
-        if usr is None:
-            usr = db.new_user(identity)
-        else:
-            usr = usr.dbid
+        # Resolved only at commit time (after all captures) on both paths, so a
+        # cancelled or failed enrollment never leaves a finger-less user record.
+        def resolve_user() -> int:
+            usr = db.lookup_user(identity)
+            if usr is None:
+                return db.new_user(identity)
+            return usr.dbid
 
         # MoH and other native-pipeline devices enroll via enroll_moh
         # (native feature pipeline + raw 0x47 store) instead of the
         # DLL-style 0x68/0x6b enrollment session.
         if moh_enroll():
-            return self.enroll_moh(usr, subtype,
-                                      update_cb=update_cb)
+            return self.enroll_moh(resolve_user, subtype, update_cb=update_cb)
 
         def do_create_finger(final_template: bytes, tid: bytes):
             tinfo = self.make_finger_data(subtype, final_template, tid)
 
-            recid = db.new_finger(usr, tinfo)
+            recid = db.new_finger(resolve_user(), tinfo)
             usb.wait_int()
 
             glow_end_scan()

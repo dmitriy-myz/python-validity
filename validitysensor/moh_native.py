@@ -547,12 +547,26 @@ NATIVE_WS_V30_REGIONS = (309, 4913, 9453, 13993)
 _NATIVE_WS_SCAFFOLD = None
 
 
+_WS_SCAFFOLD_PRE_V30_RECORDS = 6   # sec0_pre inter-section transforms
+
+
 def _load_ws_scaffold():
-    """Return the 23056-byte baked WS-body framing scaffold (v30 zeroed)."""
+    """Return the 23056-byte baked WS-body framing scaffold (v30 zeroed) with
+    its sec0_pre inter-section transforms already set to NEAR-identity.
+
+    The patch is applied once here (not per template build) and its record
+    count is asserted: the patcher is a heuristic scan, so a scaffold edit
+    that broke it would otherwise silently leave pure-identity transforms —
+    the matcher's 'unmatched' sentinel — in every template."""
     global _NATIVE_WS_SCAFFOLD
     if _NATIVE_WS_SCAFFOLD is None:
         from .blobs_a2 import build_ws_scaffold
-        _NATIVE_WS_SCAFFOLD = build_ws_scaffold()
+        patched, n = patch_pre_v30_near_identity(build_ws_scaffold(),
+                                                 NATIVE_WS_V30_REGIONS)
+        if n != _WS_SCAFFOLD_PRE_V30_RECORDS:
+            raise RuntimeError(f'WS scaffold: patched {n} sec0_pre records, '
+                               f'expected {_WS_SCAFFOLD_PRE_V30_RECORDS}')
+        _NATIVE_WS_SCAFFOLD = patched
     return _NATIVE_WS_SCAFFOLD
 
 
@@ -616,9 +630,7 @@ def native_template(image_q16, subtype=None, fill_all_sections=True):
     if subtype is None:
         subtype = DEFAULT_SUBTYPE
     assert len(ws_body) == WS_SIZE, f"WS body must be {WS_SIZE}B, got {len(ws_body)}"
-
-    # Inter-section sec0_pre transforms must be NEAR-identity (load-bearing).
-    ws_body = bytearray(patch_pre_v30_near_identity(bytes(ws_body), regions)[0])
+    # (sec0_pre transforms are already NEAR-identity — see _load_ws_scaffold.)
 
     # 1. Detect OUR keypoints + descriptors from OUR image.
     kps = extract_frame_native(image_q16, h=image_q16.shape[0],
