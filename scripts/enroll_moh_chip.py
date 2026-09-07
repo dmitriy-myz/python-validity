@@ -17,9 +17,9 @@ Usage:
       --parent <user_dbid> \\
       [--match]                          # try to identify after enroll
 
-  --subtype N     WinBio subtype (= finger position). Defaults to 0xf5
-                  (right index, common test). Look at validitysensor/
-                  fingerprint_constants.py for the full list.
+  --subtype N     WinBio subtype (= finger position). Defaults to
+                  moh_native.DEFAULT_SUBTYPE (0xf5, UNSPECIFIED_POS_01). See
+                  validitysensor/fingerprint_constants.py for the full list.
 
   --match         after storing, capture a fresh frame and ask the chip
                   to identify (sensor.match_finger). If the chip matches
@@ -32,6 +32,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from validitysensor.moh_native import DEFAULT_SUBTYPE  # noqa: E402
 
 
 def resolve_parent(parent, user_sid):
@@ -75,8 +77,8 @@ def _try_match(log):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--subtype', default='0xf5',
-                    help='WinBio subtype, hex or decimal (default 0xf5)')
+    ap.add_argument('--subtype', default=hex(DEFAULT_SUBTYPE),
+                    help=f'WinBio subtype, hex or decimal (default {DEFAULT_SUBTYPE:#x})')
     ap.add_argument('--parent', type=int, default=None,
                     help='parent USER dbid (use --list-users to find it); '
                          'required unless --user-sid is given')

@@ -85,3 +85,20 @@ def test_ws_scaffold_is_prepatched_near_identity():
     patched, n = m.patch_pre_v30_near_identity(scaffold, m.NATIVE_WS_V30_REGIONS)
     assert n == 6
     assert patched == scaffold
+
+
+def test_make_finger_data_matches_build_envelope():
+    from validitysensor.sensor import Sensor
+    ws, tid = bytes(range(256)) * 3, bytes(range(32))
+    assert Sensor().make_finger_data(0xf5, ws, tid) == m.build_envelope(0xf5, ws, tid)
+
+
+def test_assemble_template_cycles_frames_over_sections():
+    a = [(10, 11, 0.0, bytes([1] * 16))]
+    b = [(20, 21, 0.0, bytes([2] * 16))]
+    env = m.assemble_template([a, b], subtype=0xf5)
+    ws = env[12:12 + m.WS_SIZE]
+    recs = [ws[base - m.V30_DESC_LEN:base + 2] for base in m.NATIVE_WS_V30_REGIONS]
+    assert recs[0] == recs[2] == bytes([1] * 16) + bytes([10, 11])
+    assert recs[1] == recs[3] == bytes([2] * 16) + bytes([20, 21])
+    assert env[23072:23104] == m.compute_tid(ws)

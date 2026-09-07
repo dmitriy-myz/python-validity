@@ -14,14 +14,11 @@ Three stages, each usable on its own:
 """
 import logging
 import typing
-from struct import pack, unpack
 from time import sleep
 
 from usb import core as usb_core
 
 from .db import db
-from .flash import write_enable, call_cleanups
-from .tls import tls
 from .usb import usb, CancelledException
 
 UpdateCb = typing.Callable[[typing.Any, typing.Optional[Exception]], None]
@@ -130,35 +127,18 @@ def build_template(frames, subtype: int) -> bytes:
     The chip's voting matcher tolerates this (enroll + recognize confirmed on
     hardware), but the exact DLL section<->frame mapping was never
     RE-confirmed."""
-    from .moh_native import (_load_ws_scaffold, NATIVE_WS_V30_REGIONS,
-                             serialize_v30_section, V30_DESC_LEN,
-                             compute_tid, _build_envelope)
+    from .moh_native import NATIVE_WS_V30_REGIONS, assemble_template
 
     logging.info('enroll_moh: building envelope...')
-    # The scaffold already carries the NEAR-identity sec0_pre transforms
-    # (applied once in _load_ws_scaffold): the matcher skips pure-identity
-    # records as the 'unmatched' sentinel, so near-identity (tx=ty=1) makes
-    # each section a valid candidate alignment at verify.
-    ws_body = bytearray(_load_ws_scaffold())
-    regions = list(NATIVE_WS_V30_REGIONS)
+    n_sections = len(NATIVE_WS_V30_REGIONS)
     per_frame_kps = [kps for kps, _ in frames]
-    if len(frames) > len(regions):
+    if len(frames) > n_sections:
         best = sorted(range(len(frames)), key=lambda i: frames[i][1],
-                      reverse=True)[:len(regions)]
+                      reverse=True)[:n_sections]
         logging.info(f'  keeping frames {sorted(best)} '
                      f'(pools: {[n for _, n in frames]})')
         per_frame_kps = [per_frame_kps[i] for i in sorted(best)]
-    for idx, base in enumerate(regions):
-        src_frame = per_frame_kps[idx % len(per_frame_kps)]
-        # v30 records are [16B desc][x][y]; the record area starts
-        # V30_DESC_LEN before the (x,y) anchor. The per-section trailer is
-        # enroll-only bookkeeping the matcher ignores — leave it.
-        section = serialize_v30_section(
-            [(gx, gy, desc) for (gx, gy, _o, desc) in src_frame])
-        start = base - V30_DESC_LEN
-        ws_body[start:start + len(section)] = section
-    ws_body_bytes = bytes(ws_body)
-    envelope = _build_envelope(subtype, ws_body_bytes, compute_tid(ws_body_bytes))
+    envelope = assemble_template(per_frame_kps, subtype)
     logging.info(f'  envelope: {len(envelope)} bytes')
     return envelope
 
@@ -173,21 +153,10 @@ def store_template(parent_dbid: int, envelope: bytes) -> int:
 
     Storing under a non-existent dbid may succeed at the storage layer BUT
     the chip's matcher will silently fail to find the enrollment — callers
-    must pass a real user dbid. A chip rejection raises RuntimeError; it is
-    deterministic, so callers must not retry it by recapturing."""
+    must pass a real user dbid. A chip rejection raises (assert_status); it
+    is deterministic, so callers must not retry it by recapturing."""
     logging.info('enroll_moh: storing on chip...')
-    db.db_info()
-    write_enable()
-    try:
-        msg = (pack('<BHHHH', 0x47, parent_dbid, 6, 3, len(envelope))
-               + envelope + b'\x00')
-        rsp = tls.cmd(msg)
-        status, = unpack('<H', rsp[:2])
-        if status != 0:
-            raise RuntimeError(f'chip rejected new_finger: status=0x{status:04x}')
-        recid, = unpack('<H', rsp[2:4])
-    finally:
-        call_cleanups()
+    recid = db.new_record(parent_dbid, 6, 3, envelope, trailer=b'\x00')
     logging.info(f'enroll_moh: stored recid={recid}')
     return recid
 

@@ -8,6 +8,7 @@ from struct import pack, unpack
 import numpy as np
 import pytest
 
+from validitysensor import db as db_mod
 from validitysensor import moh_enrollment as me
 from validitysensor import sensor as sensor_mod
 from validitysensor.usb import usb, CancelledException
@@ -50,10 +51,9 @@ def chip(monkeypatch):
     """Silence LED/flash/tls side effects; record 0x47 stores."""
     monkeypatch.setattr(sensor_mod, 'glow_start_scan', lambda: None)
     monkeypatch.setattr(sensor_mod, 'glow_end_scan', lambda: None)
-    monkeypatch.setattr(me, 'write_enable', lambda: None)
-    monkeypatch.setattr(me, 'call_cleanups', lambda: None)
     monkeypatch.setattr(me, 'sleep', lambda s: None)
     monkeypatch.setattr(me.db, 'db_info', lambda: None)
+    monkeypatch.setattr(db_mod, 'call_cleanups', lambda: None)
     usb.cancel = False
     state = {'status': 0, 'msgs': []}
 
@@ -61,7 +61,7 @@ def chip(monkeypatch):
         state['msgs'].append(msg)
         return pack('<HH', state['status'], 0x2a)
 
-    monkeypatch.setattr(me.tls, 'cmd', cmd)
+    monkeypatch.setattr(db_mod.tls, 'cmd', cmd)
     return state
 
 
@@ -74,9 +74,17 @@ def _enroll(sensor, chip, parent=5, num_frames=2, update_cb=None):
 def test_store_rejection_fails_without_recapturing(chip):
     chip['status'] = 0x04b3
     sensor = FakeSensor(['ok'] * 12)
-    with pytest.raises(RuntimeError, match='04b3'):
+    with pytest.raises(Exception, match='04b3'):
         _enroll(sensor, chip, num_frames=2)
     assert sensor.calls == 2
+
+
+def test_store_uses_uncounted_one_byte_trailer(chip):
+    _enroll(FakeSensor(['ok']), chip, num_frames=1)
+    msg = chip['msgs'][-1]
+    _, _, _, _, size = unpack('<BHHHH', msg[:9])
+    assert size == 23136
+    assert len(msg) == 9 + size + 1 and msg[-1] == 0
 
 
 def test_failed_capture_reports_retry_to_update_cb(chip):

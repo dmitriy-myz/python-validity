@@ -837,15 +837,8 @@ class Sensor:
         return header, template, tid
 
     def make_finger_data(self, subtype: int, template: bytes, tid: bytes):
-        template = pack('<HH', 1, len(template)) + template
-        tid = pack('<HH', 2, len(tid)) + tid
-
-        tinfo = template + tid
-
-        tinfo = pack('<HHHH', subtype, 3, len(tinfo), 0x20) + tinfo
-        tinfo += b'\0' * 0x20
-
-        return tinfo
+        from .moh_native import build_envelope
+        return build_envelope(subtype, template, tid)
 
     def enroll_moh(self, parent, subtype: int, **kwargs):
         """Match-on-Host enrollment — delegates to moh_enrollment.enroll_moh.

@@ -394,7 +394,7 @@ V30_SECTION_RECORDS = 250
 V30_SECTION_BYTES = V30_SECTION_RECORDS * 18  # 4500
 V30_DESC_LEN = 16   # record = [desc:16][x:u8][y:u8]; (x,y) anchor is +16 in
 WS_SIZE = 23056             # chip-view WS body size
-DEFAULT_SUBTYPE = 0x00f7    # default WinBio finger subtype
+DEFAULT_SUBTYPE = 0x00f5    # default WinBio finger subtype (UNSPECIFIED_POS_01)
 
 
 def serialize_v30_section(records, n_slots=V30_SECTION_RECORDS):
@@ -615,50 +615,52 @@ def patch_pre_v30_near_identity(ws_body, regions):
     return bytes(ws), patched
 
 
-def native_template(image_q16, subtype=None, fill_all_sections=True):
-    """End-to-end REFERENCE-FREE native enrollment template.
+def assemble_template(per_section_kps, subtype):
+    """Assemble the chip-ready envelope from per-section keypoint lists.
 
-    Detects keypoints in `image_q16` with the native pipeline, formats them
-    into 18-byte v30 records [16B desc][x][y], overwrites every v30 region of
-    the baked WS-body scaffold, recomputes the TID, and returns the envelope
-    ready for db.new_finger() (chip cmd 0x47).
+    `per_section_kps[i % len]` fills v30 section i of the baked WS-body
+    scaffold as [16B desc][x][y] records (one list → every section gets the
+    same frame); the TID is recomputed over the new body and the result is
+    wrapped in the type-6 envelope (chip cmd 0x47). Items are
+    (gx, gy, orient, desc) as returned by extract_frame_native()."""
+    ws_body = bytearray(_load_ws_scaffold())
+    assert len(ws_body) == WS_SIZE, f"WS body must be {WS_SIZE}B, got {len(ws_body)}"
+    for idx, base in enumerate(NATIVE_WS_V30_REGIONS):
+        kps = per_section_kps[idx % len(per_section_kps)]
+        # The record area starts V30_DESC_LEN before the (x,y) anchor. The
+        # per-section trailer is enroll-only bookkeeping the matcher ignores.
+        section = serialize_v30_section(
+            [(gx, gy, desc) for (gx, gy, _orient, desc) in kps])
+        start = base - V30_DESC_LEN
+        ws_body[start:start + len(section)] = section
+    ws_body_bytes = bytes(ws_body)
+    return build_envelope(subtype, ws_body_bytes, compute_tid(ws_body_bytes))
+
+
+def native_template(image_q16, subtype=None):
+    """End-to-end REFERENCE-FREE single-frame enrollment template: detect
+    keypoints in `image_q16` with the native pipeline and fill every v30
+    section with them (see assemble_template).
 
     `image_q16`: (h, w) int Q16 image (mid-gray = 0x800000). The sensor returns
     uint8; convert via `img.astype(np.int32) << 16`."""
-    ws_body = bytearray(_load_ws_scaffold())
-    regions = list(NATIVE_WS_V30_REGIONS)
     if subtype is None:
         subtype = DEFAULT_SUBTYPE
-    assert len(ws_body) == WS_SIZE, f"WS body must be {WS_SIZE}B, got {len(ws_body)}"
-    # (sec0_pre transforms are already NEAR-identity — see _load_ws_scaffold.)
-
-    # 1. Detect OUR keypoints + descriptors from OUR image.
     kps = extract_frame_native(image_q16, h=image_q16.shape[0],
                                w=image_q16.shape[1])
-
-    # 2-3. Serialize into [16B desc][x][y] × 250 and overwrite every v30 region.
-    section = serialize_v30_section(
-        [(gx, gy, desc) for (gx, gy, _orient, desc) in kps])
-    target_regions = regions if fill_all_sections else regions[:1]
-    for base in target_regions:
-        start = base - V30_DESC_LEN
-        ws_body[start:start + len(section)] = section
-
-    # 4. Recompute TID over the new WS body, wrap in the envelope.
-    ws_body_bytes = bytes(ws_body)
-    tid = compute_tid(ws_body_bytes)
-    return _build_envelope(subtype, ws_body_bytes, tid)
+    return assemble_template([kps], subtype)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Envelope + TID (byte-format; used by native_template and moh_enrollment)
+# Envelope + TID (byte-format; shared with Sensor.make_finger_data)
 # ══════════════════════════════════════════════════════════════════════
 
-def _build_envelope(subtype, ws_body, template_id, version=3):
-    """Wire-exact envelope for new_record type=6 (byte-identical to the DLL's
-    sub_180036840). Layout: 8-byte outer header, TLV1 (tag=1) ws_body, TLV2
-    (tag=2) template_id, 32 trailing zeros. Caller passes the chip-view WS
-    body (NOT including the TLV2 header)."""
+def build_envelope(subtype, ws_body, template_id, version=3):
+    """Wire-exact finger-template envelope for new_record type=6 (byte-identical
+    to the DLL's sub_180036840). Layout: 8-byte outer header, TLV1 (tag=1)
+    ws_body, TLV2 (tag=2) template_id, 32 trailing zeros. Caller passes the
+    chip-view WS body (NOT including the TLV2 header). Also the format the
+    legacy 0x68/0x6b enrollment stores (Sensor.make_finger_data)."""
     assert len(template_id) == 32
     ws_size = len(ws_body)
     tid_size = len(template_id)
