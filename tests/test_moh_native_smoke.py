@@ -37,6 +37,17 @@ def test_extract_frame_native_shape_and_bounds():
         assert len(desc) == m.V30_DESC_LEN == 16
 
 
+def test_extract_frame_native_stats():
+    stats = {}
+    kps = m.extract_frame_native(_synthetic_frame(), stats=stats)
+    assert stats['n_pool'] >= len(kps), "pool is pre-cap, can't be smaller"
+    assert stats['med_score'] > 0
+    # cap_score > 0 iff the 250-cap was actually hit
+    assert (stats['cap_score'] > 0) == (stats['n_pool'] >= m.FRAME_KP_CAP)
+    # the stats keyword must not change the extraction result
+    assert kps == m.extract_frame_native(_synthetic_frame())
+
+
 def test_serialize_v30_section_layout():
     desc = bytes(range(16))
     sec = m.serialize_v30_section([(5, 7, desc)], n_slots=m.V30_SECTION_RECORDS)
@@ -65,3 +76,29 @@ def test_subpix_refine_rejects_out_of_range():
     assert m.subpix_refine_kp(resp, 0, 10) is None    # x on the border
     assert m.subpix_refine_kp(resp, 10, 0) is None    # y on the border
     assert m.subpix_refine_kp(resp, 10, 10) is None   # flat → singular Hessian
+
+
+def test_ws_scaffold_is_prepatched_near_identity():
+    # The near-identity sec0_pre transforms are applied once when the scaffold
+    # is loaded; re-running the patcher must be a byte-level no-op.
+    scaffold = m._load_ws_scaffold()
+    patched, n = m.patch_pre_v30_near_identity(scaffold, m.NATIVE_WS_V30_REGIONS)
+    assert n == 6
+    assert patched == scaffold
+
+
+def test_make_finger_data_matches_build_envelope():
+    from validitysensor.sensor import Sensor
+    ws, tid = bytes(range(256)) * 3, bytes(range(32))
+    assert Sensor().make_finger_data(0xf5, ws, tid) == m.build_envelope(0xf5, ws, tid)
+
+
+def test_assemble_template_cycles_frames_over_sections():
+    a = [(10, 11, 0.0, bytes([1] * 16))]
+    b = [(20, 21, 0.0, bytes([2] * 16))]
+    env = m.assemble_template([a, b], subtype=0xf5)
+    ws = env[12:12 + m.WS_SIZE]
+    recs = [ws[base - m.V30_DESC_LEN:base + 2] for base in m.NATIVE_WS_V30_REGIONS]
+    assert recs[0] == recs[2] == bytes([1] * 16) + bytes([10, 11])
+    assert recs[1] == recs[3] == bytes([2] * 16) + bytes([20, 21])
+    assert env[23072:23104] == m.compute_tid(ws)

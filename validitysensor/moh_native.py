@@ -394,7 +394,7 @@ V30_SECTION_RECORDS = 250
 V30_SECTION_BYTES = V30_SECTION_RECORDS * 18  # 4500
 V30_DESC_LEN = 16   # record = [desc:16][x:u8][y:u8]; (x,y) anchor is +16 in
 WS_SIZE = 23056             # chip-view WS body size
-DEFAULT_SUBTYPE = 0x00f7    # default WinBio finger subtype
+DEFAULT_SUBTYPE = 0x00f5    # default WinBio finger subtype (UNSPECIFIED_POS_01)
 
 
 def serialize_v30_section(records, n_slots=V30_SECTION_RECORDS):
@@ -458,13 +458,21 @@ def _a960_passes_global_edge(sx_q16, sy_q16, oy, ox, h, w, ti=None, tj=None):
 
 def extract_frame_native(image_q16, h=112, w=112,
                          t_lo=671, t_hi=168, dedup_q=72064, nms_margin=10,
-                         subpix_refine=True, frame_kp_cap=FRAME_KP_CAP):
+                         subpix_refine=True, frame_kp_cap=FRAME_KP_CAP,
+                         stats=None):
     """Single-frame native feature extractor.
 
     Per-tile: DoH → NMS → subpixel refine → global-edge cull. Then a global
     sort by |resp| descending, cap to 250, re-sort by (tile_id, |resp| desc),
     and run orientation + descriptor per keypoint. Returns a list of
     (gx_int, gy_int, orient_rad, desc_16B) after the global merge.
+
+    `stats`, if a dict, is filled with frame-quality metrics that survive the
+    250-cap (the returned list saturates at `frame_kp_cap` on any healthy
+    frame, so its length cannot rank frames — see dev/FRAME-QUALITY.md):
+      n_pool     uncapped keypoint count (pool size before the cap)
+      cap_score  |resp| of the weakest KEPT keypoint if the cap was hit, else 0
+      med_score  median |resp| of the kept keypoints
 
     `image_q16`: (h, w) int array, mid-gray = 0x800000 (uint8 image << 16)."""
     image_q16 = np.asarray(image_q16, dtype=np.int64)
@@ -496,6 +504,13 @@ def extract_frame_native(image_q16, h=112, w=112,
 
     # Phase 2: global sort by |resp| desc, cap to frame_kp_cap.
     pool.sort(key=lambda r: -r[0])
+    if stats is not None:
+        kept_scores = [r[0] for r in pool[:frame_kp_cap]]
+        stats['n_pool'] = len(pool)
+        stats['cap_score'] = (float(kept_scores[-1])
+                              if len(pool) >= frame_kp_cap else 0.0)
+        stats['med_score'] = (float(np.median(kept_scores))
+                              if kept_scores else 0.0)
     pool = pool[:frame_kp_cap]
 
     # Phase 3: re-sort by (tile_id asc, |resp| desc).
@@ -532,12 +547,26 @@ NATIVE_WS_V30_REGIONS = (309, 4913, 9453, 13993)
 _NATIVE_WS_SCAFFOLD = None
 
 
+_WS_SCAFFOLD_PRE_V30_RECORDS = 6   # sec0_pre inter-section transforms
+
+
 def _load_ws_scaffold():
-    """Return the 23056-byte baked WS-body framing scaffold (v30 zeroed)."""
+    """Return the 23056-byte baked WS-body framing scaffold (v30 zeroed) with
+    its sec0_pre inter-section transforms already set to NEAR-identity.
+
+    The patch is applied once here (not per template build) and its record
+    count is asserted: the patcher is a heuristic scan, so a scaffold edit
+    that broke it would otherwise silently leave pure-identity transforms —
+    the matcher's 'unmatched' sentinel — in every template."""
     global _NATIVE_WS_SCAFFOLD
     if _NATIVE_WS_SCAFFOLD is None:
         from .blobs_a2 import build_ws_scaffold
-        _NATIVE_WS_SCAFFOLD = build_ws_scaffold()
+        patched, n = patch_pre_v30_near_identity(build_ws_scaffold(),
+                                                 NATIVE_WS_V30_REGIONS)
+        if n != _WS_SCAFFOLD_PRE_V30_RECORDS:
+            raise RuntimeError(f'WS scaffold: patched {n} sec0_pre records, '
+                               f'expected {_WS_SCAFFOLD_PRE_V30_RECORDS}')
+        _NATIVE_WS_SCAFFOLD = patched
     return _NATIVE_WS_SCAFFOLD
 
 
@@ -586,52 +615,52 @@ def patch_pre_v30_near_identity(ws_body, regions):
     return bytes(ws), patched
 
 
-def native_template(image_q16, subtype=None, fill_all_sections=True):
-    """End-to-end REFERENCE-FREE native enrollment template.
+def assemble_template(per_section_kps, subtype):
+    """Assemble the chip-ready envelope from per-section keypoint lists.
 
-    Detects keypoints in `image_q16` with the native pipeline, formats them
-    into 18-byte v30 records [16B desc][x][y], overwrites every v30 region of
-    the baked WS-body scaffold, recomputes the TID, and returns the envelope
-    ready for db.new_finger() (chip cmd 0x47).
+    `per_section_kps[i % len]` fills v30 section i of the baked WS-body
+    scaffold as [16B desc][x][y] records (one list → every section gets the
+    same frame); the TID is recomputed over the new body and the result is
+    wrapped in the type-6 envelope (chip cmd 0x47). Items are
+    (gx, gy, orient, desc) as returned by extract_frame_native()."""
+    ws_body = bytearray(_load_ws_scaffold())
+    assert len(ws_body) == WS_SIZE, f"WS body must be {WS_SIZE}B, got {len(ws_body)}"
+    for idx, base in enumerate(NATIVE_WS_V30_REGIONS):
+        kps = per_section_kps[idx % len(per_section_kps)]
+        # The record area starts V30_DESC_LEN before the (x,y) anchor. The
+        # per-section trailer is enroll-only bookkeeping the matcher ignores.
+        section = serialize_v30_section(
+            [(gx, gy, desc) for (gx, gy, _orient, desc) in kps])
+        start = base - V30_DESC_LEN
+        ws_body[start:start + len(section)] = section
+    ws_body_bytes = bytes(ws_body)
+    return build_envelope(subtype, ws_body_bytes, compute_tid(ws_body_bytes))
+
+
+def native_template(image_q16, subtype=None):
+    """End-to-end REFERENCE-FREE single-frame enrollment template: detect
+    keypoints in `image_q16` with the native pipeline and fill every v30
+    section with them (see assemble_template).
 
     `image_q16`: (h, w) int Q16 image (mid-gray = 0x800000). The sensor returns
     uint8; convert via `img.astype(np.int32) << 16`."""
-    ws_body = bytearray(_load_ws_scaffold())
-    regions = list(NATIVE_WS_V30_REGIONS)
     if subtype is None:
         subtype = DEFAULT_SUBTYPE
-    assert len(ws_body) == WS_SIZE, f"WS body must be {WS_SIZE}B, got {len(ws_body)}"
-
-    # Inter-section sec0_pre transforms must be NEAR-identity (load-bearing).
-    ws_body = bytearray(patch_pre_v30_near_identity(bytes(ws_body), regions)[0])
-
-    # 1. Detect OUR keypoints + descriptors from OUR image.
     kps = extract_frame_native(image_q16, h=image_q16.shape[0],
                                w=image_q16.shape[1])
-
-    # 2-3. Serialize into [16B desc][x][y] × 250 and overwrite every v30 region.
-    section = serialize_v30_section(
-        [(gx, gy, desc) for (gx, gy, _orient, desc) in kps])
-    target_regions = regions if fill_all_sections else regions[:1]
-    for base in target_regions:
-        start = base - V30_DESC_LEN
-        ws_body[start:start + len(section)] = section
-
-    # 4. Recompute TID over the new WS body, wrap in the envelope.
-    ws_body_bytes = bytes(ws_body)
-    tid = compute_tid(ws_body_bytes)
-    return _build_envelope(subtype, ws_body_bytes, tid)
+    return assemble_template([kps], subtype)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Envelope + TID (byte-format; used by native_template and moh_enrollment)
+# Envelope + TID (byte-format; shared with Sensor.make_finger_data)
 # ══════════════════════════════════════════════════════════════════════
 
-def _build_envelope(subtype, ws_body, template_id, version=3):
-    """Wire-exact envelope for new_record type=6 (byte-identical to the DLL's
-    sub_180036840). Layout: 8-byte outer header, TLV1 (tag=1) ws_body, TLV2
-    (tag=2) template_id, 32 trailing zeros. Caller passes the chip-view WS
-    body (NOT including the TLV2 header)."""
+def build_envelope(subtype, ws_body, template_id, version=3):
+    """Wire-exact finger-template envelope for new_record type=6 (byte-identical
+    to the DLL's sub_180036840). Layout: 8-byte outer header, TLV1 (tag=1)
+    ws_body, TLV2 (tag=2) template_id, 32 trailing zeros. Caller passes the
+    chip-view WS body (NOT including the TLV2 header). Also the format the
+    legacy 0x68/0x6b enrollment stores (Sensor.make_finger_data)."""
     assert len(template_id) == 32
     ws_size = len(ws_body)
     tid_size = len(template_id)
