@@ -45,3 +45,14 @@ def test_valid_parent_dbid_is_returned(monkeypatch):
 def test_parent_or_user_sid_is_required():
     with pytest.raises(ValueError):
         script.resolve_parent(None, None)
+
+
+def test_try_match_waits_for_finger_lift_before_identify(monkeypatch):
+    import logging
+    from validitysensor import sensor as sensor_mod
+    events = []
+    monkeypatch.setattr(script, 'sleep', lambda s: events.append(('sleep', s)))
+    monkeypatch.setattr(sensor_mod.sensor, 'identify',
+                        lambda cb: events.append('identify') or (1, 0xf5, b''))
+    assert script._try_match(logging.getLogger('t'), settle=2.5) is True
+    assert events == [('sleep', 2.5), 'identify']

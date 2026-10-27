@@ -30,6 +30,7 @@ import argparse
 import logging
 import os
 import sys
+from time import sleep
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -60,11 +61,15 @@ def resolve_parent(parent, user_sid):
     return parent
 
 
-def _try_match(log):
+def _try_match(log, settle=0.0):
     """Capture a fresh frame and ask the chip to identify. Returns True on a
-    match, False on 'not recognized' (logged cleanly, no traceback)."""
+    match, False on 'not recognized' (logged cleanly, no traceback).
+
+    `settle`: seconds to wait before arming the capture, so a finger still
+    leaving the sensor after the last enrollment press is not captured."""
     from validitysensor.sensor import sensor as Sensor
     log.info('LIFT FINGER, then place the SAME finger to verify the chip matches ...')
+    sleep(settle)
     try:
         usrid, subtype_out, hsh = Sensor.identify(
             lambda e: log.warning(f'identify capture retry: {e}'))
@@ -89,6 +94,10 @@ def main():
                          'coverage.')
     ap.add_argument('--match', action='store_true',
                     help='after enroll, capture again and try to identify')
+    ap.add_argument('--match-settle', type=float, default=3.0,
+                    help='seconds to wait after enroll before arming the '
+                         '--match capture, so the lifting finger is not '
+                         'captured (default 3)')
     ap.add_argument('--dry-run', action='store_true',
                     help='build the envelope but DO NOT store on chip; '
                          'write it to /tmp/native_envelope.bin instead')
@@ -239,7 +248,7 @@ def main():
 
     if args.match:
         # identify() = capture(IDENTIFY) (waits for finger-present) + match.
-        if _try_match(log):
+        if _try_match(log, settle=args.match_settle):
             log.info('  → native pipeline produces chip-acceptable templates!')
             return 0
         return 3
