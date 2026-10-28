@@ -54,6 +54,9 @@ def capture_frames(sensor, num_frames: int = 6,
     if min_frame_pool is None:
         min_frame_pool = FRAME_KP_CAP
 
+    # open-fprintd sends Cancel after every verify/enroll and only wait_int()
+    # clears the flag, so a stale one would trip the check below at once.
+    usb.cancel = False
     logging.info(f'enroll_moh: capturing {num_frames} frame(s)...')
     frames = []
     for f in range(num_frames):
@@ -153,9 +156,16 @@ def store_template(parent_dbid: int, envelope: bytes) -> int:
 
     Storing under a non-existent dbid may succeed at the storage layer BUT
     the chip's matcher will silently fail to find the enrollment — callers
-    must pass a real user dbid. A chip rejection raises (assert_status); it
-    is deterministic, so callers must not retry it by recapturing."""
+    must pass a real user dbid. A full partition or a chip rejection raises;
+    both are deterministic, so callers must not retry by recapturing."""
     logging.info('enroll_moh: storing on chip...')
+    # The chip answers 0x04b5 when the envelope does not fit; deleted records
+    # keep their space (no compaction), so say what actually happened.
+    info = db.db_info()
+    if info.free < len(envelope):
+        raise RuntimeError(
+            f'template storage full: {info.free} bytes free, need {len(envelope)} '
+            f'({info.records} records incl. deleted); wipe with scripts/wipe-template-db.py')
     recid = db.new_record(parent_dbid, 6, 3, envelope, trailer=b'\x00')
     logging.info(f'enroll_moh: stored recid={recid}')
     return recid

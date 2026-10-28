@@ -52,7 +52,8 @@ def chip(monkeypatch):
     monkeypatch.setattr(sensor_mod, 'glow_start_scan', lambda: None)
     monkeypatch.setattr(sensor_mod, 'glow_end_scan', lambda: None)
     monkeypatch.setattr(me, 'sleep', lambda s: None)
-    monkeypatch.setattr(me.db, 'db_info', lambda: None)
+    monkeypatch.setattr(me.db, 'db_info',
+                        lambda: db_mod.Db.Info(524288, 0, 523520, 1, [4]))
     monkeypatch.setattr(db_mod, 'call_cleanups', lambda: None)
     usb.cancel = False
     state = {'status': 0, 'msgs': []}
@@ -205,3 +206,20 @@ def test_enroll_creates_user_only_after_moh_captures(chip, monkeypatch):
                             sensor, parent, subtype, num_frames=1, min_frame_pool=0, **kw))
     s.enroll('S-1-5-21-1', 0xf5, lambda *a: None)
     assert events == ['capture', 'lookup', 'new_user']
+
+
+def test_stale_cancel_from_previous_operation_is_ignored(chip):
+    # open-fprintd sends Cancel after each verify and enrollment; nothing
+    # clears the flag until the next wait_int(), so it is still set when the
+    # next enrollment starts.
+    usb.cancel = True
+    _enroll(FakeSensor(['ok', 'ok']), chip, num_frames=2)
+    assert chip['msgs']
+
+
+def test_store_fails_clearly_when_template_partition_is_full(chip, monkeypatch):
+    monkeypatch.setattr(me.db, 'db_info',
+                        lambda: db_mod.Db.Info(524288, 1536, 21248, 31, [4]))
+    with pytest.raises(Exception, match='storage full'):
+        _enroll(FakeSensor(['ok']), chip, num_frames=1)
+    assert chip['msgs'] == []
